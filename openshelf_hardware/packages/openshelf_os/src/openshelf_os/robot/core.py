@@ -1623,17 +1623,7 @@ class Robot:
         if not self._grid:
             return RobotCommandError(command=command_name, error="The machine's storage is not ready. Reset it and try again.")
 
-        resolved_barcode: str
-        resolved_item_name: str
-        if isinstance(item_payload, str):
-            resolved_barcode = item_payload
-            resolved_item_name = item_payload
-        elif isinstance(item_payload, dict):
-            resolved_barcode = item_payload.get("barcode") or item_payload.get("name") or "item"
-            resolved_item_name = item_payload.get("name") or resolved_barcode
-        else:
-            resolved_barcode = "item"
-            resolved_item_name = "item"
+        resolved_barcode, resolved_item_name = self._store_item_identity(item_payload)
 
         provided_dimensions = None
         if isinstance(item_payload, dict):
@@ -1668,74 +1658,9 @@ class Robot:
             barcode=resolved_barcode
         )
 
-        provided_location = None
-        if isinstance(item_payload, dict):
-            provided_location = item_payload.get("location")
-
-        reserved_locations = getattr(self, "_reserved_cell_locations", set())
-        location: StorageModuleCellLocation | None = None
-        if provided_location is not None:
-            try:
-                parsed_location = StorageModuleCellLocation(
-                    side=provided_location.get("side"),
-                    shelf_idx=int(provided_location.get("shelf_idx", 0)),
-                    cell_idx=int(provided_location.get("cell_idx", 0)),
-                )
-            except (AttributeError, TypeError, ValueError):
-                return RobotCommandError(command=command_name, error="That cell is not valid.")
-
-            is_reserved = (
-                parsed_location.side.value,
-                parsed_location.shelf_idx,
-                parsed_location.cell_idx,
-            ) in reserved_locations
-
-            # A tray home holds its tray, so only that tray's return may target it; the cell's
-            # status does not mark it.
-            if is_reserved and not tray:
-                self._logger.info("Store refused: cell %s is a bin home", parsed_location)
-                return RobotCommandError(command=command_name, error="That cell is not available.")
-
-            # Demo mode keeps its barcode-to-cell mapping for ordinary items. A tray return
-            # targets a workflow-chosen home rather than a client-requested cell, so the
-            # availability and fit checks apply only to ordinary explicit stores.
-            if self._demo_cell_map is None or is_reserved:
-                if is_reserved is False and tray is False:
-                    cell = self._grid.get_cell_if_present(parsed_location)
-                    if cell is None:
-                        return RobotCommandError(command=command_name, error="That cell does not exist.")
-                    if cell.status != CellStatus.AVAILABLE:
-                        self._logger.info("Store refused: cell %s is %s", parsed_location, cell.status.value)
-                        return RobotCommandError(command=command_name, error="That cell is not available.")
-                    if self._grid.cell_fits_item(cell, item) is False:
-                        return RobotCommandError(command=command_name, error="The item does not fit that cell.")
-                location = parsed_location
-
-        if location is None and self._demo_cell_map is not None:
-            demo_location = self._demo_cell_map.get(resolved_barcode)
-            if demo_location is None:
-                return RobotCommandError(
-                    command=command_name,
-                    error=f"Barcode {resolved_barcode}{DEMO_MAP_MISSING_SUFFIX}",
-                )
-            if (
-                demo_location.side.value,
-                demo_location.shelf_idx,
-                demo_location.cell_idx,
-            ) in reserved_locations:
-                return RobotCommandError(
-                    command=command_name,
-                    error="That cell is reserved for the demo.",
-                )
-            location = demo_location
-        elif location is None:
-            location = self._grid.find_best_slot_for_item(
-                item,
-                excluded_locations=reserved_locations,
-            )
-
-        if not location:
-            return RobotCommandError(command=command_name, error="No open cell fits this item.")
+        location = self._resolve_store_location(item_payload, item, resolved_barcode, tray)
+        if isinstance(location, RobotCommandError):
+            return location
 
         if tray is False and (blocked := self._blocked_fridge_cell_error(command_name, location)) is not None:
             return blocked
@@ -1780,6 +1705,100 @@ class Robot:
                 error=message,
                 fault_code=cause,
             )
+
+    @staticmethod
+    def _store_item_identity(item_payload: Any) -> tuple[str, str]:
+        """(barcode, name) for a store payload."""
+        if isinstance(item_payload, str):
+            return item_payload, item_payload
+        if isinstance(item_payload, dict):
+            resolved_barcode = item_payload.get("barcode") or item_payload.get("name") or "item"
+            return resolved_barcode, item_payload.get("name") or resolved_barcode
+        return "item", "item"
+
+    def _resolve_store_location(
+        self, item_payload: Any, item: CellItem, resolved_barcode: str, tray: bool
+    ) -> StorageModuleCellLocation | RobotCommandError:
+        command_name = "store_item"
+        provided_location = None
+        if isinstance(item_payload, dict):
+            provided_location = item_payload.get("location")
+
+        reserved_locations = getattr(self, "_reserved_cell_locations", set())
+        location: StorageModuleCellLocation | RobotCommandError | None = None
+        if provided_location is not None:
+            location = self._explicit_store_location(provided_location, item, tray, reserved_locations)
+            if isinstance(location, RobotCommandError):
+                return location
+
+        if location is None and self._demo_cell_map is not None:
+            demo_location = self._demo_cell_map.get(resolved_barcode)
+            if demo_location is None:
+                return RobotCommandError(
+                    command=command_name,
+                    error=f"Barcode {resolved_barcode}{DEMO_MAP_MISSING_SUFFIX}",
+                )
+            if (
+                demo_location.side.value,
+                demo_location.shelf_idx,
+                demo_location.cell_idx,
+            ) in reserved_locations:
+                return RobotCommandError(
+                    command=command_name,
+                    error="That cell is reserved for the demo.",
+                )
+            location = demo_location
+        elif location is None:
+            location = self._grid.find_best_slot_for_item(
+                item,
+                excluded_locations=reserved_locations,
+            )
+
+        if not location:
+            return RobotCommandError(command=command_name, error="No open cell fits this item.")
+        return location
+
+    def _explicit_store_location(
+        self, provided_location: Any, item: CellItem, tray: bool, reserved_locations: set[tuple[str, int, int]]
+    ) -> StorageModuleCellLocation | RobotCommandError | None:
+        """The client-requested cell, or None when demo mode maps the barcode instead."""
+        command_name = "store_item"
+        try:
+            parsed_location = StorageModuleCellLocation(
+                side=provided_location.get("side"),
+                shelf_idx=int(provided_location.get("shelf_idx", 0)),
+                cell_idx=int(provided_location.get("cell_idx", 0)),
+            )
+        except (AttributeError, TypeError, ValueError):
+            return RobotCommandError(command=command_name, error="That cell is not valid.")
+
+        is_reserved = (
+            parsed_location.side.value,
+            parsed_location.shelf_idx,
+            parsed_location.cell_idx,
+        ) in reserved_locations
+
+        # A tray home holds its tray, so only that tray's return may target it; the cell's
+        # status does not mark it.
+        if is_reserved and not tray:
+            self._logger.info("Store refused: cell %s is a bin home", parsed_location)
+            return RobotCommandError(command=command_name, error="That cell is not available.")
+
+        # Demo mode keeps its barcode-to-cell mapping for ordinary items. A tray return
+        # targets a workflow-chosen home rather than a client-requested cell, so the
+        # availability and fit checks apply only to ordinary explicit stores.
+        if self._demo_cell_map is not None and not is_reserved:
+            return None
+        if is_reserved is False and tray is False:
+            cell = self._grid.get_cell_if_present(parsed_location)
+            if cell is None:
+                return RobotCommandError(command=command_name, error="That cell does not exist.")
+            if cell.status != CellStatus.AVAILABLE:
+                self._logger.info("Store refused: cell %s is %s", parsed_location, cell.status.value)
+                return RobotCommandError(command=command_name, error="That cell is not available.")
+            if self._grid.cell_fits_item(cell, item) is False:
+                return RobotCommandError(command=command_name, error="The item does not fit that cell.")
+        return parsed_location
 
     async def _find_location_for_barcode(self, barcode: str) -> Optional[StorageModuleCellLocation]:
         for entry in self._grid.get_all_cell_data():
