@@ -26,7 +26,7 @@ import math
 import secrets
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
-from typing import Any, Iterable, Optional, Protocol, Sequence
+from typing import Any, Callable, Iterable, Iterator, Optional, Protocol, Sequence
 from uuid import uuid4
 
 from sqlalchemy import func, select
@@ -170,6 +170,89 @@ def _valid_dimensions(value: Any) -> Optional[dict[str, float]]:
     return dimensions
 
 
+# A validated row: the row, its file barcode, access level id, expiry date, and planned dimensions.
+_PreparedRow = tuple[ImportRowInput, Optional[str], Optional[int], Optional[str], Optional[dict[str, float]]]
+
+
+def _prepare_row(
+    row: ImportRowInput,
+    number: int,
+    labels: dict[str, int],
+    levels_by_id: dict[int, AccessLevel],
+    levels_by_name: dict[str, AccessLevel],
+    error: Callable[[str, str], None],
+) -> _PreparedRow:
+    """`row`'s validated values; each problem goes to `error`, and a new file barcode into `labels`."""
+    name = _clean(row.name)
+    if name is None:
+        error("name", "Name is required")
+    elif len(name) > 255:
+        error("name", "Name is longer than 255 characters")
+    if row.quantity < 1:
+        error("quantity", "Quantity must be at least 1")
+    label = _clean(row.barcode)
+    if label is not None:
+        if len(label) > BARCODE_MAX_LENGTH or not _printable(label):
+            error("barcode", "Barcode must be printable ASCII up to 255 characters")
+        elif label in labels:
+            error("barcode", f"Barcode {label} repeats row {labels[label]}")
+        else:
+            labels[label] = number
+    access_level_id = _row_access_level_id(row.access_level, levels_by_id, levels_by_name, error)
+    expires_at: Optional[str] = None
+    try:
+        expires_at = _normalize_date(row.expires_at)
+    except ValueError as exc:
+        error("expires_at", str(exc))
+    masses = {
+        key: value
+        for key, value in (
+            ("tare_weight", row.tare_weight),
+            ("net_weight", row.net_weight),
+            ("full_net_weight", row.full_net_weight),
+        )
+        if value is not None
+    }
+    try:
+        validate_mass(masses)
+    except ValidationError as exc:
+        error("weight", str(exc))
+    return (row, label, access_level_id, expires_at, _row_dimensions(row, error))
+
+
+def _row_access_level_id(
+    value: Optional[str | int],
+    levels_by_id: dict[int, AccessLevel],
+    levels_by_name: dict[str, AccessLevel],
+    error: Callable[[str, str], None],
+) -> Optional[int]:
+    if value is None or str(value).strip() == "":
+        return None
+    raw = str(value).strip()
+    level = levels_by_name.get(raw.lower())
+    if level is None and raw.isdigit():
+        level = levels_by_id.get(int(raw))
+    if level is None and raw.lower().startswith("level ") is False and raw.isdigit():
+        level = levels_by_name.get(f"level {raw}")
+    if level is None:
+        error("access_level", f"Unknown access level {raw}")
+        return None
+    return level.id
+
+
+def _row_dimensions(row: ImportRowInput, error: Callable[[str, str], None]) -> Optional[dict[str, float]]:
+    planned: dict[str, float] = {}
+    for key in ("width", "height", "length"):
+        value = getattr(row, key)
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+            error(key, f"{key.capitalize()} must be a positive number of millimetres")
+        else:
+            planned[key] = float(value)
+    return planned or None
+
+
 def _robot_grid() -> Any:
     """The robot's storage grid, or the configured grid file when no robot runs."""
     worker = robot_core.robot_worker
@@ -262,12 +345,25 @@ class ImportJobService:
                 422, "too_many_units", f"An import can load at most {MAX_UNITS} units; this one has {total}"
             )
 
+        labels, prepared = await self._prepare_rows(rows)
+        reserved = await self._check_barcodes_free(labels)
+
+        job = ImportJob(id=str(uuid4()), state="active", filename=_clean(filename))
+        self.session.add(job)
+        unlabelled = sum(row.quantity - (1 if label is not None else 0) for row, label, _, _, _ in prepared)
+        generated = iter(await self._new_barcodes(unlabelled, set(labels) | reserved))
+        self._add_units(job, prepared, generated)
+        await self.session.commit()
+        return job
+
+    async def _prepare_rows(self, rows: Sequence[ImportRowInput]) -> tuple[dict[str, int], list[_PreparedRow]]:
+        """Each row's validated values, and the file's barcodes by row; every row error is raised at once."""
         levels = (await self.session.scalars(select(AccessLevel))).all()
         levels_by_id = {level.id: level for level in levels}
         levels_by_name = {level.name.strip().lower(): level for level in levels}
         errors: list[dict[str, Any]] = []
         labels: dict[str, int] = {}
-        prepared: list[tuple[ImportRowInput, Optional[str], Optional[int], Optional[str], Optional[dict[str, float]]]] = []
+        prepared: list[_PreparedRow] = []
 
         for index, row in enumerate(rows):
             number = row.row_number or index + 1
@@ -275,65 +371,14 @@ class ImportJobService:
             def error(field_name: str, message: str) -> None:
                 errors.append({"row": number, "field": field_name, "message": message})
 
-            name = _clean(row.name)
-            if name is None:
-                error("name", "Name is required")
-            elif len(name) > 255:
-                error("name", "Name is longer than 255 characters")
-            if row.quantity < 1:
-                error("quantity", "Quantity must be at least 1")
-            label = _clean(row.barcode)
-            if label is not None:
-                if len(label) > BARCODE_MAX_LENGTH or not _printable(label):
-                    error("barcode", "Barcode must be printable ASCII up to 255 characters")
-                elif label in labels:
-                    error("barcode", f"Barcode {label} repeats row {labels[label]}")
-                else:
-                    labels[label] = number
-            access_level_id: Optional[int] = None
-            if row.access_level is not None and str(row.access_level).strip() != "":
-                raw = str(row.access_level).strip()
-                level = levels_by_name.get(raw.lower())
-                if level is None and raw.isdigit():
-                    level = levels_by_id.get(int(raw))
-                if level is None and raw.lower().startswith("level ") is False and raw.isdigit():
-                    level = levels_by_name.get(f"level {raw}")
-                if level is None:
-                    error("access_level", f"Unknown access level {raw}")
-                else:
-                    access_level_id = level.id
-            expires_at: Optional[str] = None
-            try:
-                expires_at = _normalize_date(row.expires_at)
-            except ValueError as exc:
-                error("expires_at", str(exc))
-            masses = {
-                key: value
-                for key, value in (
-                    ("tare_weight", row.tare_weight),
-                    ("net_weight", row.net_weight),
-                    ("full_net_weight", row.full_net_weight),
-                )
-                if value is not None
-            }
-            try:
-                validate_mass(masses)
-            except ValidationError as exc:
-                error("weight", str(exc))
-            planned: dict[str, float] = {}
-            for key in ("width", "height", "length"):
-                value = getattr(row, key)
-                if value is None:
-                    continue
-                if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
-                    error(key, f"{key.capitalize()} must be a positive number of millimetres")
-                else:
-                    planned[key] = float(value)
-            prepared.append((row, label, access_level_id, expires_at, planned or None))
+            prepared.append(_prepare_row(row, number, labels, levels_by_id, levels_by_name, error))
 
         if errors:
             raise ImportJobError(422, "invalid_rows", "Some rows in the file cannot be imported.", errors)
+        return labels, prepared
 
+    async def _check_barcodes_free(self, labels: dict[str, int]) -> set[str]:
+        """Rejects file barcodes an item or tray already uses; returns the reserved tray barcodes."""
         existing = await self._existing_barcodes(labels)
         reserved = await reserved_bin_barcodes(self.session)
         conflicts = sorted((existing | reserved) & set(labels))
@@ -344,11 +389,9 @@ class ImportJobService:
                 "Some barcodes in the file already exist on this machine.",
                 [{"row": labels[barcode], "field": "barcode", "barcode": barcode, "message": "Already on this machine"} for barcode in conflicts],
             )
+        return reserved
 
-        job = ImportJob(id=str(uuid4()), state="active", filename=_clean(filename))
-        self.session.add(job)
-        unlabelled = sum(row.quantity - (1 if label is not None else 0) for row, label, _, _, _ in prepared)
-        generated = iter(await self._new_barcodes(unlabelled, set(labels) | reserved))
+    def _add_units(self, job: ImportJob, prepared: list[_PreparedRow], generated: Iterator[str]) -> None:
         position = 0
         for row, label, access_level_id, expires_at, planned_dimensions in prepared:
             name = _clean(row.name) or ""
@@ -376,8 +419,6 @@ class ImportJobService:
                     )
                 )
                 position += 1
-        await self.session.commit()
-        return job
 
     async def _existing_barcodes(self, barcodes: Iterable[str]) -> set[str]:
         """Which of `barcodes` items already use, in a few chunked queries."""
