@@ -85,6 +85,71 @@ def build_seeded_edge_probe_y_offsets_mm(hole_probe_y_offsets_mm: list[float]) -
 	return lower_default_offsets_mm + list(hole_probe_y_offsets_mm)
 
 
+def build_known_shelf_edges(
+	*,
+	bounds: ScanBounds,
+	side: StorageModuleSide,
+	known_shelf_edge_y: list[float],
+) -> list[ShelfSurfaceEdge]:
+	edge_x_mm = bounds.x_max
+
+	if side == StorageModuleSide.BACK:
+		edge_x_mm = bounds.x_min
+
+	return [
+		ShelfSurfaceEdge(
+			x_mm=edge_x_mm,
+			y_mm=float(y_mm),
+		)
+		for y_mm in known_shelf_edge_y
+	]
+
+
+def collect_sweep_gap_candidates(
+	*,
+	values: list[float | None],
+	positions: list[float],
+	y_mm: float,
+	scan_config: Any,
+	wall_depth_rows: list[list[float | None]],
+	candidates: list[GapCandidateRegion],
+) -> None:
+	wall_depth_mm, gap_segments = find_gap_segments_in_line(
+		values=values,
+		positions=positions,
+		step_mm=SHELF_SWEEP_X_STEP_MM,
+		scan_config=scan_config,
+	)
+
+	if wall_depth_mm > 0:
+		wall_depth_rows.append(
+			[
+				depth_mm
+				for depth_mm in values
+				if depth_mm is not None
+			]
+		)
+
+	for segment in gap_segments:
+		local_wall_depth_mm, local_wall_sample_count = estimate_local_wall_depth_for_segment(
+			values=values,
+			segment=segment,
+			wall_depth_mm=wall_depth_mm,
+			tolerance_mm=WALL_DEPTH_TOLERANCE_MM,
+		)
+
+		candidates.append(
+			GapCandidateRegion(
+				x_min=segment.start_mm + (SHELF_SWEEP_X_STEP_MM / 2.0),
+				x_max=segment.end_mm - (SHELF_SWEEP_X_STEP_MM / 2.0),
+				y_min=y_mm,
+				y_max=y_mm,
+				wall_depth_mm=local_wall_depth_mm,
+				wall_sample_count=local_wall_sample_count,
+			)
+		)
+
+
 async def capture_shelf_candidates(
 	tool: Any,
 	*,
@@ -131,18 +196,7 @@ async def capture_shelf_candidates(
 	)
 
 	if known_shelf_edge_y is not None:
-		edge_x_mm = bounds.x_max
-
-		if side == StorageModuleSide.BACK:
-			edge_x_mm = bounds.x_min
-
-		shelf_edges = [
-			ShelfSurfaceEdge(
-				x_mm=edge_x_mm,
-				y_mm=float(y_mm),
-			)
-			for y_mm in known_shelf_edge_y
-		]
+		shelf_edges = build_known_shelf_edges(bounds=bounds, side=side, known_shelf_edge_y=known_shelf_edge_y)
 	else:
 		is_y_brake_disabled = False
 
@@ -315,40 +369,14 @@ async def capture_shelf_candidates(
 					"y_position": sweep_y_mm,
 				},
 			)
-			wall_depth_mm, gap_segments = find_gap_segments_in_line(
+			collect_sweep_gap_candidates(
 				values=sweep_depth_values,
 				positions=hole_sweep_x_positions,
-				step_mm=SHELF_SWEEP_X_STEP_MM,
+				y_mm=sweep_y_mm,
 				scan_config=scan_config,
+				wall_depth_rows=horizontal_wall_depth_values,
+				candidates=candidates,
 			)
-
-			if wall_depth_mm > 0:
-				horizontal_wall_depth_values.append(
-					[
-						depth_mm
-						for depth_mm in sweep_depth_values
-						if depth_mm is not None
-					]
-				)
-
-			for segment in gap_segments:
-				local_wall_depth_mm, local_wall_sample_count = estimate_local_wall_depth_for_segment(
-					values=sweep_depth_values,
-					segment=segment,
-					wall_depth_mm=wall_depth_mm,
-					tolerance_mm=WALL_DEPTH_TOLERANCE_MM,
-				)
-
-				candidates.append(
-					GapCandidateRegion(
-						x_min=segment.start_mm + (SHELF_SWEEP_X_STEP_MM / 2.0),
-						x_max=segment.end_mm - (SHELF_SWEEP_X_STEP_MM / 2.0),
-						y_min=sweep_y_mm,
-						y_max=sweep_y_mm,
-						wall_depth_mm=local_wall_depth_mm,
-						wall_sample_count=local_wall_sample_count,
-					)
-				)
 
 	if len(horizontal_wall_depth_values) == 0:
 		return coarse_scan, 0.0, [], filtered_shelf_edges
