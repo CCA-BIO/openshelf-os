@@ -1570,33 +1570,9 @@ class RobotWorker:
                 isinstance(command, (HomeCommand, InitializeCommand, RecoverCommand))
                 and isinstance(result, RobotCommandSuccessful)
             ):
-                homed_axes = command.axes if isinstance(command, HomeCommand) else None
-                if isinstance(command, RecoverCommand):
-                    homed_axes = list(command.axes or [])
-                if self._is_crashed:
-                    self.clear_crash_state(homed_axes)
-                    logger.info("Crash state cleared after successful %s", command.command)
-
-                if self._is_emergency_stopped:
-                    if self._is_estop_active is True:
-                        logger.info("Emergency stop state retained while button is active")
-                    else:
-                        self.clear_emergency_stop_state()
-                        logger.info("Emergency stop state cleared after successful %s", command.command)
-
-                if self.needs_home() and isinstance(command, (HomeCommand, RecoverCommand)):
-                    if command.axes is not None:
-                        self.clear_needs_home_axes(list(command.axes))
-                    elif isinstance(command, HomeCommand):
-                        # A recover without axes homes nothing, so it cannot answer a needs-home.
-                        self.clear_needs_home()
-                    logger.info("Needs-home flag cleared after successful homing")
+                self._clear_fault_state_after_home(command)
             if isinstance(result, RobotCommandSuccessful):
-                payload = result.model_dump(mode="json")
-                payload["command_id"] = operation.command_id if operation is not None else None
-                payload["request_id"] = getattr(command, "request_id", None)
-                if operation is not None and operation.visibility == "internal":
-                    payload["visibility"] = "internal"
+                payload = self._success_payload(result, command, operation)
                 await self.publish_event(payload)
                 await self._notify_command_lifecycle("succeeded", operation, payload)
             else:
@@ -1644,15 +1620,7 @@ class RobotWorker:
                 logger.info("Home stopped by a safety guard; a home is still owed: %s", err)
                 return
 
-            if is_grip_fault:
-                self.set_needs_home(str(err), axes=fault_needs_home_axes(self._robot, err))
-                logger.warning("Gripper feedback fault - tool needs recovery: %s", err, exc_info=err)
-            elif is_hardware_fault:
-                self.set_needs_home(str(err), axes=fault_needs_home_axes(self._robot, err))
-                logger.warning("Hardware fault detected - robot in crash state: %s", type(err).__name__, exc_info=err)
-            elif is_rotation_clearance_refusal(err):
-                # Nothing moved; only a sibling motor this run cancelled has to home ([] is a no-op).
-                self.set_needs_home(str(err), axes=fault_needs_home_axes(self._robot, err))
+            self._set_fault_needs_home(err, is_grip_fault=is_grip_fault, is_hardware_fault=is_hardware_fault)
 
             prepared_artifacts = (
                 self._begin_motion_crash_capture(str(err))
@@ -1685,15 +1653,8 @@ class RobotWorker:
                     code=failure_code if is_grip_fault and self._needs_home_unknown is False else None,
                 )
 
-            if is_grip_fault:
-                error_type = "GripVerification"
-            elif is_hardware_fault:
-                error_type = "HardwareFault"
-            else:
-                error_type = "CommandExecutionError"
-
             worker_error = WorkerError(
-                error_type=error_type,
+                error_type=self._fault_error_type(is_grip_fault=is_grip_fault, is_hardware_fault=is_hardware_fault),
                 message=str(err),
                 context=error_context,
                 stack_trace=stack_trace,
@@ -1706,6 +1667,61 @@ class RobotWorker:
                 )
             else:
                 self._report_error(worker_error, exc=err)
+
+    def _clear_fault_state_after_home(self, command: HomeCommand | InitializeCommand | RecoverCommand) -> None:
+        homed_axes = command.axes if isinstance(command, HomeCommand) else None
+        if isinstance(command, RecoverCommand):
+            homed_axes = list(command.axes or [])
+        if self._is_crashed:
+            self.clear_crash_state(homed_axes)
+            logger.info("Crash state cleared after successful %s", command.command)
+
+        if self._is_emergency_stopped:
+            if self._is_estop_active is True:
+                logger.info("Emergency stop state retained while button is active")
+            else:
+                self.clear_emergency_stop_state()
+                logger.info("Emergency stop state cleared after successful %s", command.command)
+
+        if self.needs_home() and isinstance(command, (HomeCommand, RecoverCommand)):
+            if command.axes is not None:
+                self.clear_needs_home_axes(list(command.axes))
+            elif isinstance(command, HomeCommand):
+                # A recover without axes homes nothing, so it cannot answer a needs-home.
+                self.clear_needs_home()
+            logger.info("Needs-home flag cleared after successful homing")
+
+    @staticmethod
+    def _success_payload(
+        result: RobotCommandSuccessful,
+        command: Optional[RobotCommands],
+        operation: Optional[QueuedOperation],
+    ) -> dict[str, Any]:
+        payload = result.model_dump(mode="json")
+        payload["command_id"] = operation.command_id if operation is not None else None
+        payload["request_id"] = getattr(command, "request_id", None)
+        if operation is not None and operation.visibility == "internal":
+            payload["visibility"] = "internal"
+        return payload
+
+    @staticmethod
+    def _fault_error_type(*, is_grip_fault: bool, is_hardware_fault: bool) -> str:
+        if is_grip_fault:
+            return "GripVerification"
+        if is_hardware_fault:
+            return "HardwareFault"
+        return "CommandExecutionError"
+
+    def _set_fault_needs_home(self, err: Exception, *, is_grip_fault: bool, is_hardware_fault: bool) -> None:
+        if is_grip_fault:
+            self.set_needs_home(str(err), axes=fault_needs_home_axes(self._robot, err))
+            logger.warning("Gripper feedback fault - tool needs recovery: %s", err, exc_info=err)
+        elif is_hardware_fault:
+            self.set_needs_home(str(err), axes=fault_needs_home_axes(self._robot, err))
+            logger.warning("Hardware fault detected - robot in crash state: %s", type(err).__name__, exc_info=err)
+        elif is_rotation_clearance_refusal(err):
+            # Nothing moved; only a sibling motor this run cancelled has to home ([] is a no-op).
+            self.set_needs_home(str(err), axes=fault_needs_home_axes(self._robot, err))
 
     def _clear_current_command_state(
         self,
