@@ -1027,22 +1027,7 @@ async def _apply_mode_transition() -> None:
 	LAST_MODE_FILE.write_text(mode.value, encoding="utf-8")
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-	runtime_paths = RuntimeStatePaths.current()
-	logger.info(
-		"application_starting",
-		app_title=app.title,
-		mode=runtime_paths.mode.value,
-		config_path=str(runtime_paths.config_path),
-		database_path=str(runtime_paths.database_path) if os.getenv("DATABASE_URL") is None else None,
-		database_url_override=os.getenv("DATABASE_URL") is not None,
-		calibration_dir=str(runtime_paths.calibration_dir),
-	)
-	settings = get_settings()
-	is_mock = runtime_paths.mode == OperatingMode.mock
-	report_relay_service_token_configuration()
-
+async def _prepare_persistent_state(settings: Settings) -> None:
 	_run_migrations()
 
 	logger.info("initializing_database_schema")
@@ -1076,9 +1061,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 		await bin_storage.sync_config()
 		await bin_storage.recover_interrupted_workflows()
 
-	robot_init_task: Optional[asyncio.Task[None]] = None
-	camera_init_task: Optional[asyncio.Task[None]] = None
-	storage_override_set = False
+
+async def _start_robot_runtime(settings: Settings, is_mock: bool) -> Optional[asyncio.Task[None]]:
 	get_init_tracker().reset()
 	if is_mock:
 		await start_mock_robot_runtime()
@@ -1086,16 +1070,22 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 		get_init_tracker().report("mock_robot", "ready")
 		get_init_tracker().set_overall("ready")
 		logger.info("mock_robot_initialized")
-	elif settings.robot.enabled is True:
+		return None
+	if settings.robot.enabled is True:
 		logger.info("robot_initialization", status="starting_background")
-		robot_init_task = asyncio.create_task(init_robot_worker())
-	else:
-		logger.info("robot_disabled", reason="settings_configuration")
-		get_init_tracker().set_overall("disabled")
+		return asyncio.create_task(init_robot_worker())
+	logger.info("robot_disabled", reason="settings_configuration")
+	get_init_tracker().set_overall("disabled")
+	return None
 
+
+async def _start_peripheral_hardware(settings: Settings, is_mock: bool) -> list[str]:
+	"""Start cameras, the iobox sizer and the crash video recorder; return camera ids. None in mock mode."""
 	camera_ids: list[str] = []
+	if is_mock:
+		return camera_ids
 
-	tool_camera_url = None if is_mock else _get_tool_camera_url(settings)
+	tool_camera_url = _get_tool_camera_url(settings)
 	if tool_camera_url is not None and tool_camera_url != "":
 		tool_recording_url = settings.tool_camera.recording_url
 		try:
@@ -1105,7 +1095,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 		except Exception as e:
 			logger.error("tool_camera_initialization_failed", error=str(e), exc_info=True)
 
-	overhead_camera_url = None if is_mock else _get_overhead_camera_url(settings)
+	overhead_camera_url = _get_overhead_camera_url(settings)
 	if overhead_camera_url is not None and overhead_camera_url != "":
 		overhead_recording_url = settings.overhead_camera.recording_url
 		try:
@@ -1115,8 +1105,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 		except Exception as e:
 			logger.error("overhead_camera_initialization_failed", error=str(e), exc_info=True)
 
-	overview_camera_urls = {} if is_mock else _get_overview_camera_urls(settings)
-	for camera_id, rtsp_url in overview_camera_urls.items():
+	for camera_id, rtsp_url in _get_overview_camera_urls(settings).items():
 		overview_recording_url = _get_overview_camera_recording_urls(settings)[camera_id]
 		try:
 			await init_overview_camera_manager(camera_id, rtsp_url, overview_recording_url)
@@ -1125,17 +1114,51 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 		except Exception as e:
 			logger.error("overview_camera_initialization_failed", camera_id=camera_id, error=str(e), exc_info=True)
 
-	if is_mock is False:
+	try:
+		await init_iobox_sizer()
+		if get_iobox_sizer_status()["enabled"] is True:
+			camera_ids.append("iobox_sizer")
+	except Exception as e:
+		logger.warning("iobox_sizer_startup_failed", error=str(e), error_type=type(e).__name__, exc_info=True)
+
+	await start_crash_video_recorder()
+	return camera_ids
+
+
+async def _cancel_init_task(task: Optional[asyncio.Task[None]], failure_event: str) -> None:
+	if task is not None and task.done() is False:
+		task.cancel()
 		try:
-			await init_iobox_sizer()
-			if get_iobox_sizer_status()["enabled"] is True:
-				camera_ids.append("iobox_sizer")
+			await task
+		except asyncio.CancelledError:
+			pass
 		except Exception as e:
-			logger.warning("iobox_sizer_startup_failed", error=str(e), error_type=type(e).__name__, exc_info=True)
+			logger.warning(failure_event, error=str(e), exc_info=True)
 
-	if is_mock is False:
-		await start_crash_video_recorder()
 
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+	runtime_paths = RuntimeStatePaths.current()
+	logger.info(
+		"application_starting",
+		app_title=app.title,
+		mode=runtime_paths.mode.value,
+		config_path=str(runtime_paths.config_path),
+		database_path=str(runtime_paths.database_path) if os.getenv("DATABASE_URL") is None else None,
+		database_url_override=os.getenv("DATABASE_URL") is not None,
+		calibration_dir=str(runtime_paths.calibration_dir),
+	)
+	settings = get_settings()
+	is_mock = runtime_paths.mode == OperatingMode.mock
+	report_relay_service_token_configuration()
+
+	await _prepare_persistent_state(settings)
+
+	camera_init_task: Optional[asyncio.Task[None]] = None
+	storage_override_set = False
+	robot_init_task = await _start_robot_runtime(settings, is_mock)
+
+	camera_ids = await _start_peripheral_hardware(settings, is_mock)
 	if len(camera_ids) > 0:
 		camera_init_task = asyncio.create_task(init_camera_progress(camera_ids))
 
@@ -1154,14 +1177,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 			await demo.shutdown_demo_cycle()
 		except Exception as e:
 			logger.warning("demo_cycle_shutdown_failed", error=str(e), error_type=type(e).__name__, exc_info=True)
-		if camera_init_task is not None and camera_init_task.done() is False:
-			camera_init_task.cancel()
-			try:
-				await camera_init_task
-			except asyncio.CancelledError:
-				pass
-			except Exception as e:
-				logger.warning("camera_init_task_shutdown_failed", error=str(e), exc_info=True)
+		await _cancel_init_task(camera_init_task, "camera_init_task_shutdown_failed")
 		try:
 			await stop_crash_video_recorder()
 		except Exception as e:
@@ -1170,14 +1186,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 			await stop_all_camera_streams()
 		except Exception as e:
 			logger.warning("camera_stream_shutdown_failed", error=str(e), error_type=type(e).__name__, exc_info=True)
-		if robot_init_task is not None and robot_init_task.done() is False:
-			robot_init_task.cancel()
-			try:
-				await robot_init_task
-			except asyncio.CancelledError:
-				pass
-			except Exception as e:
-				logger.warning("robot_init_task_shutdown_failed", error=str(e), exc_info=True)
+		await _cancel_init_task(robot_init_task, "robot_init_task_shutdown_failed")
 		if is_mock:
 			await stop_mock_robot_runtime()
 			logger.info("mock_robot_stopped")
