@@ -1038,6 +1038,220 @@ def _correct_moving_sample(
 	sample.depth_position_mm = depth_position_mm
 
 
+class _MovingReads:
+	"""Per-read state of a pass's moving loop: the samples it keeps and the motion it has seen."""
+
+	def __init__(
+		self,
+		*,
+		samples: list[FlyingScanSample],
+		progress: _PassProgress,
+		plan: _PassPlan,
+		start_mm: float,
+		start_position_mm: float,
+		started_at: float,
+		capture_latency_s: float,
+	) -> None:
+		self.samples = samples
+		self.progress = progress
+		self.plan = plan
+		self.start_mm = start_mm
+		self.start_position_mm = start_position_mm
+		self.started_at = started_at
+		self.capture_latency_s = capture_latency_s
+		# The stop predicate and progress only see samples past the lead-in: a stateful predicate
+		# would otherwise track a run that started before the grid, from under-corrected samples.
+		self.is_armed = plan.has_full_lead_in is False
+		self.has_moved = False
+		self.last_position_mm = start_position_mm
+		self.last_progress_at = started_at
+		# Encoder delay of each moving read; the history includes dropped reads so a bus that slows
+		# down for good raises the cap instead of discarding the rest of the line.
+		self.encoder_delays_s: deque[float] = deque(maxlen=FLYING_SCAN_SLOW_READ_WINDOW)
+		self.dropped_slow_reads = 0
+		# Index in `samples` of the first read after the axis left its start position; earlier reads
+		# were taken during the trigger dwell and stay out of the velocity estimate.
+		self.first_moving_index: Optional[int] = None
+
+	def record(
+		self,
+		*,
+		depth_mm: Any,
+		position_mm: float,
+		laser_replied_at: float,
+		sampled_at: float,
+	) -> tuple[bool, bool]:
+		"""Classify one moving read and keep it if it is a sample; return (is_sample, has_arrived)."""
+		encoder_delay_s = sampled_at - laser_replied_at
+		slow_read_cap_s = resolve_slow_read_cap_s(self.encoder_delays_s)
+		baseline_delay_s = (
+			min(self.encoder_delays_s) if slow_read_cap_s is not None else encoder_delay_s
+		)
+		self.encoder_delays_s.append(encoder_delay_s)
+		# Past the cap the encoder read is too late for any correction to say where the beam
+		# was. Keep the read for the motion checks but leave it out of the samples, so it
+		# neither bins nor feeds the velocity or stop predicate.
+		is_slow_read = slow_read_cap_s is not None and encoder_delay_s > slow_read_cap_s
+		# The axis may have stopped anywhere inside the latency window before this read, so
+		# no velocity correction can place its depth; the settled end sample covers the end.
+		has_arrived = self.plan.direction * (position_mm - self.plan.motion_end_mm) >= -FLYING_SCAN_ARRIVAL_TOLERANCE_MM
+
+		if is_slow_read is True:
+			self.dropped_slow_reads += 1
+
+		is_sample = is_slow_read is False and has_arrived is False
+
+		if is_sample is True:
+			self._keep_sample(
+				depth_mm=depth_mm,
+				position_mm=position_mm,
+				sampled_at=sampled_at,
+				encoder_delay_s=encoder_delay_s,
+				latency_s=self.capture_latency_s + max(0.0, encoder_delay_s - baseline_delay_s),
+			)
+
+		return is_sample, has_arrived
+
+	def _keep_sample(
+		self,
+		*,
+		depth_mm: Any,
+		position_mm: float,
+		sampled_at: float,
+		encoder_delay_s: float,
+		latency_s: float,
+	) -> None:
+		sample = FlyingScanSample(
+			position_mm=position_mm,
+			depth_mm=None if depth_mm is None else float(depth_mm),
+			elapsed_s=sampled_at - self.started_at,
+			encoder_delay_s=encoder_delay_s,
+		)
+		self.samples.append(sample)
+
+		if (
+			self.first_moving_index is None
+			and abs(position_mm - self.start_position_mm) > FLYING_SCAN_PROGRESS_EPS_MM
+		):
+			self.first_moving_index = len(self.samples) - 1
+
+		_correct_moving_sample(
+			self.samples,
+			first_moving_index=self.first_moving_index,
+			estimated_feed_mm_s=self.plan.estimated_feed_mm_s,
+			direction=self.plan.direction,
+			latency_s=latency_s,
+			start_position_mm=self.start_position_mm,
+		)
+		depth_at_mm = sample_scan_position_mm(sample)
+
+		if self.is_armed is False and self.plan.direction * (depth_at_mm - float(self.start_mm)) >= 0.0:
+			self.is_armed = True
+
+		if self.is_armed is True:
+			self.progress.cover(depth_at_mm)
+
+	def note_motion_and_has_stalled(self, *, position_mm: float, sampled_at: float) -> bool:
+		# Move the anchor only once motion clears the epsilon: at low feeds consecutive
+		# reads differ by less than it, and re-anchoring every read would never register
+		# the axis as moving.
+		if abs(position_mm - self.last_position_mm) > FLYING_SCAN_PROGRESS_EPS_MM:
+			self.has_moved = True
+			self.last_progress_at = sampled_at
+			self.last_position_mm = position_mm
+
+		if self.has_moved is True:
+			return (sampled_at - self.last_progress_at) > FLYING_SCAN_STALL_S
+
+		return (sampled_at - self.started_at) > FLYING_SCAN_START_STALL_S
+
+
+async def _take_start_sample(
+	*,
+	tool: Any,
+	samples: list[FlyingScanSample],
+	progress: _PassProgress,
+	start_position_mm: float,
+	started_at: float,
+) -> None:
+	start_depth_mm = await tool.get_laser_distance()
+	samples.append(
+		FlyingScanSample(
+			position_mm=start_position_mm,
+			depth_mm=None if start_depth_mm is None else float(start_depth_mm),
+			elapsed_s=time.monotonic() - started_at,
+		)
+	)
+	progress.cover(start_position_mm)
+
+
+async def _finish_pass(
+	*,
+	tool: Any,
+	scan_motor: Any,
+	samples: list[FlyingScanSample],
+	stopped_early: bool,
+	should_abort: Optional[Callable[[], bool]],
+	capture_latency_s: float,
+	started_at: float,
+) -> None:
+	if stopped_early is True:
+		await _stop_axis_early(scan_motor)
+		return
+
+	await tool.gantry_wait(should_abort=should_abort)
+	# Mirror the stationary start sample with one at the settled end: an axis limit can
+	# clamp the lead-out away, and without this read the latency-corrected cloud stops
+	# feed*latency short of the final grid position and leaves its bin empty. The laser
+	# reports the beam one capture latency late, so wait that out first; the depth then
+	# sits at the measured position with no latency shift.
+	if capture_latency_s > 0.0:
+		await asyncio.sleep(capture_latency_s)
+
+	end_depth_mm = await tool.get_laser_distance()
+	end_position_mm = float(await scan_motor.get_position())
+	samples.append(
+		FlyingScanSample(
+			position_mm=end_position_mm,
+			depth_mm=None if end_depth_mm is None else float(end_depth_mm),
+			elapsed_s=time.monotonic() - started_at,
+			depth_position_mm=end_position_mm,
+			velocity_mm_s=0.0,
+		)
+	)
+
+
+async def _clean_up_failed_pass(
+	exc: BaseException,
+	*,
+	tool: Any,
+	axis: str,
+	scan_motor: Any,
+	hold_motor: Any,
+	samples: list[FlyingScanSample],
+) -> None:
+	"""Stop the axes after a pass failed; the caller re-raises exc unless this raises instead."""
+	is_resumable = isinstance(exc, _RESUMABLE_INTERRUPTS)
+
+	if is_resumable:
+		exc.partial_samples = list(samples)
+
+	stop_failures = await _stop_flying_axes(tool, scan_motor, hold_motor)
+
+	try:
+		await _restore_axis_velocity(scan_motor)
+	except Exception as restore_exc:
+		logger.warning("flying %s pass could not restore the axis velocity", axis, exc_info=restore_exc)
+
+	# A guard or read-overrun interrupt is normally resumed, but not when the axes could
+	# not be confirmed stopped: fail the line instead of commanding a new pass into them.
+	if len(stop_failures) > 0 and is_resumable:
+		raise FlyingScanStopFailed(
+			f"flying {axis} pass stopped by {type(exc).__name__} but the stop write failed "
+			f"({'; '.join(stop_failures)})"
+		) from exc
+
+
 async def _scan_axis_flying_pass(
 	*,
 	tool: Any,
@@ -1114,30 +1328,24 @@ async def _scan_axis_flying_pass(
 	start_position_mm = float(await scan_motor.get_position())
 
 	if plan.has_full_lead_in is False:
-		start_depth_mm = await tool.get_laser_distance()
-		samples.append(
-			FlyingScanSample(
-				position_mm=start_position_mm,
-				depth_mm=None if start_depth_mm is None else float(start_depth_mm),
-				elapsed_s=time.monotonic() - started_at,
-			)
+		await _take_start_sample(
+			tool=tool,
+			samples=samples,
+			progress=progress,
+			start_position_mm=start_position_mm,
+			started_at=started_at,
 		)
-		progress.cover(start_position_mm)
 
-	# The stop predicate and progress only see samples past the lead-in: a stateful predicate
-	# would otherwise track a run that started before the grid, from under-corrected samples.
-	is_armed = plan.has_full_lead_in is False
-	has_moved = False
-	last_position_mm = start_position_mm
-	last_progress_at = started_at
+	reads = _MovingReads(
+		samples=samples,
+		progress=progress,
+		plan=plan,
+		start_mm=start_mm,
+		start_position_mm=start_position_mm,
+		started_at=started_at,
+		capture_latency_s=capture_latency_s,
+	)
 	stopped_early = False
-	# Encoder delay of each moving read; the history includes dropped reads so a bus that slows
-	# down for good raises the cap instead of discarding the rest of the line.
-	encoder_delays_s: deque[float] = deque(maxlen=FLYING_SCAN_SLOW_READ_WINDOW)
-	dropped_slow_reads = 0
-	# Index in `samples` of the first read after the axis left its start position; earlier reads
-	# were taken during the trigger dwell and stay out of the velocity estimate.
-	first_moving_index: Optional[int] = None
 
 	try:
 		did_start = await scan_motor.move_to_position_no_wait(plan.motion_end_mm, rpm=rpm)
@@ -1160,56 +1368,12 @@ async def _scan_axis_flying_pass(
 				)
 			)
 			sampled_at = time.monotonic()
-			encoder_delay_s = sampled_at - laser_replied_at
-			slow_read_cap_s = resolve_slow_read_cap_s(encoder_delays_s)
-			baseline_delay_s = (
-				min(encoder_delays_s) if slow_read_cap_s is not None else encoder_delay_s
+			is_sample, has_arrived = reads.record(
+				depth_mm=depth_mm,
+				position_mm=position_mm,
+				laser_replied_at=laser_replied_at,
+				sampled_at=sampled_at,
 			)
-			encoder_delays_s.append(encoder_delay_s)
-			# Past the cap the encoder read is too late for any correction to say where the beam
-			# was. Keep the read for the motion checks below but leave it out of the samples, so
-			# it neither bins nor feeds the velocity or stop predicate.
-			is_slow_read = slow_read_cap_s is not None and encoder_delay_s > slow_read_cap_s
-			# The axis may have stopped anywhere inside the latency window before this read, so
-			# no velocity correction can place its depth; the settled end sample covers the end.
-			has_arrived = plan.direction * (position_mm - plan.motion_end_mm) >= -FLYING_SCAN_ARRIVAL_TOLERANCE_MM
-
-			is_sample = is_slow_read is False and has_arrived is False
-
-			if is_slow_read is True:
-				dropped_slow_reads += 1
-
-			if is_sample is True:
-				sample = FlyingScanSample(
-					position_mm=position_mm,
-					depth_mm=None if depth_mm is None else float(depth_mm),
-					elapsed_s=sampled_at - started_at,
-					encoder_delay_s=encoder_delay_s,
-				)
-				samples.append(sample)
-
-				if (
-					first_moving_index is None
-					and abs(position_mm - start_position_mm) > FLYING_SCAN_PROGRESS_EPS_MM
-				):
-					first_moving_index = len(samples) - 1
-
-				_correct_moving_sample(
-					samples,
-					first_moving_index=first_moving_index,
-					estimated_feed_mm_s=plan.estimated_feed_mm_s,
-					direction=plan.direction,
-					latency_s=capture_latency_s + max(0.0, encoder_delay_s - baseline_delay_s),
-					start_position_mm=start_position_mm,
-				)
-				depth_at_mm = sample_scan_position_mm(sample)
-
-				if is_armed is False and plan.direction * (depth_at_mm - float(start_mm)) >= 0.0:
-					is_armed = True
-
-				if is_armed is True:
-					progress.cover(depth_at_mm)
-
 			progress.maybe_print(
 				printer,
 				sampled_at=sampled_at,
@@ -1220,28 +1384,14 @@ async def _scan_axis_flying_pass(
 
 			if (
 				is_sample is True
-				and is_armed is True
+				and reads.is_armed is True
 				and stop_when is not None
 				and stop_when(samples) is True
 			):
 				stopped_early = True
 				break
 
-			if has_arrived is True:
-				break
-
-			# Move the anchor only once motion clears the epsilon: at low feeds consecutive
-			# reads differ by less than it, and re-anchoring every read would never register
-			# the axis as moving.
-			if abs(position_mm - last_position_mm) > FLYING_SCAN_PROGRESS_EPS_MM:
-				has_moved = True
-				last_progress_at = sampled_at
-				last_position_mm = position_mm
-
-			if has_moved is True and (sampled_at - last_progress_at) > FLYING_SCAN_STALL_S:
-				break
-
-			if has_moved is False and (sampled_at - started_at) > FLYING_SCAN_START_STALL_S:
+			if has_arrived is True or reads.note_motion_and_has_stalled(position_mm=position_mm, sampled_at=sampled_at) is True:
 				break
 
 			if (sampled_at - started_at) > FLYING_SCAN_MAX_LINE_SECONDS:
@@ -1250,50 +1400,24 @@ async def _scan_axis_flying_pass(
 					f"{FLYING_SCAN_MAX_LINE_SECONDS:.0f}s"
 				)
 
-		if stopped_early is True:
-			await _stop_axis_early(scan_motor)
-		else:
-			await tool.gantry_wait(should_abort=should_abort)
-			# Mirror the stationary start sample with one at the settled end: an axis limit can
-			# clamp the lead-out away, and without this read the latency-corrected cloud stops
-			# feed*latency short of the final grid position and leaves its bin empty. The laser
-			# reports the beam one capture latency late, so wait that out first; the depth then
-			# sits at the measured position with no latency shift.
-			if capture_latency_s > 0.0:
-				await asyncio.sleep(capture_latency_s)
-
-			end_depth_mm = await tool.get_laser_distance()
-			end_position_mm = float(await scan_motor.get_position())
-			samples.append(
-				FlyingScanSample(
-					position_mm=end_position_mm,
-					depth_mm=None if end_depth_mm is None else float(end_depth_mm),
-					elapsed_s=time.monotonic() - started_at,
-					depth_position_mm=end_position_mm,
-					velocity_mm_s=0.0,
-				)
-			)
+		await _finish_pass(
+			tool=tool,
+			scan_motor=scan_motor,
+			samples=samples,
+			stopped_early=stopped_early,
+			should_abort=should_abort,
+			capture_latency_s=capture_latency_s,
+			started_at=started_at,
+		)
 	except BaseException as exc:
-		is_resumable = isinstance(exc, _RESUMABLE_INTERRUPTS)
-
-		if is_resumable:
-			exc.partial_samples = list(samples)
-
-		stop_failures = await _stop_flying_axes(tool, scan_motor, hold_motor)
-
-		try:
-			await _restore_axis_velocity(scan_motor)
-		except Exception as restore_exc:
-			logger.warning("flying %s pass could not restore the axis velocity", axis, exc_info=restore_exc)
-
-		# A guard or read-overrun interrupt is normally resumed, but not when the axes could
-		# not be confirmed stopped: fail the line instead of commanding a new pass into them.
-		if len(stop_failures) > 0 and is_resumable:
-			raise FlyingScanStopFailed(
-				f"flying {axis} pass stopped by {type(exc).__name__} but the stop write failed "
-				f"({'; '.join(stop_failures)})"
-			) from exc
-
+		await _clean_up_failed_pass(
+			exc,
+			tool=tool,
+			axis=axis,
+			scan_motor=scan_motor,
+			hold_motor=hold_motor,
+			samples=samples,
+		)
 		raise
 
 	await _restore_axis_velocity(scan_motor)
@@ -1306,7 +1430,7 @@ async def _scan_axis_flying_pass(
 		rpm=int(rpm),
 		samples=samples,
 		duration_s=time.monotonic() - started_at,
-		dropped_slow_reads=dropped_slow_reads,
+		dropped_slow_reads=reads.dropped_slow_reads,
 		capture_latency_s=capture_latency_s,
 	)
 	printer(f"flying_line={progress_label} {line.metrics_text()}")
