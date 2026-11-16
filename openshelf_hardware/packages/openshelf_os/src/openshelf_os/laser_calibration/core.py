@@ -64,7 +64,10 @@ SHELF_SWEEP_X_STEP_MM = 4.0
 # candidate saves a ~1.8min fine scan.
 SHELF_SWEEP_MIN_CANDIDATE_WIDTH_MM = 22.0
 SHELF_HOLE_SWEEP_OFFSET_MM = 32.25
-SHELF_HOLE_SWEEP_OFFSETS_MM = [16.25, SHELF_HOLE_SWEEP_OFFSET_MM]
+# Upper-shelf openings span ~edge+30..+60mm, so +32.25 only grazes their bottom edge and drops
+# cells run to run (lb4a-2, lb4a-9, lb4a-10); +44.25 crosses their middle. +16.25 catches the
+# bottom shelf and must stay first: single-shelf rescans derive their probe row from offsets[0].
+SHELF_HOLE_SWEEP_OFFSETS_MM = [16.25, SHELF_HOLE_SWEEP_OFFSET_MM, 44.25]
 Y_AXIS_FLOOR_MM = 0.0
 FILLED_HOLE_MIN_DEPTH_DELTA_MM = 0.4
 FINE_SCAN_MARGIN_X_MM = 10.0
