@@ -54,6 +54,165 @@ async def run_staged_scan(
 			run_parameters=run_parameters,
 		)
 
+	previous_scan_log_path = core_module.CURRENT_SCAN_LOG_PATH
+	core_module.CURRENT_SCAN_LOG_PATH = recorder.log_path
+	print_status(f"run_dir={recorder.run_dir}")
+
+	(
+		coarse_scan,
+		candidates,
+		shelf_edges,
+		wall_depth_mm,
+		fine_entries,
+		fine_scan_results,
+		scan_started_at,
+	) = load_staged_scan_state(
+		recorder=recorder,
+		bounds=bounds,
+		fine_step_mm=fine_step_mm,
+	)
+
+	if recorder.metadata_path.exists() is False:
+		persist_staged_metadata(
+			recorder=recorder,
+			side=side,
+			bounds=bounds,
+			fine_step_mm=fine_step_mm,
+			settle_ms=settle_ms,
+			samples_per_point=samples_per_point,
+			coarse_settle_ms=coarse_settle_ms,
+			coarse_samples_per_point=coarse_samples_per_point,
+			wall_depth_mm=wall_depth_mm,
+			coarse_scan=coarse_scan,
+			candidates=candidates,
+			fine_entries=fine_entries,
+			status="starting",
+			scan_started_at=scan_started_at,
+			shelf_edges=shelf_edges,
+		)
+
+	try:
+		raise_if_cancelled(should_abort)
+		if scan_started_at is None:
+			scan_started_at = get_current_timestamp()
+			persist_scan_started_at(
+				recorder=recorder,
+				scan_started_at=scan_started_at,
+			)
+
+		await enter_scan_mode(tool, side, scan_config)
+		raise_if_cancelled(should_abort)
+		if len(candidates) == 0:
+			if seeded_candidates is not None and len(seeded_candidates) > 0:
+				candidates, wall_depth_mm = await prepare_seeded_candidates(
+					tool,
+					recorder=recorder,
+					bounds=bounds,
+					scan_config=scan_config,
+					coarse_scan=coarse_scan,
+					seeded_candidates=seeded_candidates,
+					seeded_wall_depth_mm=seeded_wall_depth_mm,
+					wall_depth_mm=wall_depth_mm,
+					should_abort=should_abort,
+				)
+			else:
+				coarse_scan, wall_depth_mm, candidates, shelf_edges = await run_coarse_scan_stage(
+					tool,
+					side=side,
+					bounds=bounds,
+					coarse_settle_ms=coarse_settle_ms,
+					coarse_samples_per_point=coarse_samples_per_point,
+					scan_config=scan_config,
+					recorder=recorder,
+					shelf_scout_only=shelf_scout_only,
+					known_shelf_edge_y=known_shelf_edge_y,
+					should_abort=should_abort,
+				)
+
+			persist_staged_metadata(
+				recorder=recorder,
+				side=side,
+				bounds=bounds,
+				fine_step_mm=fine_step_mm,
+				settle_ms=settle_ms,
+				samples_per_point=samples_per_point,
+				coarse_settle_ms=coarse_settle_ms,
+				coarse_samples_per_point=coarse_samples_per_point,
+				wall_depth_mm=wall_depth_mm,
+				coarse_scan=coarse_scan,
+				candidates=candidates,
+				fine_entries=fine_entries,
+				status="coarse-detect",
+				scan_started_at=scan_started_at,
+				shelf_edges=shelf_edges,
+			)
+		else:
+			print_status(
+				f"resume=fine candidates={len(candidates)} "
+				f"completed_candidates={len(fine_scan_results)}"
+			)
+
+		await run_fine_scan_stage(
+			tool,
+			recorder=recorder,
+			side=side,
+			bounds=bounds,
+			fine_step_mm=fine_step_mm,
+			settle_ms=settle_ms,
+			samples_per_point=samples_per_point,
+			coarse_settle_ms=coarse_settle_ms,
+			coarse_samples_per_point=coarse_samples_per_point,
+			scan_config=scan_config,
+			wall_depth_mm=wall_depth_mm,
+			coarse_scan=coarse_scan,
+			candidates=candidates,
+			shelf_edges=shelf_edges,
+			fine_entries=fine_entries,
+			fine_scan_results=fine_scan_results,
+			scan_started_at=scan_started_at,
+			should_abort=should_abort,
+		)
+	finally:
+		core_module.CURRENT_SCAN_LOG_PATH = previous_scan_log_path
+
+		if should_skip_motion_cleanup_on_cancel() is False:
+			await tool.retract()
+
+	return build_staged_scan_result(
+		recorder=recorder,
+		side=side,
+		bounds=bounds,
+		fine_step_mm=fine_step_mm,
+		settle_ms=settle_ms,
+		samples_per_point=samples_per_point,
+		coarse_settle_ms=coarse_settle_ms,
+		coarse_samples_per_point=coarse_samples_per_point,
+		scan_config=scan_config,
+		scans_dir=scans_dir,
+		shelf_scout_only=shelf_scout_only,
+		wall_depth_mm=wall_depth_mm,
+		coarse_scan=coarse_scan,
+		candidates=candidates,
+		shelf_edges=shelf_edges,
+		fine_scan_results=fine_scan_results,
+		scan_started_at=scan_started_at,
+	)
+
+
+def load_staged_scan_state(
+	*,
+	recorder: StagedScanRecorder,
+	bounds: ScanBounds,
+	fine_step_mm: float,
+) -> tuple[
+	GridScanResult,
+	list[GapCandidateRegion],
+	list[ShelfSurfaceEdge],
+	float,
+	list[dict[str, Any]],
+	list[tuple[ScanBounds, GridScanResult, list[ScanDetectedCell]]],
+	Optional[str],
+]:
 	coarse_scan = GridScanResult(x_positions=[], y_positions=[], depth_rows=[])
 	candidates: list[GapCandidateRegion] = []
 	shelf_edges: list[ShelfSurfaceEdge] = []
@@ -61,12 +220,7 @@ async def run_staged_scan(
 	metadata: dict[str, Any] = {}
 	fine_entries: list[dict[str, Any]] = []
 	fine_scan_results: list[tuple[ScanBounds, GridScanResult, list[ScanDetectedCell]]] = []
-	all_detected_cells: list[ScanDetectedCell] = []
 	scan_started_at: Optional[str] = None
-
-	previous_scan_log_path = core_module.CURRENT_SCAN_LOG_PATH
-	core_module.CURRENT_SCAN_LOG_PATH = recorder.log_path
-	print_status(f"run_dir={recorder.run_dir}")
 
 	if recorder.metadata_path.exists() is True:
 		metadata = load_json_file(recorder.metadata_path)
@@ -109,318 +263,362 @@ async def run_staged_scan(
 			for cell in fine_entry.get("detected_cells", [])
 		]
 		fine_scan_results.append((fine_bounds, fine_scan, detected_cells))
-		all_detected_cells.extend(detected_cells)
 
-	if recorder.metadata_path.exists() is False:
-		persist_staged_metadata(
-			recorder=recorder,
-			side=side,
+	return (
+		coarse_scan,
+		candidates,
+		shelf_edges,
+		wall_depth_mm,
+		fine_entries,
+		fine_scan_results,
+		scan_started_at,
+	)
+
+
+async def prepare_seeded_candidates(
+	tool: Any,
+	*,
+	recorder: StagedScanRecorder,
+	bounds: ScanBounds,
+	scan_config: Any,
+	coarse_scan: GridScanResult,
+	seeded_candidates: list[GapCandidateRegion],
+	seeded_wall_depth_mm: float | None,
+	wall_depth_mm: float,
+	should_abort: Callable[[], bool] | None,
+) -> tuple[list[GapCandidateRegion], float]:
+	candidates = list(seeded_candidates)
+
+	if seeded_wall_depth_mm is not None:
+		wall_depth_mm = float(seeded_wall_depth_mm)
+
+
+	if wall_depth_mm <= 0.0:
+		def didRecordSeededFlyingLine(probe_label: str, flying_line: Any) -> None:
+			write_flying_line_samples(
+				run_dir=recorder.run_dir,
+				label=probe_label,
+				line=flying_line,
+			)
+
+		await estimate_seeded_candidate_wall_depths(
+			tool,
 			bounds=bounds,
-			fine_step_mm=fine_step_mm,
-			settle_ms=settle_ms,
-			samples_per_point=samples_per_point,
-			coarse_settle_ms=coarse_settle_ms,
-			coarse_samples_per_point=coarse_samples_per_point,
-			wall_depth_mm=wall_depth_mm,
-			coarse_scan=coarse_scan,
 			candidates=candidates,
-			fine_entries=fine_entries,
-			status="starting",
-			scan_started_at=scan_started_at,
-			shelf_edges=shelf_edges,
+			scan_config=scan_config,
+			coarse_scan=coarse_scan,
+			should_abort=should_abort,
+			on_flying_line=didRecordSeededFlyingLine,
 		)
+	if wall_depth_mm <= 0.0:
+		seeded_wall_depth_values = [
+			float(candidate.wall_depth_mm)
+			for candidate in candidates
+			if candidate.wall_depth_mm is not None and candidate.wall_depth_mm > 0.0
+		]
+
+		if len(seeded_wall_depth_values) > 0:
+
+			seeded_wall_depth_array = np.array(seeded_wall_depth_values, dtype=np.float32)
+
+			wall_depth_mm = float(np.median(seeded_wall_depth_array))
+
+	if wall_depth_mm <= 0.0:
+		raise ValueError("Seeded fine scan requires a valid wall depth")
+
+	print_status(
+		f"phase=seeded-fine candidates={len(candidates)} "
+		f"wall_depth_mm={wall_depth_mm:.2f}"
+	)
+	return candidates, wall_depth_mm
+
+
+async def run_coarse_scan_stage(
+	tool: Any,
+	*,
+	side: StorageModuleSide,
+	bounds: ScanBounds,
+	coarse_settle_ms: int,
+	coarse_samples_per_point: int,
+	scan_config: Any,
+	recorder: StagedScanRecorder,
+	shelf_scout_only: bool,
+	known_shelf_edge_y: Optional[list[float]],
+	should_abort: Callable[[], bool] | None,
+) -> tuple[GridScanResult, float, list[GapCandidateRegion], list[ShelfSurfaceEdge]]:
+	print_status("phase=coarse-scan")
+
+	coarse_scan, wall_depth_mm, candidates, shelf_edges = await capture_shelf_candidates(
+		tool,
+		side=side,
+		bounds=bounds,
+		settle_ms=coarse_settle_ms,
+		samples_per_point=coarse_samples_per_point,
+		scan_config=scan_config,
+		recorder=recorder,
+		shelf_scout_only=shelf_scout_only,
+		known_shelf_edge_y=known_shelf_edge_y,
+		should_abort=should_abort,
+	)
+	raise_if_cancelled(should_abort)
+
+	print_status("phase=coarse-detect")
+	print_status(
+		f"coarse_candidates={len(candidates)} "
+		f"coarse_rows={len([row for row in coarse_scan.depth_rows if any(value is not None for value in row)])} "
+		f"wall_depth_mm={wall_depth_mm:.2f}"
+	)
+	return coarse_scan, wall_depth_mm, candidates, shelf_edges
+
+
+async def run_fine_scan_stage(
+	tool: Any,
+	*,
+	recorder: StagedScanRecorder,
+	side: StorageModuleSide,
+	bounds: ScanBounds,
+	fine_step_mm: float,
+	settle_ms: int,
+	samples_per_point: int,
+	coarse_settle_ms: int,
+	coarse_samples_per_point: int,
+	scan_config: Any,
+	wall_depth_mm: float,
+	coarse_scan: GridScanResult,
+	candidates: list[GapCandidateRegion],
+	shelf_edges: list[ShelfSurfaceEdge],
+	fine_entries: list[dict[str, Any]],
+	fine_scan_results: list[tuple[ScanBounds, GridScanResult, list[ScanDetectedCell]]],
+	scan_started_at: Optional[str],
+	should_abort: Callable[[], bool] | None,
+) -> None:
+	is_y_brake_disabled = False
 
 	try:
-		raise_if_cancelled(should_abort)
-		if scan_started_at is None:
-			scan_started_at = get_current_timestamp()
-			persist_scan_started_at(
-				recorder=recorder,
-				scan_started_at=scan_started_at,
-			)
+		if len(candidates) > 0:
+			raise_if_cancelled(should_abort)
+			await set_y_brake_for_scan_motion(tool, is_enabled=False)
+			is_y_brake_disabled = True
 
-		await enter_scan_mode(tool, side, scan_config)
-		raise_if_cancelled(should_abort)
-		if len(candidates) == 0:
-			if seeded_candidates is not None and len(seeded_candidates) > 0:
-				candidates = list(seeded_candidates)
-
-				if seeded_wall_depth_mm is not None:
-					wall_depth_mm = float(seeded_wall_depth_mm)
-
-
-				if wall_depth_mm <= 0.0:
-					def didRecordSeededFlyingLine(probe_label: str, flying_line: Any) -> None:
-						write_flying_line_samples(
-							run_dir=recorder.run_dir,
-							label=probe_label,
-							line=flying_line,
-						)
-
-					await estimate_seeded_candidate_wall_depths(
-						tool,
-						bounds=bounds,
-						candidates=candidates,
-						scan_config=scan_config,
-						coarse_scan=coarse_scan,
-						should_abort=should_abort,
-						on_flying_line=didRecordSeededFlyingLine,
-					)
-				if wall_depth_mm <= 0.0:
-					seeded_wall_depth_values = [
-						float(candidate.wall_depth_mm)
-						for candidate in candidates
-						if candidate.wall_depth_mm is not None and candidate.wall_depth_mm > 0.0
-					]
-
-					if len(seeded_wall_depth_values) > 0:
-
-						seeded_wall_depth_array = np.array(seeded_wall_depth_values, dtype=np.float32)
-
-						wall_depth_mm = float(np.median(seeded_wall_depth_array))
-
-				if wall_depth_mm <= 0.0:
-					raise ValueError("Seeded fine scan requires a valid wall depth")
-
-				print_status(
-					f"phase=seeded-fine candidates={len(candidates)} "
-					f"wall_depth_mm={wall_depth_mm:.2f}"
-				)
-				persist_staged_metadata(
-					recorder=recorder,
-					side=side,
-					bounds=bounds,
-					fine_step_mm=fine_step_mm,
-					settle_ms=settle_ms,
-					samples_per_point=samples_per_point,
-					coarse_settle_ms=coarse_settle_ms,
-					coarse_samples_per_point=coarse_samples_per_point,
-					wall_depth_mm=wall_depth_mm,
-					coarse_scan=coarse_scan,
-					candidates=candidates,
-					fine_entries=fine_entries,
-					status="coarse-detect",
-					scan_started_at=scan_started_at,
-					shelf_edges=shelf_edges,
-				)
+		for candidate_idx, candidate in enumerate(candidates, start=1):
+			raise_if_cancelled(should_abort)
+			if candidate_idx <= len(fine_entries):
+				existing_fine_entry = fine_entries[candidate_idx - 1]
 			else:
-				print_status("phase=coarse-scan")
+				existing_fine_entry = {}
 
-				coarse_scan, wall_depth_mm, candidates, shelf_edges = await capture_shelf_candidates(
-					tool,
-					side=side,
-					bounds=bounds,
-					settle_ms=coarse_settle_ms,
-					samples_per_point=coarse_samples_per_point,
-					scan_config=scan_config,
-					recorder=recorder,
-					shelf_scout_only=shelf_scout_only,
-					known_shelf_edge_y=known_shelf_edge_y,
-					should_abort=should_abort,
-				)
-				raise_if_cancelled(should_abort)
+			if existing_fine_entry.get("status") in {"completed", "aborted"}:
+				continue
 
-				print_status("phase=coarse-detect")
-				print_status(
-					f"coarse_candidates={len(candidates)} "
-					f"coarse_rows={len([row for row in coarse_scan.depth_rows if any(value is not None for value in row)])} "
-					f"wall_depth_mm={wall_depth_mm:.2f}"
-				)
-				persist_staged_metadata(
-					recorder=recorder,
-					side=side,
-					bounds=bounds,
-					fine_step_mm=fine_step_mm,
-					settle_ms=settle_ms,
-					samples_per_point=samples_per_point,
-					coarse_settle_ms=coarse_settle_ms,
-					coarse_samples_per_point=coarse_samples_per_point,
-					wall_depth_mm=wall_depth_mm,
-					coarse_scan=coarse_scan,
-					candidates=candidates,
-					fine_entries=fine_entries,
-					status="coarse-detect",
-					scan_started_at=scan_started_at,
-					shelf_edges=shelf_edges,
-				)
-		else:
+			fine_bounds = build_fine_scan_bounds(
+				candidate,
+				overall_bounds=bounds,
+				scan_config=scan_config,
+			)
+			candidate_wall_depth_mm = wall_depth_mm
+
+			if candidate.wall_depth_mm is not None:
+				candidate_wall_depth_mm = float(candidate.wall_depth_mm)
+
 			print_status(
-				f"resume=fine candidates={len(candidates)} "
-				f"completed_candidates={len(fine_scan_results)}"
+				f"phase=fine-scan candidate={candidate_idx}/{len(candidates)} "
+				f"bounds:x=({fine_bounds.x_min:.2f},{fine_bounds.x_max:.2f}) "
+				f"y=({fine_bounds.y_min:.2f},{fine_bounds.y_max:.2f})"
 			)
 
-		is_y_brake_disabled = False
+			fine_path = recorder.run_dir / f"fine_{candidate_idx - 1:02d}.npy"
 
-		try:
-			if len(candidates) > 0:
-				raise_if_cancelled(should_abort)
-				await set_y_brake_for_scan_motion(tool, is_enabled=False)
-				is_y_brake_disabled = True
+			while len(fine_entries) < candidate_idx:
+				fine_entries.append({})
 
-			for candidate_idx, candidate in enumerate(candidates, start=1):
-				raise_if_cancelled(should_abort)
-				if candidate_idx <= len(fine_entries):
-					existing_fine_entry = fine_entries[candidate_idx - 1]
-				else:
-					existing_fine_entry = {}
+			fine_entries[candidate_idx - 1] = {
+				"candidate_index": candidate_idx - 1,
+				"status": "running",
+				"bounds": fine_bounds.model_dump(),
+				"raw_scan_path": str(fine_path),
+				"x_positions": existing_fine_entry.get("x_positions", []),
+				"y_positions": existing_fine_entry.get("y_positions", []),
+				"detected_cells": existing_fine_entry.get("detected_cells", []),
+			}
 
-				if existing_fine_entry.get("status") in {"completed", "aborted"}:
-					continue
+			selected_fine_bounds, fine_scan, detected_cells = await capture_candidate_fine_scan(
+				tool,
+				recorder=recorder,
+				candidate=candidate,
+				candidate_idx=candidate_idx,
+				candidates=candidates,
+				fine_bounds=fine_bounds,
+				bounds=bounds,
+				fine_path=fine_path,
+				fine_step_mm=fine_step_mm,
+				settle_ms=settle_ms,
+				samples_per_point=samples_per_point,
+				wall_depth_mm=candidate_wall_depth_mm,
+				scan_config=scan_config,
+				fine_entries=fine_entries,
+				should_abort=should_abort,
+			)
 
-				fine_bounds = build_fine_scan_bounds(
-					candidate,
-					overall_bounds=bounds,
-					scan_config=scan_config,
-				)
-				selected_fine_bounds = fine_bounds
-				candidate_wall_depth_mm = wall_depth_mm
+			print_status(
+				f"fine_detected_cells={len(detected_cells)} "
+				f"candidate={candidate_idx}/{len(candidates)}"
+			)
+			fine_scan_results.append((selected_fine_bounds, fine_scan, detected_cells))
+			fine_entries[candidate_idx - 1] = {
+				"candidate_index": candidate_idx - 1,
+				"status": "completed",
+				"bounds": selected_fine_bounds.model_dump(),
+				"raw_scan_path": str(fine_path),
+				"x_positions": fine_scan.x_positions,
+				"y_positions": fine_scan.y_positions,
+				"detected_cells": [cell.model_dump() for cell in detected_cells],
+			}
+			persist_staged_metadata(
+				recorder=recorder,
+				side=side,
+				bounds=bounds,
+				fine_step_mm=fine_step_mm,
+				settle_ms=settle_ms,
+				samples_per_point=samples_per_point,
+				coarse_settle_ms=coarse_settle_ms,
+				coarse_samples_per_point=coarse_samples_per_point,
+				wall_depth_mm=wall_depth_mm,
+				coarse_scan=coarse_scan,
+				candidates=candidates,
+				fine_entries=fine_entries,
+				status="fine-scan",
+				scan_started_at=scan_started_at,
+				shelf_edges=shelf_edges,
+			)
+	finally:
+		if is_y_brake_disabled is True:
+			await set_y_brake_for_scan_motion(tool, is_enabled=True)
 
-				if candidate.wall_depth_mm is not None:
-					candidate_wall_depth_mm = float(candidate.wall_depth_mm)
 
+async def capture_candidate_fine_scan(
+	tool: Any,
+	*,
+	recorder: StagedScanRecorder,
+	candidate: GapCandidateRegion,
+	candidate_idx: int,
+	candidates: list[GapCandidateRegion],
+	fine_bounds: ScanBounds,
+	bounds: ScanBounds,
+	fine_path: Path,
+	fine_step_mm: float,
+	settle_ms: int,
+	samples_per_point: int,
+	wall_depth_mm: float,
+	scan_config: Any,
+	fine_entries: list[dict[str, Any]],
+	should_abort: Callable[[], bool] | None,
+) -> tuple[ScanBounds, GridScanResult, list[ScanDetectedCell]]:
+	selected_fine_bounds = fine_bounds
+
+	def didUpdateFineScan(
+		partial_scan: GridScanResult,
+		probe_label: str,
+		probe_position_mm: float,
+	) -> None:
+		save_depth_rows_to_npy(
+			output_path=fine_path,
+			depth_rows=partial_scan.depth_rows,
+		)
+		persist_scan_progress(
+			recorder=recorder,
+			phase="fine-scan",
+			progress={
+				"candidate_idx": candidate_idx,
+				"candidate_count": len(candidates),
+				"probe": probe_label,
+				"probe_position_mm": probe_position_mm,
+				"fine_path": str(fine_path),
+			},
+		)
+		fine_entries[candidate_idx - 1]["x_positions"] = partial_scan.x_positions
+		fine_entries[candidate_idx - 1]["y_positions"] = partial_scan.y_positions
+
+	def didRecordFlyingLine(probe_label: str, flying_line: Any) -> None:
+		write_flying_line_samples(
+			run_dir=recorder.run_dir,
+			label=probe_label,
+			line=flying_line,
+		)
+
+	# A retry re-flies the same horizontal rows, so the first attempt's lines are kept for it.
+	with reuse_flown_fine_lines():
+		fine_scan, detected_cells = await capture_cross_scan(
+			tool,
+			candidate=candidate,
+			bounds=selected_fine_bounds,
+			step_mm=fine_step_mm,
+			settle_ms=settle_ms,
+			samples_per_point=samples_per_point,
+			wall_depth_mm=wall_depth_mm,
+			scan_config=scan_config,
+			progress_prefix=f"fine_{candidate_idx}",
+			on_update=didUpdateFineScan,
+			should_abort=should_abort,
+			on_flying_line=didRecordFlyingLine,
+		)
+		raise_if_cancelled(should_abort)
+
+		if len(detected_cells) == 0:
+			retry_fine_bounds = build_fine_scan_retry_bounds(
+				candidate,
+				current_bounds=selected_fine_bounds,
+				overall_bounds=bounds,
+				scan_config=scan_config,
+			)
+
+			if scan_bounds_match(retry_fine_bounds, selected_fine_bounds) is False:
 				print_status(
-					f"phase=fine-scan candidate={candidate_idx}/{len(candidates)} "
-					f"bounds:x=({fine_bounds.x_min:.2f},{fine_bounds.x_max:.2f}) "
-					f"y=({fine_bounds.y_min:.2f},{fine_bounds.y_max:.2f})"
+					f"phase=fine-scan-retry candidate={candidate_idx}/{len(candidates)} "
+					f"bounds:x=({retry_fine_bounds.x_min:.2f},{retry_fine_bounds.x_max:.2f}) "
+					f"y=({retry_fine_bounds.y_min:.2f},{retry_fine_bounds.y_max:.2f})"
 				)
-
-				fine_path = recorder.run_dir / f"fine_{candidate_idx - 1:02d}.npy"
-
-				while len(fine_entries) < candidate_idx:
-					fine_entries.append({})
-
-				fine_entries[candidate_idx - 1] = {
-					"candidate_index": candidate_idx - 1,
-					"status": "running",
-					"bounds": fine_bounds.model_dump(),
-					"raw_scan_path": str(fine_path),
-					"x_positions": existing_fine_entry.get("x_positions", []),
-					"y_positions": existing_fine_entry.get("y_positions", []),
-					"detected_cells": existing_fine_entry.get("detected_cells", []),
-				}
-
-				def didUpdateFineScan(
-					partial_scan: GridScanResult,
-					probe_label: str,
-					probe_position_mm: float,
-				) -> None:
-					save_depth_rows_to_npy(
-						output_path=fine_path,
-						depth_rows=partial_scan.depth_rows,
-					)
-					persist_scan_progress(
-						recorder=recorder,
-						phase="fine-scan",
-						progress={
-							"candidate_idx": candidate_idx,
-							"candidate_count": len(candidates),
-							"probe": probe_label,
-							"probe_position_mm": probe_position_mm,
-							"fine_path": str(fine_path),
-						},
-					)
-					fine_entries[candidate_idx - 1]["x_positions"] = partial_scan.x_positions
-					fine_entries[candidate_idx - 1]["y_positions"] = partial_scan.y_positions
-
-				def didRecordFlyingLine(probe_label: str, flying_line: Any) -> None:
-					write_flying_line_samples(
-						run_dir=recorder.run_dir,
-						label=probe_label,
-						line=flying_line,
-					)
-
-				# A retry re-flies the same horizontal rows, so the first attempt's lines are kept for it.
-				with reuse_flown_fine_lines():
-					fine_scan, detected_cells = await capture_cross_scan(
-						tool,
-						candidate=candidate,
-						bounds=selected_fine_bounds,
-						step_mm=fine_step_mm,
-						settle_ms=settle_ms,
-						samples_per_point=samples_per_point,
-						wall_depth_mm=candidate_wall_depth_mm,
-						scan_config=scan_config,
-						progress_prefix=f"fine_{candidate_idx}",
-						on_update=didUpdateFineScan,
-						should_abort=should_abort,
-						on_flying_line=didRecordFlyingLine,
-					)
-					raise_if_cancelled(should_abort)
-
-					if len(detected_cells) == 0:
-						retry_fine_bounds = build_fine_scan_retry_bounds(
-							candidate,
-							current_bounds=selected_fine_bounds,
-							overall_bounds=bounds,
-							scan_config=scan_config,
-						)
-
-						if scan_bounds_match(retry_fine_bounds, selected_fine_bounds) is False:
-							print_status(
-								f"phase=fine-scan-retry candidate={candidate_idx}/{len(candidates)} "
-								f"bounds:x=({retry_fine_bounds.x_min:.2f},{retry_fine_bounds.x_max:.2f}) "
-								f"y=({retry_fine_bounds.y_min:.2f},{retry_fine_bounds.y_max:.2f})"
-							)
-							fine_scan, detected_cells = await capture_cross_scan(
-								tool,
-								candidate=candidate,
-								bounds=retry_fine_bounds,
-								step_mm=fine_step_mm,
-								settle_ms=settle_ms,
-								samples_per_point=samples_per_point,
-								wall_depth_mm=candidate_wall_depth_mm,
-								scan_config=scan_config,
-								progress_prefix=f"fine_{candidate_idx}_retry",
-								on_update=didUpdateFineScan,
-								should_abort=should_abort,
-								on_flying_line=didRecordFlyingLine,
-							)
-							raise_if_cancelled(should_abort)
-							selected_fine_bounds = retry_fine_bounds
-
-				print_status(
-					f"fine_detected_cells={len(detected_cells)} "
-					f"candidate={candidate_idx}/{len(candidates)}"
-				)
-				fine_scan_results.append((selected_fine_bounds, fine_scan, detected_cells))
-				all_detected_cells.extend(detected_cells)
-				fine_entries[candidate_idx - 1] = {
-					"candidate_index": candidate_idx - 1,
-					"status": "completed",
-					"bounds": selected_fine_bounds.model_dump(),
-					"raw_scan_path": str(fine_path),
-					"x_positions": fine_scan.x_positions,
-					"y_positions": fine_scan.y_positions,
-					"detected_cells": [cell.model_dump() for cell in detected_cells],
-				}
-				persist_staged_metadata(
-					recorder=recorder,
-					side=side,
-					bounds=bounds,
-					fine_step_mm=fine_step_mm,
+				fine_scan, detected_cells = await capture_cross_scan(
+					tool,
+					candidate=candidate,
+					bounds=retry_fine_bounds,
+					step_mm=fine_step_mm,
 					settle_ms=settle_ms,
 					samples_per_point=samples_per_point,
-					coarse_settle_ms=coarse_settle_ms,
-					coarse_samples_per_point=coarse_samples_per_point,
 					wall_depth_mm=wall_depth_mm,
-					coarse_scan=coarse_scan,
-					candidates=candidates,
-					fine_entries=fine_entries,
-					status="fine-scan",
-					scan_started_at=scan_started_at,
-					shelf_edges=shelf_edges,
+					scan_config=scan_config,
+					progress_prefix=f"fine_{candidate_idx}_retry",
+					on_update=didUpdateFineScan,
+					should_abort=should_abort,
+					on_flying_line=didRecordFlyingLine,
 				)
-		finally:
-			if is_y_brake_disabled is True:
-				await set_y_brake_for_scan_motion(tool, is_enabled=True)
-	finally:
-		core_module.CURRENT_SCAN_LOG_PATH = previous_scan_log_path
+				raise_if_cancelled(should_abort)
+				selected_fine_bounds = retry_fine_bounds
 
-		if should_skip_motion_cleanup_on_cancel() is False:
-			await tool.retract()
+	return selected_fine_bounds, fine_scan, detected_cells
 
+
+def build_staged_scan_result(
+	*,
+	recorder: StagedScanRecorder,
+	side: StorageModuleSide,
+	bounds: ScanBounds,
+	fine_step_mm: float,
+	settle_ms: int,
+	samples_per_point: int,
+	coarse_settle_ms: int,
+	coarse_samples_per_point: int,
+	scan_config: Any,
+	scans_dir: str,
+	shelf_scout_only: bool,
+	wall_depth_mm: float,
+	coarse_scan: GridScanResult,
+	candidates: list[GapCandidateRegion],
+	shelf_edges: list[ShelfSurfaceEdge],
+	fine_scan_results: list[tuple[ScanBounds, GridScanResult, list[ScanDetectedCell]]],
+	scan_started_at: Optional[str],
+) -> ScanAnalysisResult:
 	deduped_cells = dedupe_detected_cells(
-		all_detected_cells,
+		[cell for _, _, cells in fine_scan_results for cell in cells],
 		scan_config=scan_config,
 	)
 
