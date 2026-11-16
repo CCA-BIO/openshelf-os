@@ -742,47 +742,9 @@ class ImportJobService:
         # operator still needs to see why the bin did not come.
         refused = workflow is not None and workflow.state == "cancelled" and workflow.error is not None
         if workflow is not None and (workflow.state in ("retrieving_bin", "awaiting_operator", "failed") or refused):
-            phase = {
-                "retrieving_bin": "fetching",
-                "awaiting_operator": "filling",
-                "failed": "failed",
-                "cancelled": "failed",
-            }[workflow.state]
-            members = [unit for unit in placed if unit.bin_id == workflow.bin_id]
-            group: list[ImportJobUnit] = []
-            if job.state == "active":
-                anchor = members[0] if members else None
-                pending = await self.units(job, ["pending"])
-                small = [unit for unit in pending if unit.small]
-                if phase == "failed":
-                    # Try again fetches for the next item, so the step stays only while a tray takes it.
-                    trays = await self._trays()
-                    head = pending[0] if pending else None
-                    small = (
-                        await self._small_group(job, head, trays)
-                        if head is not None and head.small and self._tray_takes(trays, head)
-                        else []
-                    )
-                if anchor is None and small:
-                    anchor = small[0]
-                if anchor is not None:
-                    group = [unit for unit in small if unit.access_level_id == anchor.access_level_id]
-                    if phase != "failed":
-                        # Offer only the items the plan puts in the tray being delivered; the rest wait.
-                        tray_row = await self.session.get(StorageBin, workflow.bin_id)
-                        plan = await self._plan(group, tray_row, len(members)) if tray_row is not None else {}
-                        group = [
-                            unit for unit in group if (planned := plan.get(unit.id)) is not None and planned.id == workflow.bin_id
-                        ]
-            # A failed delivery only matters while its items still wait for a tray.
-            if phase != "failed" or group:
-                return {
-                    "kind": "tray",
-                    "phase": phase,
-                    "workflow": await self.bins.serialize_workflow(workflow),
-                    "units": [self.serialize_unit(unit) for unit in [*members, *group]],
-                    "error": workflow.error,
-                }
+            step = await self._delivery_step(job, workflow, placed)
+            if step is not None:
+                return step
         if returning or (
             # An empty tray going back has no returning units; its return workflow tracks it,
             # until the robot has put it back (a held return is not waited on).
@@ -806,6 +768,57 @@ class ImportJobService:
                 "error": next((unit.error for unit in placed if unit.error), None),
             }
         return None
+
+    async def _delivery_step(
+        self, job: ImportJob, workflow: StorageBinWorkflow, placed: Sequence[ImportJobUnit]
+    ) -> Optional[dict[str, Any]]:
+        """The step for a tray being fetched or filled, or whose delivery failed or was refused."""
+        phase = {
+            "retrieving_bin": "fetching",
+            "awaiting_operator": "filling",
+            "failed": "failed",
+            "cancelled": "failed",
+        }[workflow.state]
+        members = [unit for unit in placed if unit.bin_id == workflow.bin_id]
+        group = await self._delivery_group(job, workflow, phase == "failed", members) if job.state == "active" else []
+        # A failed delivery only matters while its items still wait for a tray.
+        if phase == "failed" and not group:
+            return None
+        return {
+            "kind": "tray",
+            "phase": phase,
+            "workflow": await self.bins.serialize_workflow(workflow),
+            "units": [self.serialize_unit(unit) for unit in [*members, *group]],
+            "error": workflow.error,
+        }
+
+    async def _delivery_group(
+        self, job: ImportJob, workflow: StorageBinWorkflow, failed: bool, members: Sequence[ImportJobUnit]
+    ) -> list[ImportJobUnit]:
+        """The pending units offered with the tray's own members."""
+        anchor = members[0] if members else None
+        pending = await self.units(job, ["pending"])
+        small = [unit for unit in pending if unit.small]
+        if failed:
+            # Try again fetches for the next item, so the step stays only while a tray takes it.
+            trays = await self._trays()
+            head = pending[0] if pending else None
+            small = (
+                await self._small_group(job, head, trays)
+                if head is not None and head.small and self._tray_takes(trays, head)
+                else []
+            )
+        if anchor is None and small:
+            anchor = small[0]
+        if anchor is None:
+            return []
+        group = [unit for unit in small if unit.access_level_id == anchor.access_level_id]
+        if failed:
+            return group
+        # Offer only the items the plan puts in the tray being delivered; the rest wait.
+        tray_row = await self.session.get(StorageBin, workflow.bin_id)
+        plan = await self._plan(group, tray_row, len(members)) if tray_row is not None else {}
+        return [unit for unit in group if (planned := plan.get(unit.id)) is not None and planned.id == workflow.bin_id]
 
     # ------------------------------------------------------------- serialize
 
