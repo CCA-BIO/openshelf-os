@@ -93,177 +93,195 @@ async def _apply_robot_event(
     payload: dict[str, Any], worker: Optional[RobotEventPublisher] = None
 ) -> None:
     active_worker = worker or robot_core.robot_worker
-    if active_worker is not None:
-        bin_owned = False
-        try:
-            async with AsyncSessionLocal() as session:
-                bin_service = BinStorageService(session)
-                bin_owned = await bin_service.owns_robot_event(payload)
-                if payload.get("kind") == "label_scanned":
-                    if await bin_service.handle_scan(str(payload.get("payload", "")), active_worker):
-                        return
-                elif await bin_service.handle_robot_result(payload, active_worker):
-                    if (
-                        payload.get("command") == "store_item"
-                        and payload.get("message") == "success"
-                    ):
-                        await flush_telemetry(is_cycle=True)
-                    return
-        except Exception as err:
-            logger.exception("Failed to process bin workflow event: %s", err)
-
-        if bin_owned:
-            logger.warning("Skipping legacy mutation for bin-owned robot event: %s", payload)
-            return
+    if active_worker is not None and await _apply_bin_workflow_event(payload, active_worker):
+        return
 
     command = payload.get("command")
-    message = payload.get("message")
-
     if command == "retrieve_item":
-        if message != "success":
-            return
+        await _apply_retrieve_item(payload, active_worker)
+    elif command == "store_item":
+        await _apply_store_item(payload, active_worker)
 
-        location = payload.get("location") or {}
-        barcode = payload.get("barcode")
 
-        side = location.get("side")
-        shelf_idx = location.get("shelf_idx")
-        cell_idx = location.get("cell_idx")
-
-        if barcode is None or side is None or shelf_idx is None or cell_idx is None:
-            logger.warning("Skipping retrieve_item event with incomplete data: %s", payload)
-            return
-
-        try:
-            shelf_idx_int = int(shelf_idx)
-            cell_idx_int = int(cell_idx)
-        except (TypeError, ValueError):
-            logger.warning("Skipping retrieve_item event with non-integer location: %s", payload)
-            return
-
-        removed = False
+async def _apply_bin_workflow_event(
+    payload: dict[str, Any], active_worker: RobotEventPublisher
+) -> bool:
+    """Return True when the bin workflow consumed the event or owns it, so legacy mutation must not run."""
+    bin_owned = False
+    try:
         async with AsyncSessionLocal() as session:
-            if await BinStorageService(session).targets_reserved_bin_identity(payload):
-                logger.warning(
-                    "Skipping legacy mutation for reserved bin retrieve event: %s", payload
-                )
-                return
-            storage_service = StorageService(session)
-            try:
-                item = await storage_service.get_item(str(barcode))
-                if item is not None:
-                    if not apply_cycle_mass(item, payload.get("weight"), stored=False, command_id=payload.get("command_id")):
-                        return
-                removed = await storage_service.remove_item_location(barcode, side, shelf_idx_int, cell_idx_int, commit=False)
-                await session.commit()
-                if removed:
-                    logger.info(
-                        "Removed location for retrieved item: barcode=%s side=%s shelf=%s cell=%s",
-                        barcode, side, shelf_idx_int, cell_idx_int,
-                    )
-                else:
-                    logger.warning(
-                        "Retrieved item had no location to remove: barcode=%s side=%s shelf=%s cell=%s",
-                        barcode, side, shelf_idx_int, cell_idx_int,
-                    )
-            except Exception as err:
-                logger.exception("Failed to process retrieve_item event for %s: %s", barcode, err)
+            bin_service = BinStorageService(session)
+            bin_owned = await bin_service.owns_robot_event(payload)
+            if payload.get("kind") == "label_scanned":
+                if await bin_service.handle_scan(str(payload.get("payload", "")), active_worker):
+                    return True
+            elif await bin_service.handle_robot_result(payload, active_worker):
+                if (
+                    payload.get("command") == "store_item"
+                    and payload.get("message") == "success"
+                ):
+                    await flush_telemetry(is_cycle=True)
+                return True
+    except Exception as err:
+        logger.exception("Failed to process bin workflow event: %s", err)
 
-        await flush_telemetry(is_cycle=True)
-        if removed:
-            await _refresh_status_after_commit(active_worker)
+    if bin_owned:
+        logger.warning("Skipping legacy mutation for bin-owned robot event: %s", payload)
+        return True
+    return False
 
-    if command == "store_item":
-        if message != "success":
+
+def _event_target(payload: dict[str, Any], command: str) -> Optional[tuple[Any, int, int]]:
+    """Side, shelf and cell of a robot event, or None (logged) when it cannot be placed."""
+    location = payload.get("location") or {}
+    side = location.get("side")
+    shelf_idx = location.get("shelf_idx")
+    cell_idx = location.get("cell_idx")
+
+    if payload.get("barcode") is None or side is None or shelf_idx is None or cell_idx is None:
+        logger.warning(f"Skipping {command} event with incomplete data: %s", payload)
+        return None
+
+    try:
+        return side, int(shelf_idx), int(cell_idx)
+    except (TypeError, ValueError):
+        logger.warning(f"Skipping {command} event with non-integer location: %s", payload)
+        return None
+
+
+async def _apply_retrieve_item(
+    payload: dict[str, Any], active_worker: Optional[RobotEventPublisher]
+) -> None:
+    if payload.get("message") != "success":
+        return
+
+    barcode = payload.get("barcode")
+    target = _event_target(payload, "retrieve_item")
+    if target is None:
+        return
+    side, shelf_idx_int, cell_idx_int = target
+
+    removed = False
+    async with AsyncSessionLocal() as session:
+        if await BinStorageService(session).targets_reserved_bin_identity(payload):
+            logger.warning(
+                "Skipping legacy mutation for reserved bin retrieve event: %s", payload
+            )
             return
-
-        location = payload.get("location") or {}
-        barcode = payload.get("barcode")
-        weight = payload.get("weight")
-
-        logger.info(
-            "Processing store_item event: barcode=%s weight=%s location=%s",
-            barcode, weight, location
-        )
-
-        side = location.get("side")
-        shelf_idx = location.get("shelf_idx")
-        cell_idx = location.get("cell_idx")
-
-        if barcode is None or side is None or shelf_idx is None or cell_idx is None:
-            logger.warning("Skipping store_item event with incomplete data: %s", payload)
-            return
-
+        storage_service = StorageService(session)
         try:
-            shelf_idx_int = int(shelf_idx)
-            cell_idx_int = int(cell_idx)
-        except (TypeError, ValueError):
-            logger.warning("Skipping store_item event with non-integer location: %s", payload)
-            return
-
-        normalized_weight = None
-        if weight is not None:
-            try:
-                normalized_weight = float(weight)
-                if normalized_weight <= 0:
-                    logger.warning(
-                        "Weight normalization: raw=%s normalized to None (<=0)",
-                        weight
-                    )
-                    normalized_weight = None
-            except (TypeError, ValueError):
+            item = await storage_service.get_item(str(barcode))
+            if item is not None:
+                if not apply_cycle_mass(item, payload.get("weight"), stored=False, command_id=payload.get("command_id")):
+                    return
+            removed = await storage_service.remove_item_location(barcode, side, shelf_idx_int, cell_idx_int, commit=False)
+            await session.commit()
+            if removed:
+                logger.info(
+                    "Removed location for retrieved item: barcode=%s side=%s shelf=%s cell=%s",
+                    barcode, side, shelf_idx_int, cell_idx_int,
+                )
+            else:
                 logger.warning(
-                    "Weight normalization failed: raw=%s type=%s",
-                    weight, type(weight).__name__
+                    "Retrieved item had no location to remove: barcode=%s side=%s shelf=%s cell=%s",
+                    barcode, side, shelf_idx_int, cell_idx_int,
+                )
+        except Exception as err:
+            logger.exception("Failed to process retrieve_item event for %s: %s", barcode, err)
+
+    await flush_telemetry(is_cycle=True)
+    if removed:
+        await _refresh_status_after_commit(active_worker)
+
+
+def _normalize_store_weight(weight: Any) -> Optional[float]:
+    normalized_weight = None
+    if weight is not None:
+        try:
+            normalized_weight = float(weight)
+            if normalized_weight <= 0:
+                logger.warning(
+                    "Weight normalization: raw=%s normalized to None (<=0)",
+                    weight
                 )
                 normalized_weight = None
+        except (TypeError, ValueError):
+            logger.warning(
+                "Weight normalization failed: raw=%s type=%s",
+                weight, type(weight).__name__
+            )
+            normalized_weight = None
 
-        logger.info(
-            "Weight after normalization: raw=%s normalized=%s",
-            weight, normalized_weight
-        )
+    logger.info(
+        "Weight after normalization: raw=%s normalized=%s",
+        weight, normalized_weight
+    )
+    return normalized_weight
 
-        location_added = False
-        async with AsyncSessionLocal() as session:
-            if await BinStorageService(session).targets_reserved_bin_identity(payload):
-                logger.warning("Skipping legacy mutation for reserved bin store event: %s", payload)
+
+async def _apply_store_item(
+    payload: dict[str, Any], active_worker: Optional[RobotEventPublisher]
+) -> None:
+    if payload.get("message") != "success":
+        return
+
+    location = payload.get("location") or {}
+    barcode = payload.get("barcode")
+    weight = payload.get("weight")
+
+    logger.info(
+        "Processing store_item event: barcode=%s weight=%s location=%s",
+        barcode, weight, location
+    )
+
+    target = _event_target(payload, "store_item")
+    if target is None:
+        return
+    side, shelf_idx_int, cell_idx_int = target
+
+    normalized_weight = _normalize_store_weight(weight)
+
+    location_added = False
+    async with AsyncSessionLocal() as session:
+        if await BinStorageService(session).targets_reserved_bin_identity(payload):
+            logger.warning("Skipping legacy mutation for reserved bin store event: %s", payload)
+            return
+        storage_service = StorageService(session)
+        try:
+            existing_item = await storage_service.get_item(str(barcode))
+            logger.info(
+                "Existing item lookup: barcode=%s found=%s existing_weight=%s",
+                barcode, existing_item is not None,
+                existing_item.weight if existing_item else None
+            )
+            if existing_item is None:
+                logger.info("Creating new item with weight=%s", normalized_weight)
+                existing_item = await storage_service.create_item(
+                    barcode=str(barcode),
+                    name=str(barcode),
+                    dimensions=None,
+                    weight=normalized_weight,
+                    metadata={"name": str(barcode)},
+                )
+            if not apply_cycle_mass(existing_item, payload.get("weight"), stored=True, command_id=payload.get("command_id")):
                 return
-            storage_service = StorageService(session)
-            try:
-                existing_item = await storage_service.get_item(str(barcode))
-                logger.info(
-                    "Existing item lookup: barcode=%s found=%s existing_weight=%s",
-                    barcode, existing_item is not None,
-                    existing_item.weight if existing_item else None
-                )
-                if existing_item is None:
-                    logger.info("Creating new item with weight=%s", normalized_weight)
-                    existing_item = await storage_service.create_item(
-                        barcode=str(barcode),
-                        name=str(barcode),
-                        dimensions=None,
-                        weight=normalized_weight,
-                        metadata={"name": str(barcode)},
-                    )
-                if not apply_cycle_mass(existing_item, payload.get("weight"), stored=True, command_id=payload.get("command_id")):
-                    return
 
-                existing_locations = await storage_service.get_item_locations(str(barcode))
-                already_assigned = any(
-                    loc.side == side and loc.shelf_idx == shelf_idx_int and loc.cell_idx == cell_idx_int
-                    for loc in existing_locations
-                )
+            existing_locations = await storage_service.get_item_locations(str(barcode))
+            already_assigned = any(
+                loc.side == side and loc.shelf_idx == shelf_idx_int and loc.cell_idx == cell_idx_int
+                for loc in existing_locations
+            )
 
-                if already_assigned is False:
-                    await storage_service.add_item_location(str(barcode), side, shelf_idx_int, cell_idx_int, commit=False)
-                    location_added = True
-                await session.commit()
-            except Exception as err:
-                logger.exception("Failed to process store_item event for %s: %s", barcode, err)
+            if already_assigned is False:
+                await storage_service.add_item_location(str(barcode), side, shelf_idx_int, cell_idx_int, commit=False)
+                location_added = True
+            await session.commit()
+        except Exception as err:
+            logger.exception("Failed to process store_item event for %s: %s", barcode, err)
 
-        await flush_telemetry(is_cycle=True)
-        if location_added:
-            await _refresh_status_after_commit(active_worker)
+    await flush_telemetry(is_cycle=True)
+    if location_added:
+        await _refresh_status_after_commit(active_worker)
 
 
 class RobotEventListener:
