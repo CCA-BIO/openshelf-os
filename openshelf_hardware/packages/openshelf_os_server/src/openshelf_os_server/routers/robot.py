@@ -750,6 +750,302 @@ async def _validate_mock_retrieve(
         raise api_error(status.HTTP_403_FORBIDDEN, "item_access_denied", "")
 
 
+async def _submit_mock_command(
+    command: RobotCommands,
+    payload: dict[str, Any],
+    request_id: str | None,
+    current_user: User,
+    db: AsyncSession,
+) -> CommandAcceptedResponse:
+    if not isinstance(command, (StoreItemCommand, RetrieveItemCommand)):
+        raise api_error(status.HTTP_400_BAD_REQUEST, "mock_mode_unsupported", "")
+    runtime = get_mock_robot_runtime()
+    try:
+        replay = await runtime.replay(payload, request_id)
+    except MockRequestConflictError as exc:
+        raise api_error(
+            status.HTTP_409_CONFLICT,
+            "request_replay",
+            "",
+        ) from exc
+    if replay is not None:
+        return CommandAcceptedResponse.model_validate(
+            {"message": "success", "command_id": replay.command_id, "status": replay.status}
+        )
+
+    async with robot_command_enqueue_guard():
+        if isinstance(command, StoreItemCommand):
+            await _validate_mock_store(command, db)
+        else:
+            await _validate_mock_retrieve(command, current_user, db)
+
+        try:
+            row, _ = await runtime.enqueue(
+                payload,
+                request_id=request_id,
+                correlation_id=correlation_id_var.get(),
+            )
+        except MockRequestConflictError as exc:
+            raise api_error(
+                status.HTTP_409_CONFLICT,
+                "request_replay",
+                "",
+            ) from exc
+        except CommandTargetInFlightError as exc:
+            raise _target_in_flight_error() from exc
+        except MockQueueFullError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=error_detail("", "queue_full"),
+                headers={"Retry-After": "1"},
+            ) from exc
+        except ValueError as exc:
+            logger.info("Mock robot command rejected: %s", exc)
+            raise api_error(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "request_invalid",
+                "That command is not valid for the robot right now. Check the cell and try again.",
+            ) from exc
+    return CommandAcceptedResponse.model_validate(
+        {"message": "success", "command_id": row.command_id, "status": row.status}
+    )
+
+
+async def _apply_existing_store_item(item: Item, item_data: dict[str, Any], db: AsyncSession) -> None:
+    """Overlay stored inventory onto the store payload; an item already placed is refused."""
+    logger.info("Found item in db: name=%s, dimensions=%s", item.name, item.dimensions)
+    item_data["dimensions"] = item.dimensions
+    item_data["name"] = item.name
+    item_data.pop("net_weight", None)
+    if item.weight is not None:
+        item_data["weight"] = item.weight
+    else:
+        item_data.pop("weight", None)
+
+    location_result = await db.execute(
+        select(ItemLocation).where(ItemLocation.item_id == item.id)
+    )
+    existing_location = location_result.scalars().first()
+    if existing_location is not None:
+        raise api_error(status.HTTP_409_CONFLICT, "item_already_stored", "")
+    bin_membership = (
+        await db.execute(select(StorageBinItem).where(StorageBinItem.item_id == item.id))
+    ).scalar_one_or_none()
+    if bin_membership is not None:
+        raise api_error(status.HTTP_409_CONFLICT, "reserved_tray_item", "")
+    item_data["tare_weight"] = item.tare_weight
+    item_data["full_net_weight"] = item.full_net_weight
+
+
+def _new_enrollment_item(item_data: dict[str, Any]) -> Item:
+    barcode = item_data.get("barcode")
+    logger.info("Item not found in db for barcode: %s", barcode)
+    dimensions = item_data.get("dimensions")
+    if not isinstance(dimensions, dict) or any(
+        isinstance(dimensions.get(key), bool)
+        or not isinstance(dimensions.get(key), (int, float))
+        or not 0 < dimensions[key] < math.inf
+        for key in ("width", "height", "length")
+    ):
+        raise api_error(status.HTTP_422_UNPROCESSABLE_ENTITY, "dimension_invalid", "")
+    try:
+        ItemValidator.validate_weight(item_data.get("weight"))
+        validate_mass(item_data)
+    except ValidationError as exc:
+        raise api_error(422, "validation_failed", str(exc)) from exc
+    # Prepare enrollment for the command admission transaction, so
+    # rejected submissions cannot establish an operator baseline.
+    item = Item(barcode=str(barcode), name=str(item_data.get("name") or barcode),
+                dimensions=dimensions,
+                weight=item_data.get("weight"), item_metadata=item_data.get("metadata") or {},
+                access_level_id=item_data.get("access_level_id"))
+    apply_mass(item, item_data, enrollment=True)
+    return item
+
+
+async def _prepare_store_command(
+    command: StoreItemCommand,
+    worker: RobotWorker,
+    current_user: User,
+    db: AsyncSession,
+) -> tuple[StoreItemCommand, Item | None]:
+    """Resolve a store against inventory: the command to run and any item to enroll."""
+    logger.info("Processing StoreItemCommand: item=%s", command.item)
+    item_data = deepcopy(command.item or {})
+    barcode = item_data.get("barcode")
+    if any(key in item_data for key in MASS_FIELDS) and (
+        not isinstance(barcode, str) or not barcode.strip() or len(barcode) > BARCODE_MAX_LENGTH
+    ):
+        raise api_error(status.HTTP_422_UNPROCESSABLE_ENTITY, "barcode_required", "Enter the item barcode before entering container weights.")
+    _parse_requested_store_location(item_data)
+    await _validate_direct_store_reservation(item_data, db)
+    human_dimensions_source = "command_payload" if item_data.get("dimensions") is not None else "none"
+
+    enrollment_item: Item | None = None
+    if barcode is not None:
+        logger.info("Looking up item by barcode: %s", barcode)
+        result = await db.execute(select(Item).where(Item.barcode == barcode))
+        item = result.scalar_one_or_none()
+
+        if item is not None:
+            await _apply_existing_store_item(item, item_data, db)
+            human_dimensions_source = "db"
+            command = StoreItemCommand(item=item_data, request_id=command.request_id)
+        else:
+            enrollment_item = _new_enrollment_item(item_data)
+
+    logger.info("Final StoreItemCommand: item=%s", command.item)
+    final_item_data = command.item or {}
+    _validate_requested_store_location(final_item_data, worker)
+    try:
+        await capture_store_observer_measurement(
+            barcode=final_item_data.get("barcode"),
+            item_name=final_item_data.get("name"),
+            user_id=current_user.id,
+            request_correlation_id=correlation_id_var.get(),
+            command_payload=command.model_dump(mode="json"),
+            human_dimensions=deepcopy(final_item_data.get("dimensions")),
+            human_dimensions_source=human_dimensions_source,
+        )
+    except Exception as exc:
+        logger.warning("IO box sizer observer capture failed: %s", exc, exc_info=exc)
+    return command, enrollment_item
+
+
+async def _ensure_io_box_clear(worker: RobotWorker, request_id: str | None) -> None:
+    try:
+        scale_status = worker.get_cached_scale_status()
+        if scale_status is not None:
+            occupied = scale_status.occupied is True
+            log_io_box_guard(
+                logger,
+                "admission",
+                "blocked" if occupied else "allowed",
+                weight_grams=getattr(scale_status, "weight_grams", None),
+                cached=True,
+                scale_age_s=worker.get_cached_scale_status_age_s(),
+                request_id=request_id,
+            )
+        else:
+            scale_data = await worker.get_scale_data()
+            weight = abs(scale_data["weight"])
+            occupied = weight > SCALE_OCCUPIED_THRESHOLD_GRAMS
+            log_io_box_guard(
+                logger,
+                "admission",
+                "blocked" if occupied else "allowed",
+                weight_grams=weight,
+                request_id=request_id,
+            )
+        if occupied:
+            raise api_error(
+                409,
+                "io_box_occupied",
+                "",
+            )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning("Scale read failed during retrieve check: %s", exc, exc_info=exc)
+        log_io_box_guard(logger, "admission", "read_failed", request_id=request_id)
+
+
+async def _check_retrieve_admission(
+    command: RetrieveItemCommand,
+    worker: RobotWorker,
+    current_user: User,
+    db: AsyncSession,
+) -> None:
+    if command.barcode:
+        binned_item = (
+            await db.execute(
+                select(Item)
+                .join(StorageBinItem, StorageBinItem.item_id == Item.id)
+                .where(Item.barcode == command.barcode)
+            )
+        ).scalar_one_or_none()
+        if binned_item is not None:
+            raise api_error(status.HTTP_409_CONFLICT, "reserved_tray_item", "")
+    if worker.get_safety_status().get("bypassed") is not True:
+        await _ensure_io_box_clear(worker, command.request_id)
+    else:
+        log_io_box_guard(logger, "admission", "skipped", request_id=command.request_id)
+
+    location_data = command.location or {}
+    side = location_data.get("side")
+    shelf_idx = location_data.get("shelf_idx")
+    cell_idx = location_data.get("cell_idx")
+
+    if side is None or shelf_idx is None or cell_idx is None:
+        raise api_error(status.HTTP_400_BAD_REQUEST, "invalid_location", "")
+
+    result = await db.execute(
+        select(Item)
+        .join(ItemLocation)
+        .where(
+            ItemLocation.side == side,
+            ItemLocation.shelf_idx == shelf_idx,
+            ItemLocation.cell_idx == cell_idx,
+        )
+    )
+    item = result.scalar_one_or_none()
+
+    if item is None:
+        logger.info("No item at location side=%s shelf=%s cell=%s", side, shelf_idx, cell_idx)
+        raise api_error(status.HTTP_404_NOT_FOUND, "item_not_found", "")
+
+    if can_user_retrieve_item(current_user, item) is False:
+        raise api_error(status.HTTP_403_FORBIDDEN, "item_access_denied", "")
+
+
+async def _admit_command(
+    command: RobotCommands,
+    submission_payload: dict[str, Any],
+    request_id: str | None,
+    enrollment_item: Item | None,
+    worker: RobotWorker,
+    db: AsyncSession,
+) -> CommandAcceptedResponse:
+    async with robot_command_enqueue_guard():
+        if isinstance(command, StoreItemCommand):
+            await _validate_direct_store_reservation(command.item or {}, db)
+        try:
+            row, was_replay = await admit_robot_command(
+                submission_payload,
+                request_id=request_id,
+                correlation_id=correlation_id_var.get(),
+                enrollment_item=enrollment_item,
+            )
+        except CommandRequestConflictError as exc:
+            raise api_error(
+                status.HTTP_409_CONFLICT,
+                "request_replay",
+                "",
+            ) from exc
+        except CommandTargetInFlightError as exc:
+            raise _target_in_flight_error() from exc
+        except CommandQueueFullError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=error_detail("", "queue_full"),
+                headers={"Retry-After": "1"},
+            ) from exc
+        except ValueError as exc:
+            logger.info("Robot command rejected: %s", exc)
+            raise api_error(
+                status.HTTP_422_UNPROCESSABLE_CONTENT,
+                "request_invalid",
+                "That command is not valid for the robot right now. Check the cell and try again.",
+            ) from exc
+        if was_replay is False:
+            await enqueue_persisted(worker, command, row)
+    return CommandAcceptedResponse(
+        message="success",
+        command_id=row.command_id,
+        status=cast(Any, row.status),
+    )
+
+
 @router.post(
     "/commands",
     response_model=CommandAcceptedResponse,
@@ -830,59 +1126,7 @@ async def robot_commands(
     submission_payload = command.model_dump(mode="json", exclude_none=True)
     request_id = getattr(command, "request_id", None)
     if operating_mode == OperatingMode.mock:
-        if not isinstance(command, (StoreItemCommand, RetrieveItemCommand)):
-            raise api_error(status.HTTP_400_BAD_REQUEST, "mock_mode_unsupported", "")
-        runtime = get_mock_robot_runtime()
-        payload = submission_payload
-        try:
-            replay = await runtime.replay(payload, request_id)
-        except MockRequestConflictError as exc:
-            raise api_error(
-                status.HTTP_409_CONFLICT,
-                "request_replay",
-                "",
-            ) from exc
-        if replay is not None:
-            return CommandAcceptedResponse.model_validate(
-                {"message": "success", "command_id": replay.command_id, "status": replay.status}
-            )
-
-        async with robot_command_enqueue_guard():
-            if isinstance(command, StoreItemCommand):
-                await _validate_mock_store(command, db)
-            else:
-                await _validate_mock_retrieve(command, current_user, db)
-
-            try:
-                row, _ = await runtime.enqueue(
-                    payload,
-                    request_id=request_id,
-                    correlation_id=correlation_id_var.get(),
-                )
-            except MockRequestConflictError as exc:
-                raise api_error(
-                    status.HTTP_409_CONFLICT,
-                    "request_replay",
-                    "",
-                ) from exc
-            except CommandTargetInFlightError as exc:
-                raise _target_in_flight_error() from exc
-            except MockQueueFullError as exc:
-                raise HTTPException(
-                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                    detail=error_detail("", "queue_full"),
-                    headers={"Retry-After": "1"},
-                ) from exc
-            except ValueError as exc:
-                logger.info("Mock robot command rejected: %s", exc)
-                raise api_error(
-                    status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    "request_invalid",
-                    "That command is not valid for the robot right now. Check the cell and try again.",
-                ) from exc
-        return CommandAcceptedResponse.model_validate(
-            {"message": "success", "command_id": row.command_id, "status": row.status}
-        )
+        return await _submit_mock_command(command, submission_payload, request_id, current_user, db)
 
     try:
         replay = await replay_robot_command(submission_payload, request_id)
@@ -908,208 +1152,10 @@ async def robot_commands(
 
     enrollment_item: Item | None = None
     if isinstance(command, StoreItemCommand):
-        logger.info("Processing StoreItemCommand: item=%s", command.item)
-        item_data = deepcopy(command.item or {})
-        barcode = item_data.get("barcode")
-        if any(key in item_data for key in MASS_FIELDS) and (
-            not isinstance(barcode, str) or not barcode.strip() or len(barcode) > BARCODE_MAX_LENGTH
-        ):
-            raise api_error(status.HTTP_422_UNPROCESSABLE_ENTITY, "barcode_required", "Enter the item barcode before entering container weights.")
-        _parse_requested_store_location(item_data)
-        await _validate_direct_store_reservation(item_data, db)
-        human_dimensions_source = "command_payload" if item_data.get("dimensions") is not None else "none"
-
-        if barcode is not None:
-            logger.info("Looking up item by barcode: %s", barcode)
-            result = await db.execute(select(Item).where(Item.barcode == barcode))
-            item = result.scalar_one_or_none()
-
-            if item is not None:
-                logger.info("Found item in db: name=%s, dimensions=%s", item.name, item.dimensions)
-                item_data["dimensions"] = item.dimensions
-                item_data["name"] = item.name
-                human_dimensions_source = "db"
-                item_data.pop("net_weight", None)
-                if item.weight is not None:
-                    item_data["weight"] = item.weight
-                else:
-                    item_data.pop("weight", None)
-
-                location_result = await db.execute(
-                    select(ItemLocation).where(ItemLocation.item_id == item.id)
-                )
-                existing_location = location_result.scalars().first()
-                if existing_location is not None:
-                    raise api_error(status.HTTP_409_CONFLICT, "item_already_stored", "")
-                bin_membership = (
-                    await db.execute(select(StorageBinItem).where(StorageBinItem.item_id == item.id))
-                ).scalar_one_or_none()
-                if bin_membership is not None:
-                    raise api_error(status.HTTP_409_CONFLICT, "reserved_tray_item", "")
-                item_data["tare_weight"] = item.tare_weight
-                item_data["full_net_weight"] = item.full_net_weight
-                command = StoreItemCommand(item=item_data, request_id=request_id)
-            else:
-                logger.info("Item not found in db for barcode: %s", barcode)
-                dimensions = item_data.get("dimensions")
-                if not isinstance(dimensions, dict) or any(
-                    isinstance(dimensions.get(key), bool)
-                    or not isinstance(dimensions.get(key), (int, float))
-                    or not 0 < dimensions[key] < math.inf
-                    for key in ("width", "height", "length")
-                ):
-                    raise api_error(status.HTTP_422_UNPROCESSABLE_ENTITY, "dimension_invalid", "")
-                try:
-                    ItemValidator.validate_weight(item_data.get("weight"))
-                    validate_mass(item_data)
-                except ValidationError as exc:
-                    raise api_error(422, "validation_failed", str(exc)) from exc
-                # Prepare enrollment for the command admission transaction, so
-                # rejected submissions cannot establish an operator baseline.
-                item = Item(barcode=str(barcode), name=str(item_data.get("name") or barcode),
-                            dimensions=dimensions,
-                            weight=item_data.get("weight"), item_metadata=item_data.get("metadata") or {},
-                            access_level_id=item_data.get("access_level_id"))
-                apply_mass(item, item_data, enrollment=True)
-                enrollment_item = item
-
-        logger.info("Final StoreItemCommand: item=%s", command.item)
-        final_item_data = command.item or {}
-        _validate_requested_store_location(final_item_data, worker)
-        try:
-            await capture_store_observer_measurement(
-                barcode=final_item_data.get("barcode"),
-                item_name=final_item_data.get("name"),
-                user_id=current_user.id,
-                request_correlation_id=correlation_id_var.get(),
-                command_payload=command.model_dump(mode="json"),
-                human_dimensions=deepcopy(final_item_data.get("dimensions")),
-                human_dimensions_source=human_dimensions_source,
-            )
-        except Exception as exc:
-            logger.warning("IO box sizer observer capture failed: %s", exc, exc_info=exc)
-
+        command, enrollment_item = await _prepare_store_command(command, worker, current_user, db)
     if isinstance(command, RetrieveItemCommand):
-        if command.barcode:
-            binned_item = (
-                await db.execute(
-                    select(Item)
-                    .join(StorageBinItem, StorageBinItem.item_id == Item.id)
-                    .where(Item.barcode == command.barcode)
-                )
-            ).scalar_one_or_none()
-            if binned_item is not None:
-                raise api_error(status.HTTP_409_CONFLICT, "reserved_tray_item", "")
-        request_id = command.request_id
-        if worker.get_safety_status().get("bypassed") is not True:
-            try:
-                scale_status = worker.get_cached_scale_status()
-                if scale_status is not None:
-                    occupied = scale_status.occupied is True
-                    log_io_box_guard(
-                        logger,
-                        "admission",
-                        "blocked" if occupied else "allowed",
-                        weight_grams=getattr(scale_status, "weight_grams", None),
-                        cached=True,
-                        scale_age_s=worker.get_cached_scale_status_age_s(),
-                        request_id=request_id,
-                    )
-                    if occupied:
-                        raise api_error(
-                            409,
-                            "io_box_occupied",
-                            "",
-                        )
-                else:
-                    scale_data = await worker.get_scale_data()
-                    weight = abs(scale_data["weight"])
-                    occupied = weight > SCALE_OCCUPIED_THRESHOLD_GRAMS
-                    log_io_box_guard(
-                        logger,
-                        "admission",
-                        "blocked" if occupied else "allowed",
-                        weight_grams=weight,
-                        request_id=request_id,
-                    )
-                    if occupied:
-                        raise api_error(
-                            409,
-                            "io_box_occupied",
-                            "",
-                        )
-            except HTTPException:
-                raise
-            except Exception as exc:
-                logger.warning("Scale read failed during retrieve check: %s", exc, exc_info=exc)
-                log_io_box_guard(logger, "admission", "read_failed", request_id=request_id)
-        else:
-            log_io_box_guard(logger, "admission", "skipped", request_id=request_id)
-
-        location_data = command.location or {}
-        side = location_data.get("side")
-        shelf_idx = location_data.get("shelf_idx")
-        cell_idx = location_data.get("cell_idx")
-
-        if side is None or shelf_idx is None or cell_idx is None:
-            raise api_error(status.HTTP_400_BAD_REQUEST, "invalid_location", "")
-
-        result = await db.execute(
-            select(Item)
-            .join(ItemLocation)
-            .where(
-                ItemLocation.side == side,
-                ItemLocation.shelf_idx == shelf_idx,
-                ItemLocation.cell_idx == cell_idx,
-            )
-        )
-        item = result.scalar_one_or_none()
-
-        if item is None:
-            logger.info("No item at location side=%s shelf=%s cell=%s", side, shelf_idx, cell_idx)
-            raise api_error(status.HTTP_404_NOT_FOUND, "item_not_found", "")
-
-        if can_user_retrieve_item(current_user, item) is False:
-            raise api_error(status.HTTP_403_FORBIDDEN, "item_access_denied", "")
-
-    async with robot_command_enqueue_guard():
-        if isinstance(command, StoreItemCommand):
-            await _validate_direct_store_reservation(command.item or {}, db)
-        try:
-            row, was_replay = await admit_robot_command(
-                submission_payload,
-                request_id=request_id,
-                correlation_id=correlation_id_var.get(),
-                enrollment_item=enrollment_item,
-            )
-        except CommandRequestConflictError as exc:
-            raise api_error(
-                status.HTTP_409_CONFLICT,
-                "request_replay",
-                "",
-            ) from exc
-        except CommandTargetInFlightError as exc:
-            raise _target_in_flight_error() from exc
-        except CommandQueueFullError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail=error_detail("", "queue_full"),
-                headers={"Retry-After": "1"},
-            ) from exc
-        except ValueError as exc:
-            logger.info("Robot command rejected: %s", exc)
-            raise api_error(
-                status.HTTP_422_UNPROCESSABLE_CONTENT,
-                "request_invalid",
-                "That command is not valid for the robot right now. Check the cell and try again.",
-            ) from exc
-        if was_replay is False:
-            await enqueue_persisted(worker, command, row)
-    return CommandAcceptedResponse(
-        message="success",
-        command_id=row.command_id,
-        status=cast(Any, row.status),
-    )
+        await _check_retrieve_admission(command, worker, current_user, db)
+    return await _admit_command(command, submission_payload, request_id, enrollment_item, worker, db)
 
 
 @router.get(
