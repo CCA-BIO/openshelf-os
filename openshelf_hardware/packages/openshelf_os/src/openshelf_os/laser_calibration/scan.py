@@ -219,6 +219,54 @@ def _estimate_frame_offset_mm(detected_xs: list[float], existing_xs: list[float]
 	return best_offset_mm
 
 
+def _nearest_unused_index(xs: list[float], is_used: list[bool], target_x: float, tolerance_mm: float) -> Optional[int]:
+	best_index: Optional[int] = None
+	best_distance_mm: Optional[float] = None
+
+	for index, x in enumerate(xs):
+		if is_used[index] is True:
+			continue
+
+		distance_mm = abs(x - target_x)
+
+		if distance_mm > tolerance_mm:
+			continue
+
+		if best_distance_mm is None or distance_mm < best_distance_mm:
+			best_distance_mm = distance_mm
+			best_index = index
+
+	return best_index
+
+
+def _match_cells_in_order(
+	*,
+	detected_sorted: list[ScanDetectedCell],
+	existing_sorted: list[tuple[Cell, CalibrationCoordinate]],
+	side_number: int,
+	shelf_idx: int,
+	detected_cell_key_map: Optional[dict[tuple[int, int], tuple[int, int]]],
+) -> list[Cell]:
+	if detected_cell_key_map is not None:
+		for (existing_cell, _existing_point), detected_cell in zip(existing_sorted, detected_sorted):
+			detected_cell_key_map[(int(detected_cell.shelf_idx), int(detected_cell.cell_idx))] = (
+				shelf_idx,
+				int(existing_cell.cell_idx),
+			)
+
+	output_cells = [
+		_build_scan_cell(
+			cell_idx=existing_cell.cell_idx,
+			detected_cell=detected_cell,
+			existing_cell=existing_cell,
+			side_number=side_number,
+		)
+		for (existing_cell, _existing_point), detected_cell in zip(existing_sorted, detected_sorted)
+	]
+	output_cells.sort(key=lambda cell: int(cell.cell_idx))
+	return output_cells
+
+
 def _match_detected_cells_to_existing(
 	*,
 	detected_cells: list[ScanDetectedCell],
@@ -237,24 +285,13 @@ def _match_detected_cells_to_existing(
 	existing_sorted = sorted(calibrated_existing, key=lambda pair: float(pair[1].x))
 
 	if len(uncalibrated_existing) == 0 and len(detected_sorted) == len(existing_sorted):
-		if detected_cell_key_map is not None:
-			for (existing_cell, _existing_point), detected_cell in zip(existing_sorted, detected_sorted):
-				detected_cell_key_map[(int(detected_cell.shelf_idx), int(detected_cell.cell_idx))] = (
-					shelf_idx,
-					int(existing_cell.cell_idx),
-				)
-
-		output_cells = [
-			_build_scan_cell(
-				cell_idx=existing_cell.cell_idx,
-				detected_cell=detected_cell,
-				existing_cell=existing_cell,
-				side_number=side_number,
-			)
-			for (existing_cell, _existing_point), detected_cell in zip(existing_sorted, detected_sorted)
-		]
-		output_cells.sort(key=lambda cell: int(cell.cell_idx))
-		return output_cells
+		return _match_cells_in_order(
+			detected_sorted=detected_sorted,
+			existing_sorted=existing_sorted,
+			side_number=side_number,
+			shelf_idx=shelf_idx,
+			detected_cell_key_map=detected_cell_key_map,
+		)
 
 	existing_xs = [float(point.x) for _, point in existing_sorted]
 	tolerance_mm = _scan_cell_match_tolerance_mm(existing_xs)
@@ -263,27 +300,13 @@ def _match_detected_cells_to_existing(
 		existing_xs,
 		tolerance_mm,
 	)
+	shifted_detected_xs = [float(cell.tool_x_mm) + frame_offset_mm for cell in detected_sorted]
 	is_detected_used = [False] * len(detected_sorted)
 	output_cells = []
 	matched_count = 0
 
 	for existing_cell, existing_point in existing_sorted:
-		existing_x = float(existing_point.x)
-		best_index: Optional[int] = None
-		best_distance_mm: Optional[float] = None
-
-		for index, detected_cell in enumerate(detected_sorted):
-			if is_detected_used[index] is True:
-				continue
-
-			distance_mm = abs(float(detected_cell.tool_x_mm) + frame_offset_mm - existing_x)
-
-			if distance_mm > tolerance_mm:
-				continue
-
-			if best_distance_mm is None or distance_mm < best_distance_mm:
-				best_distance_mm = distance_mm
-				best_index = index
+		best_index = _nearest_unused_index(shifted_detected_xs, is_detected_used, float(existing_point.x), tolerance_mm)
 
 		if best_index is None:
 			output_cells.append(existing_cell.model_copy(deep=True))
