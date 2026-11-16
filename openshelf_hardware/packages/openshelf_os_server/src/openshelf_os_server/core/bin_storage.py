@@ -829,6 +829,57 @@ class BinStorageService:
         member_levels = {member.access_level_id for member in members}
         return len(member_levels) != 1 or joining_levels == member_levels
 
+    @classmethod
+    def _no_fit_reason(cls, item: Item, bins: Sequence[StorageBin]) -> str:
+        item_dimensions = cls._dimensions(item.dimensions, ("width", "height", "length"))
+        if item_dimensions is None:
+            # A record without a usable size fits no bin, so the height and footprint
+            # causes below would be guesses about a size nobody measured.
+            return "The item needs its size measured before it can go in a bin."
+        item_height = item_dimensions[1]
+        known_heights = [
+            dimension[0]
+            for dimension in (
+                cls._dimensions(cls._compartment_dimensions(row), ("height",))
+                for row in bins
+            )
+            if dimension is not None
+        ]
+        if known_heights and all(item_height > known for known in known_heights):
+            return "The item is taller than every bin compartment."
+        return "The item's footprint is larger than every bin compartment."
+
+    @classmethod
+    def _tightest_bin(
+        cls, item: Item, roomy: Sequence[tuple[StorageBin, list[Item]]]
+    ) -> Optional[StorageBin]:
+        candidates: list[tuple[float, bool, str, int, int, StorageBin]] = []
+        for row, members in roomy:
+            if any(member.access_level_id != item.access_level_id for member in members):
+                continue
+            capacity = cls._volume(row.inner_dimensions)
+            item_volume = cls._volume(item.dimensions)
+            used_volume = sum(cls._volume(member.dimensions) or 0.0 for member in members)
+            remaining_volume = (
+                (cls._volume(cls._compartment_dimensions(row)) or capacity) - item_volume
+                if row.compartment_layout
+                else capacity - used_volume - item_volume
+            )
+            # The tightest spot wins; among equal spots a partly filled bin keeps bins full.
+            candidates.append(
+                (
+                    remaining_volume,
+                    len(members) == 0,
+                    row.side,
+                    row.shelf_idx,
+                    row.cell_idx,
+                    row,
+                )
+            )
+        if not candidates:
+            return None
+        return min(candidates, key=lambda entry: entry[:-1])[-1]
+
     async def allocate_bin(self, item: Item) -> tuple[Optional[StorageBin], Optional[str]]:
         """Choose a home bin that takes the item, or report why none can.
 
@@ -863,23 +914,7 @@ class BinStorageService:
             if self._fits(item, row):
                 fitting.append(row)
         if not fitting:
-            item_dimensions = self._dimensions(item.dimensions, ("width", "height", "length"))
-            if item_dimensions is None:
-                # A record without a usable size fits no bin, so the height and footprint
-                # causes below would be guesses about a size nobody measured.
-                return None, "The item needs its size measured before it can go in a bin."
-            item_height = item_dimensions[1]
-            known_heights = [
-                dimension[0]
-                for dimension in (
-                    self._dimensions(self._compartment_dimensions(row), ("height",))
-                    for row in bins
-                )
-                if dimension is not None
-            ]
-            if known_heights and all(item_height > known for known in known_heights):
-                return None, "The item is taller than every bin compartment."
-            return None, "The item's footprint is larger than every bin compartment."
+            return None, self._no_fit_reason(item, bins)
         if not any(row.status == "at_home" for row in fitting):
             return None, "Every bin that fits this item is outside the machine."
         roomy: list[tuple[StorageBin, list[Item]]] = []
@@ -898,34 +933,10 @@ class BinStorageService:
             roomy.append((row, members))
         if not roomy:
             return None, "Every bin that fits this item is full."
-        candidates: list[tuple[float, bool, str, int, int, StorageBin]] = []
-        for row, members in roomy:
-            if any(member.access_level_id != item.access_level_id for member in members):
-                continue
-            capacity = self._volume(row.inner_dimensions)
-            item_volume = self._volume(item.dimensions)
-            used_volume = sum(self._volume(member.dimensions) or 0.0 for member in members)
-            if capacity is None or item_volume is None:
-                continue
-            remaining_volume = (
-                (self._volume(self._compartment_dimensions(row)) or capacity) - item_volume
-                if row.compartment_layout
-                else capacity - used_volume - item_volume
-            )
-            # The tightest spot wins; among equal spots a partly filled bin keeps bins full.
-            candidates.append(
-                (
-                    remaining_volume,
-                    len(members) == 0,
-                    row.side,
-                    row.shelf_idx,
-                    row.cell_idx,
-                    row,
-                )
-            )
-        if not candidates:
+        chosen = self._tightest_bin(item, roomy)
+        if chosen is None:
             return None, "The bins with room hold items with a different access level."
-        return min(candidates, key=lambda entry: entry[:-1])[-1], None
+        return chosen, None
 
     async def _apply_return_contents(
         self, workflow: StorageBinWorkflow, bin_row: StorageBin
