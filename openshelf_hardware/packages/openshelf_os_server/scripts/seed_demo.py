@@ -438,15 +438,10 @@ def iter_grid_cells(grid: StorageGrid) -> Iterable[tuple[SeedLocation, Any]]:
 			yield SeedLocation(StorageModuleSide.BACK, shelf_idx, cell_idx), cell
 
 
-def build_seed_records(grid: StorageGrid, demo_entries: Dict[str, Dict[str, Any]]) -> tuple[list[SeedRecord], int]:
-	all_cells: Dict[tuple[str, int, int], Any] = {}
-	for location, cell in iter_grid_cells(grid):
-		all_cells[location_key(location)] = cell
-
-	demo_rank_by_barcode: Dict[str, int] = {}
-	for demo_rank, demo_barcode in enumerate(demo_entries.keys()):
-		demo_rank_by_barcode[demo_barcode] = demo_rank
-
+def map_demo_entries(
+	all_cells: Dict[tuple[str, int, int], Any],
+	demo_entries: Dict[str, Dict[str, Any]],
+) -> Dict[tuple[str, int, int], tuple[str, Dict[str, Any]]]:
 	mapped_by_location: Dict[tuple[str, int, int], tuple[str, Dict[str, Any]]] = {}
 	for barcode, entry in demo_entries.items():
 		location = parse_demo_location(str(entry["cell"]))
@@ -473,6 +468,10 @@ def build_seed_records(grid: StorageGrid, demo_entries: Dict[str, Dict[str, Any]
 
 		mapped_by_location[key] = (barcode, entry)
 
+	return mapped_by_location
+
+
+def reserve_demo_names(mapped_by_location: Dict[tuple[str, int, int], tuple[str, Dict[str, Any]]]) -> set[str]:
 	demo_name_to_barcode: Dict[str, str] = {}
 	for mapped_barcode, mapped_entry in mapped_by_location.values():
 		mapped_data = mapped_entry.get("data", {})
@@ -489,7 +488,106 @@ def build_seed_records(grid: StorageGrid, demo_entries: Dict[str, Dict[str, Any]
 
 		demo_name_to_barcode[name_key] = mapped_barcode
 
-	reserved_demo_name_keys = set(demo_name_to_barcode.keys())
+	return set(demo_name_to_barcode.keys())
+
+
+def build_cell_record(
+	location: SeedLocation,
+	cell: Any,
+	barcode: str,
+	data: Dict[str, Any],
+	name_counts: Dict[str, int],
+) -> SeedRecord:
+	cell_dimensions = {
+		"width": float(cell.dimensions.width),
+		"height": float(cell.dimensions.height),
+		"length": float(cell.dimensions.length),
+	}
+
+	if location.shelf_idx == 12:
+		data["name"] = f"Well plate {format_cell_coordinate(location)}"
+
+	dimensions = resolve_dimensions(data, cell_dimensions)
+	name = resolve_name(data, barcode)
+	name_counts[name] = name_counts.get(name, 0) + 1
+	weight = coerce_positive_float(data.get("weight"))
+	if weight is None:
+		weight = coerce_positive_float(data.get("initial_weight"))
+	if weight is None:
+		weight = coerce_positive_float(data.get("initialWeight"))
+	if weight is None:
+		weight = 100.0
+
+	stored_at = data.get("stored_at")
+	if isinstance(stored_at, str) is False or len(stored_at.strip()) == 0:
+		stored_at = data.get("storedAt")
+	if isinstance(stored_at, str) is False or len(stored_at.strip()) == 0:
+		stored_at = datetime.now(timezone.utc).isoformat()
+
+	expires_at = resolve_expiration(data, (datetime.now(timezone.utc) + timedelta(days=365)).date().isoformat())
+
+	initial_weight = coerce_positive_float(data.get("initial_weight"))
+	if initial_weight is None:
+		initial_weight = coerce_positive_float(data.get("initialWeight"))
+	if initial_weight is None:
+		initial_weight = weight
+
+	metadata: Dict[str, Any] = {}
+	for meta_key, meta_value in data.items():
+		if meta_key in {"weight", "dimensions", "storedAt", "expiresAt", "initialWeight"}:
+			continue
+		if meta_value is None:
+			continue
+		metadata[meta_key] = meta_value
+
+	metadata["name"] = name
+	metadata["weight"] = weight
+	metadata["stored_at"] = stored_at
+	metadata["expires_at"] = expires_at
+	metadata["initial_weight"] = initial_weight
+
+	record = SeedRecord(
+		barcode=barcode,
+		name=name,
+		weight=weight,
+		dimensions=dimensions,
+		metadata=metadata,
+		location=location,
+	)
+
+	if cell.status not in (CellStatus.DISABLED, CellStatus.MAINTENANCE):
+		cell.status = CellStatus.OCCUPIED
+
+	cell.item = CellItem(
+		barcode=barcode,
+		weight=weight,
+		dimensions=Dimensions(
+			width=dimensions["width"],
+			height=dimensions["height"],
+			length=dimensions["length"],
+		),
+		data={
+			"name": name,
+			"storedAt": stored_at,
+			"expiresAt": expires_at,
+			"initialWeight": initial_weight,
+			**metadata,
+		},
+	)
+	return record
+
+
+def build_seed_records(grid: StorageGrid, demo_entries: Dict[str, Dict[str, Any]]) -> tuple[list[SeedRecord], int]:
+	all_cells: Dict[tuple[str, int, int], Any] = {}
+	for location, cell in iter_grid_cells(grid):
+		all_cells[location_key(location)] = cell
+
+	demo_rank_by_barcode: Dict[str, int] = {}
+	for demo_rank, demo_barcode in enumerate(demo_entries.keys()):
+		demo_rank_by_barcode[demo_barcode] = demo_rank
+
+	mapped_by_location = map_demo_entries(all_cells, demo_entries)
+	reserved_demo_name_keys = reserve_demo_names(mapped_by_location)
 	name_counts: Dict[str, int] = {}
 
 	used_barcodes: set[str] = set(demo_entries.keys())
@@ -522,89 +620,8 @@ def build_seed_records(grid: StorageGrid, demo_entries: Dict[str, Dict[str, Any]
 			data["is_demo_physical"] = True
 			if isinstance(data.get("demo_rank"), int) is False:
 				data["demo_rank"] = demo_rank_by_barcode.get(barcode)
-			if barcode in used_barcodes:
-				pass
-			else:
-				used_barcodes.add(barcode)
 
-		cell_dimensions = {
-			"width": float(cell.dimensions.width),
-			"height": float(cell.dimensions.height),
-			"length": float(cell.dimensions.length),
-		}
-
-		if location.shelf_idx == 12:
-			data["name"] = f"Well plate {format_cell_coordinate(location)}"
-
-		dimensions = resolve_dimensions(data, cell_dimensions)
-		name = resolve_name(data, barcode)
-		name_counts[name] = name_counts.get(name, 0) + 1
-		weight = coerce_positive_float(data.get("weight"))
-		if weight is None:
-			weight = coerce_positive_float(data.get("initial_weight"))
-		if weight is None:
-			weight = coerce_positive_float(data.get("initialWeight"))
-		if weight is None:
-			weight = 100.0
-
-		stored_at = data.get("stored_at")
-		if isinstance(stored_at, str) is False or len(stored_at.strip()) == 0:
-			stored_at = data.get("storedAt")
-		if isinstance(stored_at, str) is False or len(stored_at.strip()) == 0:
-			stored_at = datetime.now(timezone.utc).isoformat()
-
-		expires_at = resolve_expiration(data, (datetime.now(timezone.utc) + timedelta(days=365)).date().isoformat())
-
-		initial_weight = coerce_positive_float(data.get("initial_weight"))
-		if initial_weight is None:
-			initial_weight = coerce_positive_float(data.get("initialWeight"))
-		if initial_weight is None:
-			initial_weight = weight
-
-		metadata: Dict[str, Any] = {}
-		for meta_key, meta_value in data.items():
-			if meta_key in {"weight", "dimensions", "storedAt", "expiresAt", "initialWeight"}:
-				continue
-			if meta_value is None:
-				continue
-			metadata[meta_key] = meta_value
-
-		metadata["name"] = name
-		metadata["weight"] = weight
-		metadata["stored_at"] = stored_at
-		metadata["expires_at"] = expires_at
-		metadata["initial_weight"] = initial_weight
-
-		records.append(
-			SeedRecord(
-				barcode=barcode,
-				name=name,
-				weight=weight,
-				dimensions=dimensions,
-				metadata=metadata,
-				location=location,
-			)
-		)
-
-		if cell.status not in (CellStatus.DISABLED, CellStatus.MAINTENANCE):
-			cell.status = CellStatus.OCCUPIED
-
-		cell.item = CellItem(
-			barcode=barcode,
-			weight=weight,
-			dimensions=Dimensions(
-				width=dimensions["width"],
-				height=dimensions["height"],
-				length=dimensions["length"],
-			),
-			data={
-				"name": name,
-				"storedAt": stored_at,
-				"expiresAt": expires_at,
-				"initialWeight": initial_weight,
-				**metadata,
-			},
-		)
+		records.append(build_cell_record(location, cell, barcode, data, name_counts))
 
 	return records, placeholder_count
 
