@@ -234,6 +234,17 @@ async def _install_applied_grid(worker: RobotWorker, grid_path: Path) -> None:
     worker._robot.sync_occupied_cells([(side, shelf_idx, cell_idx) for side, shelf_idx, cell_idx, _ in occupied])
 
 
+def _report_unmeasured_shelves(
+    analysis: Any, *, sampled_shelves: set[int], side: StorageModuleSide, manual_intercept_mm: float
+) -> None:
+    for shelf in analysis.shelves:
+        if len(shelf.cells) > 0 and int(shelf.shelf_idx) not in sampled_shelves:
+            laser_module.print_status(
+                f"grip_edge=shelf_unmeasured side={side.value} shelf={int(shelf.shelf_idx)} "
+                f"y_mm={float(shelf.center_y_mm):.1f} uses_intercept_mm={manual_intercept_mm:.3f}"
+            )
+
+
 class ApplyRunnerMixin:
     _reference_offset_entries: list[LaserAutoCalibrationReferenceOffset]
 
@@ -361,15 +372,12 @@ class ApplyRunnerMixin:
         cell_z_offsets = {
             (int(sample.shelf_idx), int(sample.cell_idx)): float(sample.target_z_mm) for sample in result.samples
         }
-        sampled_shelves = {int(sample.shelf_idx) for sample in result.samples}
-
-        for shelf in analysis.shelves:
-            if len(shelf.cells) > 0 and int(shelf.shelf_idx) not in sampled_shelves:
-                laser_module.print_status(
-                    f"grip_edge=shelf_unmeasured side={side.value} shelf={int(shelf.shelf_idx)} "
-                    f"y_mm={float(shelf.center_y_mm):.1f} uses_intercept_mm={manual_intercept_mm:.3f}"
-                )
-
+        _report_unmeasured_shelves(
+            analysis,
+            sampled_shelves={int(sample.shelf_idx) for sample in result.samples},
+            side=side,
+            manual_intercept_mm=manual_intercept_mm,
+        )
         stage_extension_mm = float(await worker._robot._tool.get_param(_side_to_stage_extension_param_name(side)))
         z_place_mm = float(await worker._robot._tool.get_param("Z_EXTENSION_PLACE"))
         # A partial scope measures only its own shelves: the stored entries of the others stay.
