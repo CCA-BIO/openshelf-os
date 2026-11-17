@@ -572,6 +572,68 @@ class IOBox:
             or position_mm > self._door_max_position_mm
         )
 
+    async def _handle_bad_door_reading(
+        self, position_mm: float, door_limit: float, now: float
+    ) -> Optional[float]:
+        """Count an out-of-range reading; return a valid recovered position, else None."""
+        self._door_last_read_at = now
+        self._door_bad_reading_count += 1
+
+        self._logger.warning(
+            "Door position out of range; using cached state",
+            extra={
+                "position_mm": position_mm,
+                "door_limit": door_limit,
+                "cached_open": self._door_open,
+                "bad_reading_count": self._door_bad_reading_count,
+            },
+        )
+
+        if self._door_bad_reading_count < self._door_max_bad_readings:
+            return None
+
+        if self._door_motion_lock.locked():
+            self._logger.warning(
+                "Deferring bad-reading door recovery while a door motion is active",
+                extra={"bad_reading_count": self._door_bad_reading_count},
+            )
+            return None
+
+        self._logger.warning(
+            "Too many bad door readings; attempting door motor recovery",
+            extra={"bad_reading_count": self._door_bad_reading_count},
+        )
+
+        await self._door_motion_lock.acquire()
+        try:
+            recovery_position_mm = await self._md.get_position()
+            recovery_position_valid = recovery_position_mm is not None
+
+            if recovery_position_valid:
+                position_mm = recovery_position_mm
+                position_mm = self._normalize_door_position(position_mm)
+                recovery_position_valid = not self._is_door_position_out_of_range(
+                    position_mm,
+                    door_limit,
+                )
+
+            if recovery_position_valid:
+                self._door_bad_reading_count = 0
+                self._logger.info(
+                    "Door position recovered before homing; skipping recovery home",
+                    extra={"position_mm": position_mm},
+                )
+                return position_mm
+            else:
+                await self._home_door_and_cache_closed()
+                self._logger.info("Door motor homed successfully after bad readings")
+        except Exception as home_exc:
+            self._logger.error("Door motor recovery failed: %s", home_exc, exc_info=home_exc)
+        finally:
+            self._door_motion_lock.release()
+
+        return None
+
     async def refresh_door_state(self, *, force: bool = False) -> Optional[bool]:
         if self._md is None:
             return self._door_open
@@ -622,67 +684,12 @@ class IOBox:
             return self._door_open
 
         door_limit = self._params.motors.by_name("door").lim
+        position_mm = self._normalize_door_position(position_mm)
 
-        while True:
-            position_mm = self._normalize_door_position(position_mm)
-
-            if self._is_door_position_out_of_range(position_mm, door_limit) is False:
-                break
-
-            self._door_last_read_at = now
-            self._door_bad_reading_count += 1
-
-            self._logger.warning(
-                "Door position out of range; using cached state",
-                extra={
-                    "position_mm": position_mm,
-                    "door_limit": door_limit,
-                    "cached_open": self._door_open,
-                    "bad_reading_count": self._door_bad_reading_count,
-                },
-            )
-
-            if self._door_bad_reading_count >= self._door_max_bad_readings:
-                if self._door_motion_lock.locked():
-                    self._logger.warning(
-                        "Deferring bad-reading door recovery while a door motion is active",
-                        extra={"bad_reading_count": self._door_bad_reading_count},
-                    )
-                else:
-                    self._logger.warning(
-                        "Too many bad door readings; attempting door motor recovery",
-                        extra={"bad_reading_count": self._door_bad_reading_count},
-                    )
-
-                    await self._door_motion_lock.acquire()
-                    try:
-                        recovery_position_mm = await self._md.get_position()
-                        recovery_position_valid = recovery_position_mm is not None
-
-                        if recovery_position_valid:
-                            position_mm = recovery_position_mm
-                            position_mm = self._normalize_door_position(position_mm)
-                            recovery_position_valid = not self._is_door_position_out_of_range(
-                                position_mm,
-                                door_limit,
-                            )
-
-                        if recovery_position_valid:
-                            self._door_bad_reading_count = 0
-                            self._logger.info(
-                                "Door position recovered before homing; skipping recovery home",
-                                extra={"position_mm": position_mm},
-                            )
-                            break
-                        else:
-                            await self._home_door_and_cache_closed()
-                            self._logger.info("Door motor homed successfully after bad readings")
-                    except Exception as home_exc:
-                        self._logger.error("Door motor recovery failed: %s", home_exc, exc_info=home_exc)
-                    finally:
-                        self._door_motion_lock.release()
-
-            return self._door_open
+        if self._is_door_position_out_of_range(position_mm, door_limit) is not False:
+            position_mm = await self._handle_bad_door_reading(position_mm, door_limit, now)
+            if position_mm is None:
+                return self._door_open
 
         self._door_bad_reading_count = 0
         threshold = self._door_open_threshold_mm
