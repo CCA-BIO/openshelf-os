@@ -1674,31 +1674,44 @@ class Motor():
         state: MotionWaitState,
         snapshot: MotionSnapshot | None,
     ) -> None:
-        alarm_read_error: str | None = None
-        try:
-            alarm_state = await self._read_alarm_state(homing, state)
-        except Exception as alarm_exc:
-            alarm_state = None
-            alarm_read_error = str(alarm_exc)
+        # The axis may still be moving. Record its last known position, then mark it unusable
+        # before any await so a cancellation cannot leave it homed, and stop it before the
+        # alarm read: after a bus timeout that read can hold the stop back by another full
+        # timeout.
+        self._record_flight_snapshot(snapshot, None, state, None)
+        if self._status not in TERMINAL_MOTOR_STATUSES:
+            self._status = MotorStatus.ERROR
+        self.invalidate_position()
+        if homing is True:
+            # The seek may have stopped on the limit with the counter off; see _cancel_motion.
+            self._should_skip_pre_home_once = True
+        self._clear_pending_motion()
 
-        self._record_flight_snapshot(snapshot, alarm_state, state, None)
-
+        stop_exc = await self._stop_to_completion()
         stop_error: str | None = None
-        try:
-            await self.stop()
-        except Exception as stop_exc:
+        if stop_exc is not None:
             stop_error = str(stop_exc)
             self._logger.error(
                 "Failed to stop motor after motion monitoring exception",
                 extra={"motor_id": self._motor_id, "error": stop_error},
+                exc_info=stop_exc,
             )
 
-        if self._status not in TERMINAL_MOTOR_STATUSES:
-            self._status = MotorStatus.ERROR
-        self._hard_stopped = True
-        self._is_homed = False
-        self._cur_pos = None
-        self._clear_pending_motion()
+        # A pending cancellation request means the caller is being cancelled, whether it
+        # arrived during the stop or was turned into this failure by a bus call.
+        current = asyncio.current_task()
+        cancelled = current is not None and current.cancelling() > 0
+        alarm_state: MotionAlarmState | None = None
+        alarm_read_error: str | None = None
+        if cancelled is False:
+            # Diagnostic only, so a cancellation during it still records the failure below.
+            try:
+                alarm_state = await self._read_alarm_state(homing, state)
+            except asyncio.CancelledError:
+                cancelled = True
+            except Exception as alarm_exc:
+                alarm_read_error = str(alarm_exc)
+
         dump_path = self._dump_flight_recorder(
             reason="motion_exception",
             state=state,
@@ -1719,6 +1732,29 @@ class Motor():
         if alarm_read_error is not None:
             fault_context["alarm_read_error"] = alarm_read_error
         setattr(exc, "fault_context", fault_context)
+
+        if cancelled is True and stop_exc is None:
+            # The axis is stopped, so the cancellation proceeds; it carries the failure's context
+            # and is chained to it, so callers that report cancelled motion still see the fault.
+            # A failed stop is not a clean cancel: the caller's re-raise surfaces it instead.
+            cancellation = asyncio.CancelledError()
+            setattr(cancellation, "fault_context", fault_context)
+            raise cancellation from exc
+
+    async def _stop_to_completion(self) -> Optional[BaseException]:
+        """Send the stop and wait for it even if the caller is cancelled meanwhile; return its
+        failure, if any. A stop left running after the caller moved on could land on its next
+        command to this motor and abort it.
+        """
+        task = asyncio.ensure_future(self.stop())
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except (asyncio.CancelledError, Exception):
+                pass
+        if task.cancelled():
+            return asyncio.CancelledError("the stop write was cancelled")
+        return task.exception()
 
     def _home_guard_trip_for(self, state: MotionWaitState) -> Optional[str]:
         if self._is_home_limit_overrun(state) is True:

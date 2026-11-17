@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -112,8 +113,9 @@ async def test_wait_for_move_position_error_still_reads_alarm_and_invalidates_mo
         return_value=MotionSnapshot(status_word=0x40, is_complete=False, has_fault_bit=False)
     )
     motor.get_position = AsyncMock(side_effect=MotorError("position read failed"))
-    motor.get_param = AsyncMock(return_value=17)
-    motor.stop = AsyncMock(return_value=MotorStatus.STOPPED)
+    order: list[str] = []
+    motor.get_param = AsyncMock(side_effect=lambda name: order.append("alarm_read") or 17)
+    motor.stop = AsyncMock(side_effect=lambda: order.append("stop") or MotorStatus.STOPPED)
     motor._dump_flight_recorder = Mock(return_value="data/motion_faults/y.json")
     motor._pending_motion = AsyncMock()
     motor._target_pos = 50.0
@@ -123,6 +125,8 @@ async def test_wait_for_move_position_error_still_reads_alarm_and_invalidates_mo
     with pytest.raises(MotorError, match="position read failed") as exc_info:
         await motor.wait_for_move(timeout=0.5)
 
+    # The axis may still be moving, so the stop goes out before the diagnostic alarm read.
+    assert order == ["stop", "alarm_read"]
     motor.get_param.assert_awaited_once_with("Current alarm")
     motor.stop.assert_awaited_once()
     assert motor._status is MotorStatus.ERROR
@@ -142,6 +146,44 @@ async def test_wait_for_move_position_error_still_reads_alarm_and_invalidates_mo
         "flight_recorder_path": "data/motion_faults/y.json",
         "position_known": False,
     }
+
+
+@pytest.mark.asyncio
+async def test_wait_for_move_cancelled_while_stopping_after_a_read_failure_still_stops_and_unhomes(
+    mock_controller,
+):
+    motor = Motor(mock_controller, make_motor_params())
+    motor._read_motion_snapshot = AsyncMock(side_effect=MotorError("status read timed out"))
+    motor._dump_flight_recorder = Mock(return_value=None)
+    motor._is_homed = True
+    motor._cur_pos = 12.0
+    stop_started = asyncio.Event()
+    release_stop = asyncio.Event()
+    stop_writes_done: list[int] = []
+
+    async def slow_stop_write(_unit, address, value, **_kwargs):
+        stop_started.set()
+        await release_stop.wait()
+        stop_writes_done.append(value)
+
+    mock_controller.write_single_register.side_effect = slow_stop_write
+    task = asyncio.create_task(motor.wait_for_move(timeout=0.5))
+    await stop_started.wait()
+    task.cancel()
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    # A cancellation landing during the stop write must not leave a moving axis trusted, and
+    # waits for the stop: one landing later could abort the caller's next command.
+    assert motor.is_homed() is False
+    assert motor.is_hard_stopped() is True
+    assert motor._cur_pos is None
+    assert task.done() is False
+
+    release_stop.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert stop_writes_done == [0x40]
 
 
 class _BlockingSafety:
