@@ -606,36 +606,42 @@ class CycleTestRunner:
 
 	# -- run ---------------------------------------------------------------
 
+	async def select_cells(self, is_first: bool) -> Optional[list[dict[str, Any]]]:
+		"""The cells for one pass, or None after recording why the pass cannot run."""
+		fault = await self.hardware_fault()
+		if fault is not None:
+			self.set_hardware_fault(fault)
+			self.log(f"Robot has a hardware fault: {fault[1]}")
+			return None
+
+		if is_first and self.config.clear:
+			self.log("Clearing all items and item locations...")
+			if not await self.clear_database():
+				self.set_error(("cycle_test_clear_failed", CODE_MESSAGES["cycle_test_clear_failed"]))
+				return None
+
+		self.log("Getting storage locations...")
+		locations = await self.locations()
+		if locations is None:
+			self.set_error(("grid_load_failed", CODE_MESSAGES["grid_load_failed"]))
+			return None
+		if not locations:
+			self.log("Warning: no storage cells available, skipping cell tests")
+			self.set_error(NO_CELLS)
+			return None
+		filtered = self.filter_locations(locations)
+		if filtered is None:
+			self.set_error(NO_CELLS)
+		return filtered
+
 	async def run_loop(self, is_first: bool) -> bool:
 		"""Run one pass over the selected cells; returns whether every cell passed."""
 		snapshot = self.snapshot
 		snapshot.results = []
 		snapshot.total = 0
 
-		fault = await self.hardware_fault()
-		if fault is not None:
-			self.set_hardware_fault(fault)
-			self.log(f"Robot has a hardware fault: {fault[1]}")
-			return False
-
-		if is_first and self.config.clear:
-			self.log("Clearing all items and item locations...")
-			if not await self.clear_database():
-				self.set_error(("cycle_test_clear_failed", CODE_MESSAGES["cycle_test_clear_failed"]))
-				return False
-
-		self.log("Getting storage locations...")
-		locations = await self.locations()
-		if locations is None:
-			self.set_error(("grid_load_failed", CODE_MESSAGES["grid_load_failed"]))
-			return False
-		if not locations:
-			self.log("Warning: no storage cells available, skipping cell tests")
-			self.set_error(NO_CELLS)
-			return False
-		filtered = self.filter_locations(locations)
+		filtered = await self.select_cells(is_first)
 		if filtered is None:
-			self.set_error(NO_CELLS)
 			return False
 
 		snapshot.total = len(filtered)
