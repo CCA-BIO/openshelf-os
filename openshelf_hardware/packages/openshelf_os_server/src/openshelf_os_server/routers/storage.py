@@ -1202,6 +1202,24 @@ async def lookup_item(
     return await _build_item_payload_with_bin(item, locations, current_user, session)
 
 
+def _create_item_fields(item: ItemCreate, existing: Optional[Item]) -> tuple[Any, Dict[str, Any], Optional[int]]:
+    dimensions = item.dimensions
+    metadata = item.item_metadata or {}
+    access_level_id = item.access_level_id
+    if existing is not None:
+        # A re-post changes what it names. A field it omits keeps its stored value, as
+        # weight already does; it used to reset the size to the 1 mm default, the
+        # metadata to empty and the access level to none.
+        provided_fields = item.model_fields_set
+        if "dimensions" not in provided_fields:
+            dimensions = existing.dimensions
+        if "item_metadata" not in provided_fields:
+            metadata = existing.item_metadata or {}
+        if "access_level_id" not in provided_fields:
+            access_level_id = existing.access_level_id
+    return dimensions, metadata, access_level_id
+
+
 @router.post(
     "/items",
     dependencies=[Depends(require_relay_or_permissions("storage:write"))],
@@ -1235,21 +1253,9 @@ async def create_item(
         raise api_error(409, "reserved_bin_barcode", "")
     existing = await storage_service.get_item(item.barcode)
     bin_service = BinStorageService(session)
-    dimensions = item.dimensions
-    metadata = item.item_metadata or {}
-    access_level_id = item.access_level_id
     member_bin = await bin_service.item_bin(existing.id) if existing is not None else None
     provided_fields = item.model_fields_set
-    if existing is not None:
-        # A re-post changes what it names. A field it omits keeps its stored value, as
-        # weight already does; it used to reset the size to the 1 mm default, the
-        # metadata to empty and the access level to none.
-        if "dimensions" not in provided_fields:
-            dimensions = existing.dimensions
-        if "item_metadata" not in provided_fields:
-            metadata = existing.item_metadata or {}
-        if "access_level_id" not in provided_fields:
-            access_level_id = existing.access_level_id
+    dimensions, metadata, access_level_id = _create_item_fields(item, existing)
     if member_bin is not None:
         dimensions_changed = (
             "dimensions" in provided_fields and item.dimensions != existing.dimensions
