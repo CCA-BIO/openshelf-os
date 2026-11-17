@@ -1170,6 +1170,27 @@ class ImportJobService:
         await self.session.commit()
         return workflow
 
+    @staticmethod
+    def _tray_height(height: Any) -> float:
+        try:
+            measured_height = float(height)
+        except (TypeError, ValueError):
+            measured_height = math.nan
+        if isinstance(height, bool) or not math.isfinite(measured_height) or measured_height <= 0:
+            raise ImportJobError(422, "invalid_dimensions", "Enter a height greater than zero.")
+        return measured_height
+
+    async def _require_tray_access(self, tray: StorageBin, unit: ImportJobUnit) -> None:
+        members = (
+            await self.session.scalars(
+                select(Item.access_level_id)
+                .join(StorageBinItem, StorageBinItem.item_id == Item.id)
+                .where(StorageBinItem.bin_id == tray.id)
+            )
+        ).all()
+        if any(level != unit.access_level_id for level in members):
+            raise ImportJobError(409, "access_level_mismatch", "This item's access level does not match this bin.")
+
     async def place_in_tray(
         self, job: ImportJob, unit_id: int, height: Any, barcode: Optional[str] = None
     ) -> ImportJobUnit:
@@ -1185,24 +1206,11 @@ class ImportJobService:
         unit = await self.unit(job, unit_id)
         if unit.status != "pending" or not unit.small:
             raise ImportJobError(409, "unit_not_pending", "That item was already handled.")
-        try:
-            measured_height = float(height)
-        except (TypeError, ValueError):
-            measured_height = math.nan
-        if isinstance(height, bool) or not math.isfinite(measured_height) or measured_height <= 0:
-            raise ImportJobError(422, "invalid_dimensions", "Enter a height greater than zero.")
+        measured_height = self._tray_height(height)
         tray = await self.session.get(StorageBin, workflow.bin_id)
         if tray is None:
             raise ImportJobError(409, "tray_missing", "This bin no longer exists.")
-        members = (
-            await self.session.scalars(
-                select(Item.access_level_id)
-                .join(StorageBinItem, StorageBinItem.item_id == Item.id)
-                .where(StorageBinItem.bin_id == tray.id)
-            )
-        ).all()
-        if any(level != unit.access_level_id for level in members):
-            raise ImportJobError(409, "access_level_mismatch", "This item's access level does not match this bin.")
+        await self._require_tray_access(tray, unit)
         if barcode is not None:
             await self._use_scanned_barcode(job, unit, barcode)
         if await self._barcode_taken(unit):
