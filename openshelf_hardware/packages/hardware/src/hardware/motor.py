@@ -671,6 +671,15 @@ class Motor():
 
         return pos_h, pos_l
 
+    @staticmethod
+    def _decode_raw_position(pos_h: int, pos_l: int) -> int:
+        pos = ((pos_h & 0xFFFF) << 16) | (pos_l & 0xFFFF)
+
+        if pos & 0x8000_0000:
+            pos -= 0x1_0000_0000
+
+        return pos
+
     async def get_position(self, *, timeout_s: Optional[float] = None) -> float:
         """Read the encoder position in logical mm.
 
@@ -706,10 +715,7 @@ class Motor():
             if pos_l is None or pos_h is None:
                 raise MotorError(f"Failed to read position registers for motor {self._motor_id}")
 
-            pos = ((pos_h & 0xFFFF) << 16) | (pos_l & 0xFFFF)
-
-            if pos & 0x8000_0000:
-                pos -= 0x1_0000_0000
+            pos = self._decode_raw_position(pos_h, pos_l)
 
             ppr = getattr(self._params, "ppr", 10000)
             physical_pos = (pos / ppr) * self._params.mpr
@@ -754,10 +760,7 @@ class Motor():
                 if pos_l is None or pos_h is None:
                     raise MotorError(f"Failed to re-read position for motor {self._motor_id}")
 
-                pos = ((pos_h & 0xFFFF) << 16) | (pos_l & 0xFFFF)
-
-                if pos & 0x8000_0000:
-                    pos -= 0x1_0000_0000
+                pos = self._decode_raw_position(pos_h, pos_l)
 
                 physical_pos = (pos / ppr) * self._params.mpr
                 logical_pos = self._params.physical_to_logical(physical_pos)
