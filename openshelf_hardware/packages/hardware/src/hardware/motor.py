@@ -1350,9 +1350,14 @@ class Motor():
         pulse = motor_helpers.rev_to_pulse(motor_helpers.mm_to_rev(physical_pos, self._params.mpr), ppr)
 
         # Every move writes its own profile: the registers otherwise keep whatever the
-        # last move, home or move_config() left, and the logged rpm/accel would lie.
+        # last move, home or move_config() left, and the logged rpm/accel would lie. That
+        # includes the path mode and direction: a home or jog that failed part-way leaves
+        # the homing or relative mode and the home direction, which would run this absolute
+        # move as a homing seek, as a relative move, or reversed.
         move_rpm = int(rpm or self._params.rpm)
         move_accel = int(accel or self._params.accel)
+        await self.set_param("Motion of Path 0", 0x1)
+        await self.set_param("Motor direction", self._params.dr)
         await self.set_param("Velocity", move_rpm)
         await self.set_param("Acceleration", move_accel)
         await self.set_param("Deceleration", move_accel)

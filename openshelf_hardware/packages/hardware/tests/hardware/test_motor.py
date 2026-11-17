@@ -1044,6 +1044,39 @@ async def test_rehome_failing_after_the_zero_write_leaves_the_axis_unhomed(mock_
 
 
 @pytest.mark.asyncio
+async def test_move_after_a_home_failing_in_its_seek_setup_runs_as_an_absolute_move(mock_controller):
+    # The failed home left the drive in homing path mode with the home direction (the opposite
+    # of the motor's), and the next move wrote only its target and speed, so the drive ran a
+    # homing seek instead of the move.
+    motor = Motor(mock_controller, make_motor_params(motor_name="x_axis", logical_to_physical=lambda v: v))
+    registers = echo_registers(mock_controller, {})
+    motor.clear_alarm = AsyncMock()
+    motor._move_near_home = AsyncMock()
+    motor._start_path_zero = AsyncMock(side_effect=MotorError("trigger write failed"))
+    motor._is_homed = True
+    motor._cur_pos = 10.0
+    path_reg = motor_helpers.get_register_by_name("Motion of Path 0")
+    direction_reg = motor_helpers.get_register_by_name("Motor direction")
+
+    with pytest.raises(MotorError, match="Failed to start homing movement"):
+        await motor.home()
+    assert (registers[path_reg], registers[direction_reg]) == (0x2, 1)
+
+    at_trigger: dict[str, int] = {}
+    echo = mock_controller.write_single_register.side_effect
+
+    async def record_trigger(unit, address, value, **kwargs):
+        if address == motor_helpers.TRIGGER and value == 0x10:
+            at_trigger.update(path=registers.get(path_reg), direction=registers.get(direction_reg))
+        await echo(unit, address, value, **kwargs)
+
+    mock_controller.write_single_register.side_effect = record_trigger
+    await motor.move_to_position_no_wait(50.0)
+
+    assert at_trigger == {"path": 0x1, "direction": 0}
+
+
+@pytest.mark.asyncio
 async def test_y_axis_home_lifts_off_the_stop_and_stays_after_restoring_overrides(mock_controller):
     # lb4a-4: the first climb straight from the homed zero tripped alarm 32 at ~90 mm.
     motor = y_home_motor(mock_controller)
