@@ -472,6 +472,12 @@ class Motor():
     def is_homed(self) -> bool:
         return self._is_homed
 
+    def invalidate_position(self) -> None:
+        """Drop the axis coordinates; it must home before it moves on them again."""
+        self._is_homed = False
+        self._hard_stopped = True
+        self._cur_pos = None
+
     def set_motion_guard(self, guard: Optional[Callable[[Optional[float]], Awaitable[None]]]) -> None:
         """Run `guard(target_mm)` before every move, `guard(None)` before a home; it raises to refuse."""
         self._motion_guard = guard
@@ -2604,8 +2610,19 @@ class Motor():
         self._emit_init("failed", detail="home", reason=reason)
 
     async def _restore_after_home(
-        self, restore_following_error: bool, restore_peak_current: int | None, home_failed: bool
+        self,
+        restore_following_error: bool,
+        restore_peak_current: int | None,
+        home_failed: bool,
+        zero_rewritten: bool,
     ) -> None:
+        if home_failed is True and zero_rewritten is True:
+            # The drive zero was rewritten, so the previous home's coordinates no longer hold,
+            # and the axis may rest on its limit: the next home seeks from here instead of
+            # approaching a backoff target on that counter.
+            self.invalidate_position()
+            self._should_skip_pre_home_once = True
+
         restore_errors = await self._restore_homing_overrides(
             restore_following_error, restore_peak_current
         )
@@ -2645,6 +2662,7 @@ class Motor():
         restore_following_error = False
         home_failed = False
         safety_stopped = False
+        zero_rewritten = False
 
         try:
             self._emit_init("homing")
@@ -2706,6 +2724,7 @@ class Motor():
                 )
 
             if stop == MotorStatus.STOPPED:
+                zero_rewritten = True
                 await self._zero_at_home(is_y_axis, provisional)
 
                 if is_y_axis:
@@ -2749,4 +2768,6 @@ class Motor():
                 raise MotorError(f"Unexpected error during homing: {str(e)}") from e
             raise
         finally:
-            await self._restore_after_home(restore_following_error, restore_peak_current, home_failed)
+            await self._restore_after_home(
+                restore_following_error, restore_peak_current, home_failed, zero_rewritten
+            )

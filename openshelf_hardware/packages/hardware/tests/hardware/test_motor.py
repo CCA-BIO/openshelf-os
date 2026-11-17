@@ -1019,6 +1019,31 @@ async def test_y_axis_home_fails_when_the_drive_drops_the_zero(mock_controller, 
 
 
 @pytest.mark.asyncio
+async def test_rehome_failing_after_the_zero_write_leaves_the_axis_unhomed(mock_controller):
+    # The drive zero is already rewritten, so the previous home's coordinates no longer hold
+    # and later moves must not run against them.
+    motor = Motor(mock_controller, make_motor_params(motor_name="x_axis"))
+    motor.clear_alarm = AsyncMock()
+    motor._move_near_home = AsyncMock()
+    motor._prepare_home_motion = AsyncMock()
+    motor._start_path_zero = AsyncMock()
+    motor._set_zero_position = AsyncMock()
+    motor.wait_for_move = AsyncMock(return_value=MotorStatus.STOPPED)
+    motor.move_config = AsyncMock(side_effect=MotorError("move config write failed"))
+    motor._is_homed = True
+    motor._cur_pos = 42.0
+
+    with pytest.raises(MotorError, match="move config write failed"):
+        await motor.home()
+
+    motor._set_zero_position.assert_awaited_once()
+    assert motor.is_homed() is False
+    assert motor._cur_pos is None
+    # It may rest on its limit with a bad counter, so the next home seeks without approaching.
+    assert motor._should_skip_pre_home_once is True
+
+
+@pytest.mark.asyncio
 async def test_y_axis_home_lifts_off_the_stop_and_stays_after_restoring_overrides(mock_controller):
     # lb4a-4: the first climb straight from the homed zero tripped alarm 32 at ~90 mm.
     motor = y_home_motor(mock_controller)
