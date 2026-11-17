@@ -1939,6 +1939,14 @@ class Robot:
     #  Command dispatch
     # ------------------------------------------------------------------ #
 
+    async def _home(self, command: HomeCommand) -> None:
+        await self._tool.home(axes=command.axes)
+        if command.axes is None or "door" in command.axes:
+            await self._io.home_door()
+        fridge = getattr(self, "_fridge", None)
+        if fridge is not None and (command.axes is None or "fridge_door" in command.axes):
+            await fridge.home_door()
+
     async def handle_command(self, command: RobotCommands) -> RobotResponse:
         command_name = getattr(command, "command", "unknown")
         try:
@@ -1954,12 +1962,7 @@ class Robot:
                 await self.idle()
                 result = RobotCommandSuccessful(command=command_name)
             elif isinstance(command, HomeCommand):
-                await self._tool.home(axes=command.axes)
-                if command.axes is None or "door" in command.axes:
-                    await self._io.home_door()
-                fridge = getattr(self, "_fridge", None)
-                if fridge is not None and (command.axes is None or "fridge_door" in command.axes):
-                    await fridge.home_door()
+                await self._home(command)
                 result = RobotCommandSuccessful(command=command_name)
             elif isinstance(command, RecoverCommand):
                 await self.recover(command.axes)
