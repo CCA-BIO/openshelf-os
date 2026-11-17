@@ -1321,15 +1321,9 @@ class ImportJobService:
             candidates = [int(i) for i in (returning.resolution or {}).get("candidate_item_ids", [])]
             prepared = await self.bins.prepare_return(returning, candidates)
         except BinWorkflowConflict as exc:
-            # Leave the tray as it was: the batch keeps filling and no return stays open. A refused
-            # check rolled the session back, so the rows are read again before they are changed.
-            await self.session.rollback()
-            returning = await self.session.get(StorageBinWorkflow, returning_id) if returning_id else None
-            if returning is not None and returning.state == "awaiting_operator":
-                await self.bins.transition(returning, "cancelled", str(exc))
-            workflow = await self.session.get(StorageBinWorkflow, workflow_id) if workflow_id else None
-            if workflow is not None and reopen:
-                await self.bins.transition(workflow, "awaiting_operator", "import bin return rejected")
+            await self._undo_tray_return(
+                str(exc), returning_id=returning_id, workflow_id=workflow_id, reopen=reopen
+            )
             raise ImportJobError(409, "tray_return_rejected", str(exc)) from exc
         for unit in placed:
             unit.stage = "returning"
@@ -1337,6 +1331,19 @@ class ImportJobService:
             unit.error = None
         await self.session.commit()
         return returning if prepared else None
+
+    async def _undo_tray_return(
+        self, reason: str, *, returning_id: Optional[str], workflow_id: Optional[str], reopen: bool
+    ) -> None:
+        # Leave the tray as it was: the batch keeps filling and no return stays open. A refused
+        # check rolled the session back, so the rows are read again before they are changed.
+        await self.session.rollback()
+        returning = await self.session.get(StorageBinWorkflow, returning_id) if returning_id else None
+        if returning is not None and returning.state == "awaiting_operator":
+            await self.bins.transition(returning, "cancelled", reason)
+        workflow = await self.session.get(StorageBinWorkflow, workflow_id) if workflow_id else None
+        if workflow is not None and reopen:
+            await self.bins.transition(workflow, "awaiting_operator", "import bin return rejected")
 
     async def apply_tray_return(self, returning: StorageBinWorkflow) -> None:
         """Mark units loaded once a return finished without a robot event (mock mode)."""
