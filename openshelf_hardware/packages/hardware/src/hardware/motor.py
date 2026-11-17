@@ -1655,52 +1655,61 @@ class Motor():
                 await asyncio.shield(self._cancel_motion(homing=homing))
             raise
         except Exception as exc:
-            alarm_read_error: str | None = None
-            try:
-                alarm_state = await self._read_alarm_state(homing, state)
-            except Exception as alarm_exc:
-                alarm_state = None
-                alarm_read_error = str(alarm_exc)
-
-            self._record_flight_snapshot(snapshot, alarm_state, state, None)
-
-            stop_error: str | None = None
-            try:
-                await self.stop()
-            except Exception as stop_exc:
-                stop_error = str(stop_exc)
-                self._logger.error(
-                    "Failed to stop motor after motion monitoring exception",
-                    extra={"motor_id": self._motor_id, "error": stop_error},
-                )
-
-            if self._status not in TERMINAL_MOTOR_STATUSES:
-                self._status = MotorStatus.ERROR
-            self._hard_stopped = True
-            self._is_homed = False
-            self._cur_pos = None
-            self._clear_pending_motion()
-            dump_path = self._dump_flight_recorder(
-                reason="motion_exception",
-                state=state,
-                snapshot=snapshot,
-                alarm_state=alarm_state,
-            )
-            fault_context = {
-                "motor_id": self._motor_id,
-                "status_word": None if snapshot is None else snapshot.status_word,
-                "alarm_code": None if alarm_state is None else alarm_state.alarm_code,
-                "stall_detected": None,
-                "no_progress": None,
-                "safety_blocked": bool(self._safety and self._safety.blocked),
-                "stop_error": stop_error,
-                "flight_recorder_path": dump_path,
-                "position_known": False,
-            }
-            if alarm_read_error is not None:
-                fault_context["alarm_read_error"] = alarm_read_error
-            setattr(exc, "fault_context", fault_context)
+            await self._fail_motion_monitoring(exc, homing, state, snapshot)
             raise
+
+    async def _fail_motion_monitoring(
+        self,
+        exc: Exception,
+        homing: bool,
+        state: MotionWaitState,
+        snapshot: MotionSnapshot | None,
+    ) -> None:
+        alarm_read_error: str | None = None
+        try:
+            alarm_state = await self._read_alarm_state(homing, state)
+        except Exception as alarm_exc:
+            alarm_state = None
+            alarm_read_error = str(alarm_exc)
+
+        self._record_flight_snapshot(snapshot, alarm_state, state, None)
+
+        stop_error: str | None = None
+        try:
+            await self.stop()
+        except Exception as stop_exc:
+            stop_error = str(stop_exc)
+            self._logger.error(
+                "Failed to stop motor after motion monitoring exception",
+                extra={"motor_id": self._motor_id, "error": stop_error},
+            )
+
+        if self._status not in TERMINAL_MOTOR_STATUSES:
+            self._status = MotorStatus.ERROR
+        self._hard_stopped = True
+        self._is_homed = False
+        self._cur_pos = None
+        self._clear_pending_motion()
+        dump_path = self._dump_flight_recorder(
+            reason="motion_exception",
+            state=state,
+            snapshot=snapshot,
+            alarm_state=alarm_state,
+        )
+        fault_context = {
+            "motor_id": self._motor_id,
+            "status_word": None if snapshot is None else snapshot.status_word,
+            "alarm_code": None if alarm_state is None else alarm_state.alarm_code,
+            "stall_detected": None,
+            "no_progress": None,
+            "safety_blocked": bool(self._safety and self._safety.blocked),
+            "stop_error": stop_error,
+            "flight_recorder_path": dump_path,
+            "position_known": False,
+        }
+        if alarm_read_error is not None:
+            fault_context["alarm_read_error"] = alarm_read_error
+        setattr(exc, "fault_context", fault_context)
 
     def _home_guard_trip_for(self, state: MotionWaitState) -> Optional[str]:
         if self._is_home_limit_overrun(state) is True:
