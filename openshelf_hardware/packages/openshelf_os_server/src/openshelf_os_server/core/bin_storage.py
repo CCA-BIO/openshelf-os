@@ -285,6 +285,30 @@ async def validate_direct_store_reservation(
                 raise DirectStoreReservationError("reserved_tray_item")
 
 
+def _bin_row_values(entry: Any) -> dict[str, Any]:
+    """Return the StorageBin column values a configured bin entry defines."""
+    inner_dimensions = entry.inner_dimensions.model_dump(mode="json")
+    max_item_dimensions = getattr(entry, "max_item_dimensions", None)
+    layout = getattr(entry, "compartment_layout", None)
+    return {
+        "compartment_layout": layout.model_dump(mode="json") if layout is not None else None,
+        "side": entry.home_location.side,
+        "shelf_idx": entry.home_location.shelf_idx,
+        "cell_idx": entry.home_location.cell_idx,
+        "inner_dimensions": inner_dimensions,
+        "max_item_dimensions": (
+            max_item_dimensions.model_dump(mode="json")
+            if max_item_dimensions is not None
+            else {
+                "width": inner_dimensions["width"],
+                "length": inner_dimensions["length"],
+            }
+        ),
+        "max_items": entry.max_items,
+        "active": True,
+    }
+
+
 class BinStorageService:
     def __init__(self, session: AsyncSession):
         self.session = session
@@ -327,27 +351,7 @@ class BinStorageService:
                     },
                 )
             row = existing.get(entry.barcode)
-            inner_dimensions = entry.inner_dimensions.model_dump(mode="json")
-            max_item_dimensions = getattr(entry, "max_item_dimensions", None)
-            layout = getattr(entry, "compartment_layout", None)
-            layout_value = layout.model_dump(mode="json") if layout is not None else None
-            values = {
-                "compartment_layout": layout_value,
-                "side": entry.home_location.side,
-                "shelf_idx": entry.home_location.shelf_idx,
-                "cell_idx": entry.home_location.cell_idx,
-                "inner_dimensions": inner_dimensions,
-                "max_item_dimensions": (
-                    max_item_dimensions.model_dump(mode="json")
-                    if max_item_dimensions is not None
-                    else {
-                        "width": inner_dimensions["width"],
-                        "length": inner_dimensions["length"],
-                    }
-                ),
-                "max_items": entry.max_items,
-                "active": True,
-            }
+            values = _bin_row_values(entry)
             if row is None:
                 self.session.add(StorageBin(barcode=entry.barcode, status="at_home", **values))
             else:
@@ -363,7 +367,7 @@ class BinStorageService:
                         "cell_idx",
                     )
                 )
-                if geometry_changed and (row.compartment_layout or layout_value):
+                if geometry_changed and (row.compartment_layout or values["compartment_layout"]):
                     unfinished = await self.session.scalar(
                         select(StorageBinWorkflow.id)
                         .where(
@@ -829,6 +833,57 @@ class BinStorageService:
         member_levels = {member.access_level_id for member in members}
         return len(member_levels) != 1 or joining_levels == member_levels
 
+    @classmethod
+    def _no_fit_reason(cls, item: Item, bins: Sequence[StorageBin]) -> str:
+        item_dimensions = cls._dimensions(item.dimensions, ("width", "height", "length"))
+        if item_dimensions is None:
+            # A record without a usable size fits no bin, so the height and footprint
+            # causes below would be guesses about a size nobody measured.
+            return "The item needs its size measured before it can go in a bin."
+        item_height = item_dimensions[1]
+        known_heights = [
+            dimension[0]
+            for dimension in (
+                cls._dimensions(cls._compartment_dimensions(row), ("height",))
+                for row in bins
+            )
+            if dimension is not None
+        ]
+        if known_heights and all(item_height > known for known in known_heights):
+            return "The item is taller than every bin compartment."
+        return "The item's footprint is larger than every bin compartment."
+
+    @classmethod
+    def _tightest_bin(
+        cls, item: Item, roomy: Sequence[tuple[StorageBin, list[Item]]]
+    ) -> Optional[StorageBin]:
+        candidates: list[tuple[float, bool, str, int, int, StorageBin]] = []
+        for row, members in roomy:
+            if any(member.access_level_id != item.access_level_id for member in members):
+                continue
+            capacity = cls._volume(row.inner_dimensions)
+            item_volume = cls._volume(item.dimensions)
+            used_volume = sum(cls._volume(member.dimensions) or 0.0 for member in members)
+            remaining_volume = (
+                (cls._volume(cls._compartment_dimensions(row)) or capacity) - item_volume
+                if row.compartment_layout
+                else capacity - used_volume - item_volume
+            )
+            # The tightest spot wins; among equal spots a partly filled bin keeps bins full.
+            candidates.append(
+                (
+                    remaining_volume,
+                    len(members) == 0,
+                    row.side,
+                    row.shelf_idx,
+                    row.cell_idx,
+                    row,
+                )
+            )
+        if not candidates:
+            return None
+        return min(candidates, key=lambda entry: entry[:-1])[-1]
+
     async def allocate_bin(self, item: Item) -> tuple[Optional[StorageBin], Optional[str]]:
         """Choose a home bin that takes the item, or report why none can.
 
@@ -863,23 +918,7 @@ class BinStorageService:
             if self._fits(item, row):
                 fitting.append(row)
         if not fitting:
-            item_dimensions = self._dimensions(item.dimensions, ("width", "height", "length"))
-            if item_dimensions is None:
-                # A record without a usable size fits no bin, so the height and footprint
-                # causes below would be guesses about a size nobody measured.
-                return None, "The item needs its size measured before it can go in a bin."
-            item_height = item_dimensions[1]
-            known_heights = [
-                dimension[0]
-                for dimension in (
-                    self._dimensions(self._compartment_dimensions(row), ("height",))
-                    for row in bins
-                )
-                if dimension is not None
-            ]
-            if known_heights and all(item_height > known for known in known_heights):
-                return None, "The item is taller than every bin compartment."
-            return None, "The item's footprint is larger than every bin compartment."
+            return None, self._no_fit_reason(item, bins)
         if not any(row.status == "at_home" for row in fitting):
             return None, "Every bin that fits this item is outside the machine."
         roomy: list[tuple[StorageBin, list[Item]]] = []
@@ -898,34 +937,10 @@ class BinStorageService:
             roomy.append((row, members))
         if not roomy:
             return None, "Every bin that fits this item is full."
-        candidates: list[tuple[float, bool, str, int, int, StorageBin]] = []
-        for row, members in roomy:
-            if any(member.access_level_id != item.access_level_id for member in members):
-                continue
-            capacity = self._volume(row.inner_dimensions)
-            item_volume = self._volume(item.dimensions)
-            used_volume = sum(self._volume(member.dimensions) or 0.0 for member in members)
-            if capacity is None or item_volume is None:
-                continue
-            remaining_volume = (
-                (self._volume(self._compartment_dimensions(row)) or capacity) - item_volume
-                if row.compartment_layout
-                else capacity - used_volume - item_volume
-            )
-            # The tightest spot wins; among equal spots a partly filled bin keeps bins full.
-            candidates.append(
-                (
-                    remaining_volume,
-                    len(members) == 0,
-                    row.side,
-                    row.shelf_idx,
-                    row.cell_idx,
-                    row,
-                )
-            )
-        if not candidates:
+        chosen = self._tightest_bin(item, roomy)
+        if chosen is None:
             return None, "The bins with room hold items with a different access level."
-        return min(candidates, key=lambda entry: entry[:-1])[-1], None
+        return chosen, None
 
     async def _apply_return_contents(
         self, workflow: StorageBinWorkflow, bin_row: StorageBin
@@ -1003,18 +1018,9 @@ class BinStorageService:
                 .where(StorageBinItem.bin_id == bin_row.id)
             )
         ).all()
-        member_ids = {member.id for member in members}
-        joining = [item for item in items if item.id not in member_ids]
-        # Unconfirmed members leave on completion, so they do not count for the
-        # items joining now; only the members that stay hold room and one level.
-        staying = [member for member in members if member.id in confirmed_ids]
-        if any(not self._fits(item, bin_row) for item in joining):
-            return "One of the confirmed items does not fit this bin."
-        if joining:
-            if not self._joining_items_have_volume(joining, staying, bin_row):
-                return "The confirmed items need more space than this bin has."
-            if not self._joining_items_share_a_level(joining, staying):
-                return "The confirmed items have different access levels."
+        joining_error = self._joining_items_error(items, members, confirmed_ids, bin_row)
+        if joining_error:
+            return joining_error
         direct_item = (
             await self.session.execute(
                 select(ItemLocation.item_id).where(ItemLocation.item_id.in_(confirmed_ids)).limit(1)
@@ -1044,6 +1050,28 @@ class BinStorageService:
             )
             if any(member.compartment != positions.get(str(member.item_id)) for member in memberships):
                 return "The item's compartment changed since this task started."
+        return None
+
+    @classmethod
+    def _joining_items_error(
+        cls,
+        items: Sequence[Item],
+        members: Sequence[Item],
+        confirmed_ids: set[int],
+        bin_row: StorageBin,
+    ) -> Optional[str]:
+        member_ids = {member.id for member in members}
+        joining = [item for item in items if item.id not in member_ids]
+        # Unconfirmed members leave on completion, so they do not count for the
+        # items joining now; only the members that stay hold room and one level.
+        staying = [member for member in members if member.id in confirmed_ids]
+        if any(not cls._fits(item, bin_row) for item in joining):
+            return "One of the confirmed items does not fit this bin."
+        if joining:
+            if not cls._joining_items_have_volume(joining, staying, bin_row):
+                return "The confirmed items need more space than this bin has."
+            if not cls._joining_items_share_a_level(joining, staying):
+                return "The confirmed items have different access levels."
         return None
 
     async def _store_invariant_error(self, bin_row: StorageBin, item: Item) -> Optional[str]:
@@ -1374,22 +1402,7 @@ class BinStorageService:
             return
         await self.transition(workflow, "completed")
 
-    async def begin_return(
-        self, barcode: str, user_id: Optional[int] = None
-    ) -> Optional[StorageBinWorkflow]:
-        tray = await self.session.scalar(
-            select(StorageBin).where(StorageBin.barcode == barcode, StorageBin.active.is_(True))
-        )
-        if tray is None:
-            return None
-        # Serialize duplicate scans on this tray across database sessions.
-        await self.session.execute(
-            update(StorageBin).where(StorageBin.id == tray.id).values(updated_at=_utc_now())
-        )
-        await self.session.refresh(tray)
-        if tray.status != "outside":
-            await self.session.rollback()
-            raise BinWorkflowConflict("This bin is already in the machine.")
+    async def _claim_return_slot(self, tray: StorageBin) -> Optional[StorageBinWorkflow]:
         pending = (
             await self.session.scalars(
                 select(StorageBinWorkflow).where(
@@ -1413,6 +1426,9 @@ class BinStorageService:
             # A barcode return supersedes a dismissed/abandoned item instruction.
             workflow.state = "cancelled"
             workflow.completed_at = _utc_now()
+        return None
+
+    async def _return_seed(self, tray: StorageBin) -> Optional[StorageBinWorkflow]:
         latest = await self.session.scalar(
             select(StorageBinWorkflow)
             .where(
@@ -1447,7 +1463,29 @@ class BinStorageService:
                 .limit(1)
             )
         ):
-            latest = None
+            return None
+        return latest
+
+    async def begin_return(
+        self, barcode: str, user_id: Optional[int] = None
+    ) -> Optional[StorageBinWorkflow]:
+        tray = await self.session.scalar(
+            select(StorageBin).where(StorageBin.barcode == barcode, StorageBin.active.is_(True))
+        )
+        if tray is None:
+            return None
+        # Serialize duplicate scans on this tray across database sessions.
+        await self.session.execute(
+            update(StorageBin).where(StorageBin.id == tray.id).values(updated_at=_utc_now())
+        )
+        await self.session.refresh(tray)
+        if tray.status != "outside":
+            await self.session.rollback()
+            raise BinWorkflowConflict("This bin is already in the machine.")
+        existing = await self._claim_return_slot(tray)
+        if existing is not None:
+            return existing
+        latest = await self._return_seed(tray)
         positions = (
             dict((latest.resolution or {}).get("candidate_compartments", {})) if latest else {}
         )

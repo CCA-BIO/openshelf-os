@@ -26,7 +26,7 @@ import math
 import secrets
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
-from typing import Any, Iterable, Optional, Protocol, Sequence
+from typing import Any, Callable, Iterable, Iterator, Optional, Protocol, Sequence
 from uuid import uuid4
 
 from sqlalchemy import func, select
@@ -170,6 +170,89 @@ def _valid_dimensions(value: Any) -> Optional[dict[str, float]]:
     return dimensions
 
 
+# A validated row: the row, its file barcode, access level id, expiry date, and planned dimensions.
+_PreparedRow = tuple[ImportRowInput, Optional[str], Optional[int], Optional[str], Optional[dict[str, float]]]
+
+
+def _prepare_row(
+    row: ImportRowInput,
+    number: int,
+    labels: dict[str, int],
+    levels_by_id: dict[int, AccessLevel],
+    levels_by_name: dict[str, AccessLevel],
+    error: Callable[[str, str], None],
+) -> _PreparedRow:
+    """`row`'s validated values; each problem goes to `error`, and a new file barcode into `labels`."""
+    name = _clean(row.name)
+    if name is None:
+        error("name", "Name is required")
+    elif len(name) > 255:
+        error("name", "Name is longer than 255 characters")
+    if row.quantity < 1:
+        error("quantity", "Quantity must be at least 1")
+    label = _clean(row.barcode)
+    if label is not None:
+        if len(label) > BARCODE_MAX_LENGTH or not _printable(label):
+            error("barcode", "Barcode must be printable ASCII up to 255 characters")
+        elif label in labels:
+            error("barcode", f"Barcode {label} repeats row {labels[label]}")
+        else:
+            labels[label] = number
+    access_level_id = _row_access_level_id(row.access_level, levels_by_id, levels_by_name, error)
+    expires_at: Optional[str] = None
+    try:
+        expires_at = _normalize_date(row.expires_at)
+    except ValueError as exc:
+        error("expires_at", str(exc))
+    masses = {
+        key: value
+        for key, value in (
+            ("tare_weight", row.tare_weight),
+            ("net_weight", row.net_weight),
+            ("full_net_weight", row.full_net_weight),
+        )
+        if value is not None
+    }
+    try:
+        validate_mass(masses)
+    except ValidationError as exc:
+        error("weight", str(exc))
+    return (row, label, access_level_id, expires_at, _row_dimensions(row, error))
+
+
+def _row_access_level_id(
+    value: Optional[str | int],
+    levels_by_id: dict[int, AccessLevel],
+    levels_by_name: dict[str, AccessLevel],
+    error: Callable[[str, str], None],
+) -> Optional[int]:
+    if value is None or str(value).strip() == "":
+        return None
+    raw = str(value).strip()
+    level = levels_by_name.get(raw.lower())
+    if level is None and raw.isdigit():
+        level = levels_by_id.get(int(raw))
+    if level is None and raw.lower().startswith("level ") is False and raw.isdigit():
+        level = levels_by_name.get(f"level {raw}")
+    if level is None:
+        error("access_level", f"Unknown access level {raw}")
+        return None
+    return level.id
+
+
+def _row_dimensions(row: ImportRowInput, error: Callable[[str, str], None]) -> Optional[dict[str, float]]:
+    planned: dict[str, float] = {}
+    for key in ("width", "height", "length"):
+        value = getattr(row, key)
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+            error(key, f"{key.capitalize()} must be a positive number of millimetres")
+        else:
+            planned[key] = float(value)
+    return planned or None
+
+
 def _robot_grid() -> Any:
     """The robot's storage grid, or the configured grid file when no robot runs."""
     worker = robot_core.robot_worker
@@ -262,12 +345,25 @@ class ImportJobService:
                 422, "too_many_units", f"An import can load at most {MAX_UNITS} units; this one has {total}"
             )
 
+        labels, prepared = await self._prepare_rows(rows)
+        reserved = await self._check_barcodes_free(labels)
+
+        job = ImportJob(id=str(uuid4()), state="active", filename=_clean(filename))
+        self.session.add(job)
+        unlabelled = sum(row.quantity - (1 if label is not None else 0) for row, label, _, _, _ in prepared)
+        generated = iter(await self._new_barcodes(unlabelled, set(labels) | reserved))
+        self._add_units(job, prepared, generated)
+        await self.session.commit()
+        return job
+
+    async def _prepare_rows(self, rows: Sequence[ImportRowInput]) -> tuple[dict[str, int], list[_PreparedRow]]:
+        """Each row's validated values, and the file's barcodes by row; every row error is raised at once."""
         levels = (await self.session.scalars(select(AccessLevel))).all()
         levels_by_id = {level.id: level for level in levels}
         levels_by_name = {level.name.strip().lower(): level for level in levels}
         errors: list[dict[str, Any]] = []
         labels: dict[str, int] = {}
-        prepared: list[tuple[ImportRowInput, Optional[str], Optional[int], Optional[str], Optional[dict[str, float]]]] = []
+        prepared: list[_PreparedRow] = []
 
         for index, row in enumerate(rows):
             number = row.row_number or index + 1
@@ -275,65 +371,14 @@ class ImportJobService:
             def error(field_name: str, message: str) -> None:
                 errors.append({"row": number, "field": field_name, "message": message})
 
-            name = _clean(row.name)
-            if name is None:
-                error("name", "Name is required")
-            elif len(name) > 255:
-                error("name", "Name is longer than 255 characters")
-            if row.quantity < 1:
-                error("quantity", "Quantity must be at least 1")
-            label = _clean(row.barcode)
-            if label is not None:
-                if len(label) > BARCODE_MAX_LENGTH or not _printable(label):
-                    error("barcode", "Barcode must be printable ASCII up to 255 characters")
-                elif label in labels:
-                    error("barcode", f"Barcode {label} repeats row {labels[label]}")
-                else:
-                    labels[label] = number
-            access_level_id: Optional[int] = None
-            if row.access_level is not None and str(row.access_level).strip() != "":
-                raw = str(row.access_level).strip()
-                level = levels_by_name.get(raw.lower())
-                if level is None and raw.isdigit():
-                    level = levels_by_id.get(int(raw))
-                if level is None and raw.lower().startswith("level ") is False and raw.isdigit():
-                    level = levels_by_name.get(f"level {raw}")
-                if level is None:
-                    error("access_level", f"Unknown access level {raw}")
-                else:
-                    access_level_id = level.id
-            expires_at: Optional[str] = None
-            try:
-                expires_at = _normalize_date(row.expires_at)
-            except ValueError as exc:
-                error("expires_at", str(exc))
-            masses = {
-                key: value
-                for key, value in (
-                    ("tare_weight", row.tare_weight),
-                    ("net_weight", row.net_weight),
-                    ("full_net_weight", row.full_net_weight),
-                )
-                if value is not None
-            }
-            try:
-                validate_mass(masses)
-            except ValidationError as exc:
-                error("weight", str(exc))
-            planned: dict[str, float] = {}
-            for key in ("width", "height", "length"):
-                value = getattr(row, key)
-                if value is None:
-                    continue
-                if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
-                    error(key, f"{key.capitalize()} must be a positive number of millimetres")
-                else:
-                    planned[key] = float(value)
-            prepared.append((row, label, access_level_id, expires_at, planned or None))
+            prepared.append(_prepare_row(row, number, labels, levels_by_id, levels_by_name, error))
 
         if errors:
             raise ImportJobError(422, "invalid_rows", "Some rows in the file cannot be imported.", errors)
+        return labels, prepared
 
+    async def _check_barcodes_free(self, labels: dict[str, int]) -> set[str]:
+        """Rejects file barcodes an item or tray already uses; returns the reserved tray barcodes."""
         existing = await self._existing_barcodes(labels)
         reserved = await reserved_bin_barcodes(self.session)
         conflicts = sorted((existing | reserved) & set(labels))
@@ -344,11 +389,9 @@ class ImportJobService:
                 "Some barcodes in the file already exist on this machine.",
                 [{"row": labels[barcode], "field": "barcode", "barcode": barcode, "message": "Already on this machine"} for barcode in conflicts],
             )
+        return reserved
 
-        job = ImportJob(id=str(uuid4()), state="active", filename=_clean(filename))
-        self.session.add(job)
-        unlabelled = sum(row.quantity - (1 if label is not None else 0) for row, label, _, _, _ in prepared)
-        generated = iter(await self._new_barcodes(unlabelled, set(labels) | reserved))
+    def _add_units(self, job: ImportJob, prepared: list[_PreparedRow], generated: Iterator[str]) -> None:
         position = 0
         for row, label, access_level_id, expires_at, planned_dimensions in prepared:
             name = _clean(row.name) or ""
@@ -376,8 +419,6 @@ class ImportJobService:
                     )
                 )
                 position += 1
-        await self.session.commit()
-        return job
 
     async def _existing_barcodes(self, barcodes: Iterable[str]) -> set[str]:
         """Which of `barcodes` items already use, in a few chunked queries."""
@@ -429,15 +470,7 @@ class ImportJobService:
                 )
                 if command is None:
                     continue
-                if command.status in ("queued", "running"):
-                    if unit.stage != "storing":
-                        unit.stage = "storing"
-                        changed = True
-                elif command.status == "succeeded":
-                    self._mark_loaded(unit)
-                    changed = True
-                elif command.status == "failed":
-                    self._mark_store_failed(job, unit, (command.result or {}).get("error"))
+                if self._follow_command(job, unit, command):
                     changed = True
             elif unit.stage == "returning":
                 workflow = await self.session.get(StorageBinWorkflow, unit.request_id)
@@ -457,6 +490,20 @@ class ImportJobService:
         if await self.settle(job):
             changed = True
         return changed
+
+    def _follow_command(self, job: ImportJob, unit: ImportJobUnit, command: RobotCommand) -> bool:
+        """Move a measured or storing unit along with its store command; whether the unit changed."""
+        if command.status in ("queued", "running"):
+            if unit.stage == "storing":
+                return False
+            unit.stage = "storing"
+        elif command.status == "succeeded":
+            self._mark_loaded(unit)
+        elif command.status == "failed":
+            self._mark_store_failed(job, unit, (command.result or {}).get("error"))
+        else:
+            return False
+        return True
 
     async def _recovered_home(self, bin_id: int) -> bool:
         tray = await self.session.get(StorageBin, bin_id)
@@ -701,47 +748,9 @@ class ImportJobService:
         # operator still needs to see why the bin did not come.
         refused = workflow is not None and workflow.state == "cancelled" and workflow.error is not None
         if workflow is not None and (workflow.state in ("retrieving_bin", "awaiting_operator", "failed") or refused):
-            phase = {
-                "retrieving_bin": "fetching",
-                "awaiting_operator": "filling",
-                "failed": "failed",
-                "cancelled": "failed",
-            }[workflow.state]
-            members = [unit for unit in placed if unit.bin_id == workflow.bin_id]
-            group: list[ImportJobUnit] = []
-            if job.state == "active":
-                anchor = members[0] if members else None
-                pending = await self.units(job, ["pending"])
-                small = [unit for unit in pending if unit.small]
-                if phase == "failed":
-                    # Try again fetches for the next item, so the step stays only while a tray takes it.
-                    trays = await self._trays()
-                    head = pending[0] if pending else None
-                    small = (
-                        await self._small_group(job, head, trays)
-                        if head is not None and head.small and self._tray_takes(trays, head)
-                        else []
-                    )
-                if anchor is None and small:
-                    anchor = small[0]
-                if anchor is not None:
-                    group = [unit for unit in small if unit.access_level_id == anchor.access_level_id]
-                    if phase != "failed":
-                        # Offer only the items the plan puts in the tray being delivered; the rest wait.
-                        tray_row = await self.session.get(StorageBin, workflow.bin_id)
-                        plan = await self._plan(group, tray_row, len(members)) if tray_row is not None else {}
-                        group = [
-                            unit for unit in group if (planned := plan.get(unit.id)) is not None and planned.id == workflow.bin_id
-                        ]
-            # A failed delivery only matters while its items still wait for a tray.
-            if phase != "failed" or group:
-                return {
-                    "kind": "tray",
-                    "phase": phase,
-                    "workflow": await self.bins.serialize_workflow(workflow),
-                    "units": [self.serialize_unit(unit) for unit in [*members, *group]],
-                    "error": workflow.error,
-                }
+            step = await self._delivery_step(job, workflow, placed)
+            if step is not None:
+                return step
         if returning or (
             # An empty tray going back has no returning units; its return workflow tracks it,
             # until the robot has put it back (a held return is not waited on).
@@ -765,6 +774,57 @@ class ImportJobService:
                 "error": next((unit.error for unit in placed if unit.error), None),
             }
         return None
+
+    async def _delivery_step(
+        self, job: ImportJob, workflow: StorageBinWorkflow, placed: Sequence[ImportJobUnit]
+    ) -> Optional[dict[str, Any]]:
+        """The step for a tray being fetched or filled, or whose delivery failed or was refused."""
+        phase = {
+            "retrieving_bin": "fetching",
+            "awaiting_operator": "filling",
+            "failed": "failed",
+            "cancelled": "failed",
+        }[workflow.state]
+        members = [unit for unit in placed if unit.bin_id == workflow.bin_id]
+        group = await self._delivery_group(job, workflow, phase == "failed", members) if job.state == "active" else []
+        # A failed delivery only matters while its items still wait for a tray.
+        if phase == "failed" and not group:
+            return None
+        return {
+            "kind": "tray",
+            "phase": phase,
+            "workflow": await self.bins.serialize_workflow(workflow),
+            "units": [self.serialize_unit(unit) for unit in [*members, *group]],
+            "error": workflow.error,
+        }
+
+    async def _delivery_group(
+        self, job: ImportJob, workflow: StorageBinWorkflow, failed: bool, members: Sequence[ImportJobUnit]
+    ) -> list[ImportJobUnit]:
+        """The pending units offered with the tray's own members."""
+        anchor = members[0] if members else None
+        pending = await self.units(job, ["pending"])
+        small = [unit for unit in pending if unit.small]
+        if failed:
+            # Try again fetches for the next item, so the step stays only while a tray takes it.
+            trays = await self._trays()
+            head = pending[0] if pending else None
+            small = (
+                await self._small_group(job, head, trays)
+                if head is not None and head.small and self._tray_takes(trays, head)
+                else []
+            )
+        if anchor is None and small:
+            anchor = small[0]
+        if anchor is None:
+            return []
+        group = [unit for unit in small if unit.access_level_id == anchor.access_level_id]
+        if failed:
+            return group
+        # Offer only the items the plan puts in the tray being delivered; the rest wait.
+        tray_row = await self.session.get(StorageBin, workflow.bin_id)
+        plan = await self._plan(group, tray_row, len(members)) if tray_row is not None else {}
+        return [unit for unit in group if (planned := plan.get(unit.id)) is not None and planned.id == workflow.bin_id]
 
     # ------------------------------------------------------------- serialize
 
@@ -1116,6 +1176,27 @@ class ImportJobService:
         await self.session.commit()
         return workflow
 
+    @staticmethod
+    def _tray_height(height: Any) -> float:
+        try:
+            measured_height = float(height)
+        except (TypeError, ValueError):
+            measured_height = math.nan
+        if isinstance(height, bool) or not math.isfinite(measured_height) or measured_height <= 0:
+            raise ImportJobError(422, "invalid_dimensions", "Enter a height greater than zero.")
+        return measured_height
+
+    async def _require_tray_access(self, tray: StorageBin, unit: ImportJobUnit) -> None:
+        members = (
+            await self.session.scalars(
+                select(Item.access_level_id)
+                .join(StorageBinItem, StorageBinItem.item_id == Item.id)
+                .where(StorageBinItem.bin_id == tray.id)
+            )
+        ).all()
+        if any(level != unit.access_level_id for level in members):
+            raise ImportJobError(409, "access_level_mismatch", "This item's access level does not match this bin.")
+
     async def place_in_tray(
         self, job: ImportJob, unit_id: int, height: Any, barcode: Optional[str] = None
     ) -> ImportJobUnit:
@@ -1131,24 +1212,11 @@ class ImportJobService:
         unit = await self.unit(job, unit_id)
         if unit.status != "pending" or not unit.small:
             raise ImportJobError(409, "unit_not_pending", "That item was already handled.")
-        try:
-            measured_height = float(height)
-        except (TypeError, ValueError):
-            measured_height = math.nan
-        if isinstance(height, bool) or not math.isfinite(measured_height) or measured_height <= 0:
-            raise ImportJobError(422, "invalid_dimensions", "Enter a height greater than zero.")
+        measured_height = self._tray_height(height)
         tray = await self.session.get(StorageBin, workflow.bin_id)
         if tray is None:
             raise ImportJobError(409, "tray_missing", "This bin no longer exists.")
-        members = (
-            await self.session.scalars(
-                select(Item.access_level_id)
-                .join(StorageBinItem, StorageBinItem.item_id == Item.id)
-                .where(StorageBinItem.bin_id == tray.id)
-            )
-        ).all()
-        if any(level != unit.access_level_id for level in members):
-            raise ImportJobError(409, "access_level_mismatch", "This item's access level does not match this bin.")
+        await self._require_tray_access(tray, unit)
         if barcode is not None:
             await self._use_scanned_barcode(job, unit, barcode)
         if await self._barcode_taken(unit):
@@ -1259,15 +1327,9 @@ class ImportJobService:
             candidates = [int(i) for i in (returning.resolution or {}).get("candidate_item_ids", [])]
             prepared = await self.bins.prepare_return(returning, candidates)
         except BinWorkflowConflict as exc:
-            # Leave the tray as it was: the batch keeps filling and no return stays open. A refused
-            # check rolled the session back, so the rows are read again before they are changed.
-            await self.session.rollback()
-            returning = await self.session.get(StorageBinWorkflow, returning_id) if returning_id else None
-            if returning is not None and returning.state == "awaiting_operator":
-                await self.bins.transition(returning, "cancelled", str(exc))
-            workflow = await self.session.get(StorageBinWorkflow, workflow_id) if workflow_id else None
-            if workflow is not None and reopen:
-                await self.bins.transition(workflow, "awaiting_operator", "import bin return rejected")
+            await self._undo_tray_return(
+                str(exc), returning_id=returning_id, workflow_id=workflow_id, reopen=reopen
+            )
             raise ImportJobError(409, "tray_return_rejected", str(exc)) from exc
         for unit in placed:
             unit.stage = "returning"
@@ -1275,6 +1337,19 @@ class ImportJobService:
             unit.error = None
         await self.session.commit()
         return returning if prepared else None
+
+    async def _undo_tray_return(
+        self, reason: str, *, returning_id: Optional[str], workflow_id: Optional[str], reopen: bool
+    ) -> None:
+        # Leave the tray as it was: the batch keeps filling and no return stays open. A refused
+        # check rolled the session back, so the rows are read again before they are changed.
+        await self.session.rollback()
+        returning = await self.session.get(StorageBinWorkflow, returning_id) if returning_id else None
+        if returning is not None and returning.state == "awaiting_operator":
+            await self.bins.transition(returning, "cancelled", reason)
+        workflow = await self.session.get(StorageBinWorkflow, workflow_id) if workflow_id else None
+        if workflow is not None and reopen:
+            await self.bins.transition(workflow, "awaiting_operator", "import bin return rejected")
 
     async def apply_tray_return(self, returning: StorageBinWorkflow) -> None:
         """Mark units loaded once a return finished without a robot event (mock mode)."""

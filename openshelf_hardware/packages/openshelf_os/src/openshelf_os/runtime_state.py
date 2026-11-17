@@ -8,7 +8,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from openshelf_os.operating_mode import OperatingMode, get_operating_mode
 
@@ -226,6 +226,22 @@ def _invalidate_demo_seed_if_core_state_recovered(
         (active.data_dir / DEMO_SEEDED_FILE).unlink(missing_ok=True)
 
 
+def _adopt_or_fork(
+    source: Path,
+    target: Path,
+    label: str,
+    fork: Callable[[Path, Path], bool],
+    copied: list[str],
+    adopted: list[str],
+) -> None:
+    if target.exists():
+        adopted.append(label)
+    elif fork(source, target):
+        copied.append(label)
+    elif target.exists():
+        adopted.append(label)
+
+
 def ensure_mode_workspace(paths: RuntimeStatePaths | None = None) -> dict[str, Any] | None:
     active = paths if paths is not None else RuntimeStatePaths.current()
     if active.mode == OperatingMode.production:
@@ -239,12 +255,9 @@ def ensure_mode_workspace(paths: RuntimeStatePaths | None = None) -> dict[str, A
     copied: list[str] = []
     adopted: list[str] = []
 
-    if active.config_path.exists():
-        adopted.append(active.config_path.name)
-    elif _atomic_copy(production.config_path, active.config_path):
-        copied.append(active.config_path.name)
-    elif active.config_path.exists():
-        adopted.append(active.config_path.name)
+    _adopt_or_fork(
+        production.config_path, active.config_path, active.config_path.name, _atomic_copy, copied, adopted
+    )
 
     production_config = _read_json_object(production.config_path)
     active_config = _read_json_object(active.config_path)
@@ -263,22 +276,28 @@ def ensure_mode_workspace(paths: RuntimeStatePaths | None = None) -> dict[str, A
         # Mock inventory is exclusively database-backed and must never inherit
         # a production storage snapshot.
         pass
-    elif active_storage.exists():
-        adopted.append(_manifest_path_label(active_storage, active.data_dir))
-    elif _atomic_copy(production_storage, active_storage):
-        copied.append(_manifest_path_label(active_storage, active.data_dir))
-    elif active_storage.exists():
-        adopted.append(_manifest_path_label(active_storage, active.data_dir))
+    else:
+        _adopt_or_fork(
+            production_storage,
+            active_storage,
+            _manifest_path_label(active_storage, active.data_dir),
+            _atomic_copy,
+            copied,
+            adopted,
+        )
 
     if active.mode == OperatingMode.mock and active.database_path.exists() is False:
         # Alembic creates a fresh database containing only seeded auth state.
         pass
-    elif active.database_path.exists():
-        adopted.append(active.database_path.name)
-    elif _sqlite_backup(production.database_path, active.database_path):
-        copied.append(active.database_path.name)
-    elif active.database_path.exists():
-        adopted.append(active.database_path.name)
+    else:
+        _adopt_or_fork(
+            production.database_path,
+            active.database_path,
+            active.database_path.name,
+            _sqlite_backup,
+            copied,
+            adopted,
+        )
 
     production_blank_logical = _configured_path(
         production_config,
@@ -298,12 +317,7 @@ def ensure_mode_workspace(paths: RuntimeStatePaths | None = None) -> dict[str, A
         active_blank_logical,
         relative_to=Path.cwd(),
     )
-    if active_blank.exists():
-        adopted.append(str(active_blank))
-    elif _atomic_copy(production_blank, active_blank):
-        copied.append(str(active_blank))
-    elif active_blank.exists():
-        adopted.append(str(active_blank))
+    _adopt_or_fork(production_blank, active_blank, str(active_blank), _atomic_copy, copied, adopted)
 
     _invalidate_demo_seed_if_core_state_recovered(active, copied, active_storage)
 

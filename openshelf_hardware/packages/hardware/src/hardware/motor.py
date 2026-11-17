@@ -11,7 +11,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Optional, Callable, Awaitable
+from typing import TYPE_CHECKING, Any, Optional, Callable, Awaitable, NoReturn
 
 from hardware import motor_helpers
 from hardware.controller import SharedModbusController
@@ -472,6 +472,12 @@ class Motor():
     def is_homed(self) -> bool:
         return self._is_homed
 
+    def invalidate_position(self) -> None:
+        """Drop the axis coordinates; it must home before it moves on them again."""
+        self._is_homed = False
+        self._hard_stopped = True
+        self._cur_pos = None
+
     def set_motion_guard(self, guard: Optional[Callable[[Optional[float]], Awaitable[None]]]) -> None:
         """Run `guard(target_mm)` before every move, `guard(None)` before a home; it raises to refuse."""
         self._motion_guard = guard
@@ -671,6 +677,15 @@ class Motor():
 
         return pos_h, pos_l
 
+    @staticmethod
+    def _decode_raw_position(pos_h: int, pos_l: int) -> int:
+        pos = ((pos_h & 0xFFFF) << 16) | (pos_l & 0xFFFF)
+
+        if pos & 0x8000_0000:
+            pos -= 0x1_0000_0000
+
+        return pos
+
     async def get_position(self, *, timeout_s: Optional[float] = None) -> float:
         """Read the encoder position in logical mm.
 
@@ -706,10 +721,7 @@ class Motor():
             if pos_l is None or pos_h is None:
                 raise MotorError(f"Failed to read position registers for motor {self._motor_id}")
 
-            pos = ((pos_h & 0xFFFF) << 16) | (pos_l & 0xFFFF)
-
-            if pos & 0x8000_0000:
-                pos -= 0x1_0000_0000
+            pos = self._decode_raw_position(pos_h, pos_l)
 
             ppr = getattr(self._params, "ppr", 10000)
             physical_pos = (pos / ppr) * self._params.mpr
@@ -754,10 +766,7 @@ class Motor():
                 if pos_l is None or pos_h is None:
                     raise MotorError(f"Failed to re-read position for motor {self._motor_id}")
 
-                pos = ((pos_h & 0xFFFF) << 16) | (pos_l & 0xFFFF)
-
-                if pos & 0x8000_0000:
-                    pos -= 0x1_0000_0000
+                pos = self._decode_raw_position(pos_h, pos_l)
 
                 physical_pos = (pos / ppr) * self._params.mpr
                 logical_pos = self._params.physical_to_logical(physical_pos)
@@ -1341,9 +1350,14 @@ class Motor():
         pulse = motor_helpers.rev_to_pulse(motor_helpers.mm_to_rev(physical_pos, self._params.mpr), ppr)
 
         # Every move writes its own profile: the registers otherwise keep whatever the
-        # last move, home or move_config() left, and the logged rpm/accel would lie.
+        # last move, home or move_config() left, and the logged rpm/accel would lie. That
+        # includes the path mode and direction: a home or jog that failed part-way leaves
+        # the homing or relative mode and the home direction, which would run this absolute
+        # move as a homing seek, as a relative move, or reversed.
         move_rpm = int(rpm or self._params.rpm)
         move_accel = int(accel or self._params.accel)
+        await self.set_param("Motion of Path 0", 0x1)
+        await self.set_param("Motor direction", self._params.dr)
         await self.set_param("Velocity", move_rpm)
         await self.set_param("Acceleration", move_accel)
         await self.set_param("Deceleration", move_accel)
@@ -1655,52 +1669,97 @@ class Motor():
                 await asyncio.shield(self._cancel_motion(homing=homing))
             raise
         except Exception as exc:
-            alarm_read_error: str | None = None
+            await self._fail_motion_monitoring(exc, homing, state, snapshot)
+            raise
+
+    async def _fail_motion_monitoring(
+        self,
+        exc: Exception,
+        homing: bool,
+        state: MotionWaitState,
+        snapshot: MotionSnapshot | None,
+    ) -> None:
+        # The axis may still be moving. Record its last known position, then mark it unusable
+        # before any await so a cancellation cannot leave it homed, and stop it before the
+        # alarm read: after a bus timeout that read can hold the stop back by another full
+        # timeout.
+        self._record_flight_snapshot(snapshot, None, state, None)
+        if self._status not in TERMINAL_MOTOR_STATUSES:
+            self._status = MotorStatus.ERROR
+        self.invalidate_position()
+        if homing is True:
+            # The seek may have stopped on the limit with the counter off; see _cancel_motion.
+            self._should_skip_pre_home_once = True
+        self._clear_pending_motion()
+
+        stop_exc = await self._stop_to_completion()
+        stop_error: str | None = None
+        if stop_exc is not None:
+            stop_error = str(stop_exc)
+            self._logger.error(
+                "Failed to stop motor after motion monitoring exception",
+                extra={"motor_id": self._motor_id, "error": stop_error},
+                exc_info=stop_exc,
+            )
+
+        # A pending cancellation request means the caller is being cancelled, whether it
+        # arrived during the stop or was turned into this failure by a bus call.
+        current = asyncio.current_task()
+        cancelled = current is not None and current.cancelling() > 0
+        alarm_state: MotionAlarmState | None = None
+        alarm_read_error: str | None = None
+        if cancelled is False:
+            # Diagnostic only, so a cancellation during it still records the failure below.
             try:
                 alarm_state = await self._read_alarm_state(homing, state)
+            except asyncio.CancelledError:
+                cancelled = True
             except Exception as alarm_exc:
-                alarm_state = None
                 alarm_read_error = str(alarm_exc)
 
-            self._record_flight_snapshot(snapshot, alarm_state, state, None)
+        dump_path = self._dump_flight_recorder(
+            reason="motion_exception",
+            state=state,
+            snapshot=snapshot,
+            alarm_state=alarm_state,
+        )
+        fault_context = {
+            "motor_id": self._motor_id,
+            "status_word": None if snapshot is None else snapshot.status_word,
+            "alarm_code": None if alarm_state is None else alarm_state.alarm_code,
+            "stall_detected": None,
+            "no_progress": None,
+            "safety_blocked": bool(self._safety and self._safety.blocked),
+            "stop_error": stop_error,
+            "flight_recorder_path": dump_path,
+            "position_known": False,
+        }
+        if alarm_read_error is not None:
+            fault_context["alarm_read_error"] = alarm_read_error
+        setattr(exc, "fault_context", fault_context)
 
-            stop_error: str | None = None
+        if cancelled is True and stop_exc is None:
+            # The axis is stopped, so the cancellation proceeds; it carries the failure's context
+            # and is chained to it, so callers that report cancelled motion still see the fault.
+            # A failed stop is not a clean cancel: the caller's re-raise surfaces it instead.
+            cancellation = asyncio.CancelledError()
+            setattr(cancellation, "fault_context", fault_context)
+            raise cancellation from exc
+
+    async def _stop_to_completion(self) -> Optional[BaseException]:
+        """Send the stop and wait for it even if the caller is cancelled meanwhile; return its
+        failure, if any. A stop left running after the caller moved on could land on its next
+        command to this motor and abort it.
+        """
+        task = asyncio.ensure_future(self.stop())
+        while not task.done():
             try:
-                await self.stop()
-            except Exception as stop_exc:
-                stop_error = str(stop_exc)
-                self._logger.error(
-                    "Failed to stop motor after motion monitoring exception",
-                    extra={"motor_id": self._motor_id, "error": stop_error},
-                )
-
-            if self._status not in TERMINAL_MOTOR_STATUSES:
-                self._status = MotorStatus.ERROR
-            self._hard_stopped = True
-            self._is_homed = False
-            self._cur_pos = None
-            self._clear_pending_motion()
-            dump_path = self._dump_flight_recorder(
-                reason="motion_exception",
-                state=state,
-                snapshot=snapshot,
-                alarm_state=alarm_state,
-            )
-            fault_context = {
-                "motor_id": self._motor_id,
-                "status_word": None if snapshot is None else snapshot.status_word,
-                "alarm_code": None if alarm_state is None else alarm_state.alarm_code,
-                "stall_detected": None,
-                "no_progress": None,
-                "safety_blocked": bool(self._safety and self._safety.blocked),
-                "stop_error": stop_error,
-                "flight_recorder_path": dump_path,
-                "position_known": False,
-            }
-            if alarm_read_error is not None:
-                fault_context["alarm_read_error"] = alarm_read_error
-            setattr(exc, "fault_context", fault_context)
-            raise
+                await asyncio.shield(task)
+            except (asyncio.CancelledError, Exception):
+                pass
+        if task.cancelled():
+            return asyncio.CancelledError("the stop write was cancelled")
+        return task.exception()
 
     def _home_guard_trip_for(self, state: MotionWaitState) -> Optional[str]:
         if self._is_home_limit_overrun(state) is True:
@@ -2283,6 +2342,23 @@ class Motor():
             # The trigger may have landed; no wait_for_move is watching yet, so stop the drive.
             await asyncio.shield(self._cancel_motion(homing=True))
             raise
+        except Exception as trigger_exc:
+            # A write that raised can still have reached the drive and started an unwatched seek:
+            # drop the coordinates, stop it, and report the trigger failure itself.
+            self.invalidate_position()
+            self._should_skip_pre_home_once = True
+            self._clear_pending_motion()
+            stop_exc = await self._stop_to_completion()
+            if stop_exc is not None:
+                self._logger.error(
+                    "Failed to stop motor after a failed homing trigger",
+                    extra={"motor_id": self._motor_id, "error": str(stop_exc)},
+                    exc_info=stop_exc,
+                )
+            current = asyncio.current_task()
+            if stop_exc is None and current is not None and current.cancelling() > 0:
+                raise asyncio.CancelledError() from trigger_exc
+            raise
         # The drive seeks its home limit, which is the logical far end on an inverted axis.
         self._commanded_direction = 1 if self._is_physical_mapping_inverted() is True else -1
         self._status = MotorStatus.MOVING
@@ -2504,6 +2580,122 @@ class Motor():
             f"'{self._home_limit_input.name}' is not engaged"
         )
 
+    async def _arm_homing_following_error_trip(self) -> None:
+        try:
+            await self._arm_following_error_trip()
+        except Exception as e:
+            raise MotorConfigError(f"Failed to arm following-error trip: {str(e)}") from e
+
+    async def _run_pre_home_approach(
+        self, pre_home_clearance_mm: Optional[float], skip_pre_home_approach: bool
+    ) -> None:
+        try:
+            if pre_home_clearance_mm is not None:
+                await self._move_away_from_home(pre_home_clearance_mm, self._params.ret_rpm)
+            if skip_pre_home_approach is True:
+                self._logger.warning(
+                    "Skipping pre-home approach",
+                    extra={
+                        "motor_id": self._motor_id,
+                        "motor_name": getattr(self._params, "motor_name", None),
+                    },
+                )
+            else:
+                await self._move_near_home(self._params.ret_rpm)
+        except Exception as e:
+            raise MotorConfigError(f"Failed during pre-home approach: {str(e)}") from e
+
+    def _consume_safety_stop(self, stop: MotorStatus) -> bool:
+        safety_interrupted = self._safety_interrupted_move
+        self._safety_interrupted_move = False
+        if safety_interrupted is True and not (stop == MotorStatus.FAULT and self._last_fault_was_hardware):
+            # The pause stopped the drive short of its limit and the seek is not
+            # restarted, so zeroing here would set home wherever the axis stopped.
+            # A real drive fault after the pause falls through and still crashes.
+            self._is_homed = False
+            self._hard_stopped = True
+            # The seek may have stopped on the limit with the counter off, so the next home
+            # seeks from here: an approach to the backoff target would drive into the switch.
+            self._should_skip_pre_home_once = True
+            return True
+        return False
+
+    async def _zero_at_home(self, is_y_axis: bool, provisional: bool) -> None:
+        if is_y_axis:
+            await self._clear_homing_trip()
+
+        try:
+            await self._set_zero_position()
+        except Exception as e:
+            raise MotorError(f"Failed to set home position as zero: {str(e)}") from e
+
+        if is_y_axis:
+            await self._verify_zero_position()
+        else:
+            # Keep the alarm-history reset here. Without it the zero is dropped (X,
+            # rotate) or, zeroed after move_config, the next door open trips alarm
+            # 32 at ~20 mm (lb4a-3, 2026-10-29). Homing is rare enough to pay its stall.
+            await self.set_param("Control word", 0x1111)
+            await self._reset_alarm_history()
+            await self.move_config()
+
+        if provisional is False:
+            await self._verify_home_limit_engaged()
+
+    def _raise_home_fault(self) -> NoReturn:
+        self._is_homed = False
+        self._hard_stopped = True
+
+        if self._home_guard_trip is not None:
+            if self._home_guard_trip == "switch_overrun":
+                detail = f"kept driving {HOME_LIMIT_OVERRUN_S:.0f} s after its home switch engaged"
+            else:
+                detail = f"turned more than {self._home_overtravel_limit_mm():.0f} mm, past its full travel"
+            tripped = MotorError(f"Motor {self._motor_id} {detail} while homing")
+            setattr(tripped, "fault_context", self._last_fault_context)
+            raise tripped
+        raise MotorError(f"Motor {self._motor_id} faulted during homing")
+
+    def _report_home_failure(self, e: Exception, safety_stopped: bool) -> None:
+        if isinstance(e, MotorTimeoutError):
+            self._is_homed = False
+        if safety_stopped is True:
+            reason = "Homing was stopped by a safety guard. Clear it, then home it again."
+        elif isinstance(e, MotorTimeoutError):
+            reason = "Homing timed out. Check for an obstruction, then home it again."
+        else:
+            reason = "Homing failed. Check the motor before homing it again."
+        self._emit_init("failed", detail="home", reason=reason)
+
+    async def _restore_after_home(
+        self,
+        restore_following_error: bool,
+        restore_peak_current: int | None,
+        home_failed: bool,
+        zero_rewritten: bool,
+    ) -> None:
+        if home_failed is True and zero_rewritten is True:
+            # The drive zero was rewritten, so the previous home's coordinates no longer hold,
+            # and the axis may rest on its limit: the next home seeks from here instead of
+            # approaching a backoff target on that counter.
+            self.invalidate_position()
+            self._should_skip_pre_home_once = True
+
+        restore_errors = await self._restore_homing_overrides(
+            restore_following_error, restore_peak_current
+        )
+
+        if restore_errors:
+            self._is_homed = False
+            self._hard_stopped = True
+            message = f"Failed to restore motor {self._motor_id} " + "; ".join(restore_errors)
+            if home_failed is True:
+                # Keep the homing failure as the reported cause.
+                self._logger.warning(message, extra={"motor_id": self._motor_id})
+            else:
+                self._emit_init("failed", detail="home", reason="The motor settings were not restored after homing. Check the drive.")
+                raise MotorConfigError(message)
+
     # ------------------------------------------------------------------ #
     #  Public homing API
     # ------------------------------------------------------------------ #
@@ -2528,36 +2720,21 @@ class Motor():
         restore_following_error = False
         home_failed = False
         safety_stopped = False
+        zero_rewritten = False
 
         try:
             self._emit_init("homing")
             await self.clear_alarm()
 
-            if getattr(self._params, "motor_name", None) == "y_axis":
+            is_y_axis = getattr(self._params, "motor_name", None) == "y_axis"
+            if is_y_axis:
                 restore_following_error = True
-                try:
-                    await self._arm_following_error_trip()
-                except Exception as e:
-                    raise MotorConfigError(f"Failed to arm following-error trip: {str(e)}") from e
+                await self._arm_homing_following_error_trip()
 
             home_dir = self._get_home_direction()
             home_rpm = self._params.home_rpm or self._params.ret_rpm
 
-            try:
-                if pre_home_clearance_mm is not None:
-                    await self._move_away_from_home(pre_home_clearance_mm, self._params.ret_rpm)
-                if skip_pre_home_approach is True:
-                    self._logger.warning(
-                        "Skipping pre-home approach",
-                        extra={
-                            "motor_id": self._motor_id,
-                            "motor_name": getattr(self._params, "motor_name", None),
-                        },
-                    )
-                else:
-                    await self._move_near_home(self._params.ret_rpm)
-            except Exception as e:
-                raise MotorConfigError(f"Failed during pre-home approach: {str(e)}") from e
+            await self._run_pre_home_approach(pre_home_clearance_mm, skip_pre_home_approach)
 
             # Wait before the homing overrides go on, so a blocked axis does not sit on them.
             if self._safety:
@@ -2598,44 +2775,15 @@ class Motor():
             if self._on_move_complete is not None:
                 self._on_move_complete(elapsed)
 
-            safety_interrupted = self._safety_interrupted_move
-            self._safety_interrupted_move = False
-            if safety_interrupted is True and not (stop == MotorStatus.FAULT and self._last_fault_was_hardware):
-                # The pause stopped the drive short of its limit and the seek is not
-                # restarted, so zeroing here would set home wherever the axis stopped.
-                # A real drive fault after the pause falls through and still crashes.
-                self._is_homed = False
-                self._hard_stopped = True
-                # The seek may have stopped on the limit with the counter off, so the next home
-                # seeks from here: an approach to the backoff target would drive into the switch.
-                self._should_skip_pre_home_once = True
+            if self._consume_safety_stop(stop) is True:
                 safety_stopped = True
                 raise MotorSafetyStopError(
                     f"Homing of motor {self._motor_id} was stopped by the safety guard and did not complete"
                 )
 
             if stop == MotorStatus.STOPPED:
-                is_y_axis = getattr(self._params, "motor_name", None) == "y_axis"
-                if is_y_axis:
-                    await self._clear_homing_trip()
-
-                try:
-                    await self._set_zero_position()
-                except Exception as e:
-                    raise MotorError(f"Failed to set home position as zero: {str(e)}") from e
-
-                if is_y_axis:
-                    await self._verify_zero_position()
-                else:
-                    # Keep the alarm-history reset here. Without it the zero is dropped (X,
-                    # rotate) or, zeroed after move_config, the next door open trips alarm
-                    # 32 at ~20 mm (lb4a-3, 2026-10-29). Homing is rare enough to pay its stall.
-                    await self.set_param("Control word", 0x1111)
-                    await self._reset_alarm_history()
-                    await self.move_config()
-
-                if provisional is False:
-                    await self._verify_home_limit_engaged()
+                zero_rewritten = True
+                await self._zero_at_home(is_y_axis, provisional)
 
                 if is_y_axis:
                     restore_errors = await self._restore_homing_overrides(
@@ -2659,18 +2807,7 @@ class Motor():
                 self._should_skip_pre_home_once = False
                 self._emit_init("ready")
             elif stop == MotorStatus.FAULT:
-                self._is_homed = False
-                self._hard_stopped = True
-
-                if self._home_guard_trip is not None:
-                    if self._home_guard_trip == "switch_overrun":
-                        detail = f"kept driving {HOME_LIMIT_OVERRUN_S:.0f} s after its home switch engaged"
-                    else:
-                        detail = f"turned more than {self._home_overtravel_limit_mm():.0f} mm, past its full travel"
-                    tripped = MotorError(f"Motor {self._motor_id} {detail} while homing")
-                    setattr(tripped, "fault_context", self._last_fault_context)
-                    raise tripped
-                raise MotorError(f"Motor {self._motor_id} faulted during homing")
+                self._raise_home_fault()
             else:
                 self._is_homed = False
 
@@ -2684,30 +2821,11 @@ class Motor():
             raise
         except Exception as e:
             home_failed = True
-            if isinstance(e, MotorTimeoutError):
-                self._is_homed = False
-            if safety_stopped is True:
-                reason = "Homing was stopped by a safety guard. Clear it, then home it again."
-            elif isinstance(e, MotorTimeoutError):
-                reason = "Homing timed out. Check for an obstruction, then home it again."
-            else:
-                reason = "Homing failed. Check the motor before homing it again."
-            self._emit_init("failed", detail="home", reason=reason)
+            self._report_home_failure(e, safety_stopped)
             if not isinstance(e, (MotorError, MotorConfigError, MotorTimeoutError)):
                 raise MotorError(f"Unexpected error during homing: {str(e)}") from e
             raise
         finally:
-            restore_errors = await self._restore_homing_overrides(
-                restore_following_error, restore_peak_current
+            await self._restore_after_home(
+                restore_following_error, restore_peak_current, home_failed, zero_rewritten
             )
-
-            if restore_errors:
-                self._is_homed = False
-                self._hard_stopped = True
-                message = f"Failed to restore motor {self._motor_id} " + "; ".join(restore_errors)
-                if home_failed is True:
-                    # Keep the homing failure as the reported cause.
-                    self._logger.warning(message, extra={"motor_id": self._motor_id})
-                else:
-                    self._emit_init("failed", detail="home", reason="The motor settings were not restored after homing. Check the drive.")
-                    raise MotorConfigError(message)

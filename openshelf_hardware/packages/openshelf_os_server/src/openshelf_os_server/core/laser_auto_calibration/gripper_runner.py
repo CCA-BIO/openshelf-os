@@ -48,44 +48,7 @@ async def calibrate_gripper_open_position(
     grid = worker._robot._grid
     previous = int(tool._gs.open_position)
     result = LaserAutoCalibrationGripperResult(previous_open_position=previous)
-    measured: list[tuple[LaserAutoCalibrationGripperSample, AxisCoordinate]] = []
-
-    for side in sides:
-        side_name = _side_to_short_name(side)
-        datum = None if grid is None else laser_module.select_reference_datum_cell(grid=grid, side=side)
-
-        if datum is None:
-            result.skipped.append(f"{side_name}: no hand-calibrated reference cell")
-            continue
-
-        shelf_idx, cell = datum
-        location = StorageModuleCellLocation(side=side, shelf_idx=int(shelf_idx), cell_idx=int(cell.cell_idx))
-        point = grid.get_cell_coordinate(location)
-        coordinate = AxisCoordinate(
-            x=point.x, y=point.y, s=0 if side == StorageModuleSide.FRONT else 1, z_offset=point.z_offset
-        )
-        measurement = await laser_module.measure_hole_stop(tool, coordinate, should_abort=should_abort)
-        sample = LaserAutoCalibrationGripperSample(
-            side=side,
-            shelf_idx=location.shelf_idx,
-            cell_idx=location.cell_idx,
-            z_offset_mm=float(coordinate.z_offset),
-            positions=measurement.positions,
-            states=measurement.states,
-            stop_position=measurement.stop_position,
-        )
-        result.samples.append(sample)
-        laser_module.print_status(
-            f"phase=gripper-open-position side={side_name} cell={location.shelf_idx}:{location.cell_idx} "
-            f"z_mm={coordinate.z_offset:.2f} positions={measurement.positions} stop={measurement.stop_position}"
-        )
-
-        if measurement.stop_position is None:
-            result.skipped.append(f"{side_name}: no steady grip at the reference cell")
-            continue
-
-        measured.append((sample, coordinate))
-
+    measured = await _measure_reference_sides(tool, grid, sides, result, should_abort)
     open_position = None
 
     if len(measured) > 0:
@@ -149,6 +112,54 @@ async def calibrate_gripper_open_position(
         logger.warning("gripper_open_position_debug_write_failed", exc_info=exc)
 
     return result
+
+
+async def _measure_reference_sides(
+    tool,
+    grid,
+    sides: list[StorageModuleSide],
+    result: LaserAutoCalibrationGripperResult,
+    should_abort: Callable[[], bool] | None,
+) -> list[tuple[LaserAutoCalibrationGripperSample, AxisCoordinate]]:
+    measured: list[tuple[LaserAutoCalibrationGripperSample, AxisCoordinate]] = []
+
+    for side in sides:
+        side_name = _side_to_short_name(side)
+        datum = None if grid is None else laser_module.select_reference_datum_cell(grid=grid, side=side)
+
+        if datum is None:
+            result.skipped.append(f"{side_name}: no hand-calibrated reference cell")
+            continue
+
+        shelf_idx, cell = datum
+        location = StorageModuleCellLocation(side=side, shelf_idx=int(shelf_idx), cell_idx=int(cell.cell_idx))
+        point = grid.get_cell_coordinate(location)
+        coordinate = AxisCoordinate(
+            x=point.x, y=point.y, s=0 if side == StorageModuleSide.FRONT else 1, z_offset=point.z_offset
+        )
+        measurement = await laser_module.measure_hole_stop(tool, coordinate, should_abort=should_abort)
+        sample = LaserAutoCalibrationGripperSample(
+            side=side,
+            shelf_idx=location.shelf_idx,
+            cell_idx=location.cell_idx,
+            z_offset_mm=float(coordinate.z_offset),
+            positions=measurement.positions,
+            states=measurement.states,
+            stop_position=measurement.stop_position,
+        )
+        result.samples.append(sample)
+        laser_module.print_status(
+            f"phase=gripper-open-position side={side_name} cell={location.shelf_idx}:{location.cell_idx} "
+            f"z_mm={coordinate.z_offset:.2f} positions={measurement.positions} stop={measurement.stop_position}"
+        )
+
+        if measurement.stop_position is None:
+            result.skipped.append(f"{side_name}: no steady grip at the reference cell")
+            continue
+
+        measured.append((sample, coordinate))
+
+    return measured
 
 
 class GripperRunnerMixin:

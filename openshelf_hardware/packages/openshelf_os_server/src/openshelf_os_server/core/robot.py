@@ -18,6 +18,7 @@ from openshelf_os_server.core.init_progress import (
     OVERALL_FAILED,
     OVERALL_INITIALIZING,
     OVERALL_READY,
+    RobotInitTracker,
     get_init_tracker,
 )
 from openshelf_os_server.core.crash_video_recorder import (
@@ -138,6 +139,47 @@ async def _interrupted_bin_crash_reason() -> Optional[str]:
     return "A bin move was interrupted. Check that every bin is on its shelf before resetting."
 
 
+def _apply_startup_needs_home(
+    worker: r_worker.RobotWorker,
+    robot: "r.Robot",
+    tracker: RobotInitTracker,
+    home_on_init: bool,
+    startup_home_skip_reason: Optional[str],
+) -> None:
+    critical_motor_components = set(CRITICAL_MOTOR_COMPONENTS)
+    if "fridge_door" in robot.get_init_component_names():
+        critical_motor_components.add("fridge_door")
+    failed = tracker.failed_components(degrading_only=True)
+    failed_motor_components = [component for component in failed if component in critical_motor_components]
+    if home_on_init is False:
+        if failed_motor_components:
+            reason = "Startup failed for motion components: " + ", ".join(failed_motor_components)
+        elif startup_home_skip_reason is not None:
+            reason = startup_home_skip_reason
+        else:
+            reason = "Automatic homing disabled on initialization"
+        worker.set_needs_home(reason, axes=sorted(critical_motor_components))
+    elif failed_motor_components:
+        reason = "Startup failed for motion components: " + ", ".join(failed_motor_components)
+        worker.set_needs_home(reason, axes=failed_motor_components)
+
+
+async def _cleanup_failed_worker(
+    worker: Optional[r_worker.RobotWorker],
+    listener: Optional[RobotEventListener],
+) -> None:
+    if listener is not None:
+        try:
+            await listener.stop()
+        except Exception as stop_error:
+            logger.warning("robot_event_listener_cleanup_failed: %s", stop_error, exc_info=True)
+    if worker is not None:
+        try:
+            await worker.shutdown()
+        except Exception as shutdown_error:
+            logger.warning("robot_worker_cleanup_failed: %s", shutdown_error, exc_info=True)
+
+
 async def init_robot_worker() -> None:
     """Bring up the robot in the background, reporting progress into the init tracker.
 
@@ -231,22 +273,7 @@ async def init_robot_worker() -> None:
             crash_artifact_begin_provider=begin_motion_crash_artifacts,
             command_lifecycle_callback=handle_worker_lifecycle,
         )
-        critical_motor_components = set(CRITICAL_MOTOR_COMPONENTS)
-        if "fridge_door" in robot.get_init_component_names():
-            critical_motor_components.add("fridge_door")
-        failed = tracker.failed_components(degrading_only=True)
-        failed_motor_components = [component for component in failed if component in critical_motor_components]
-        if home_on_init is False:
-            if failed_motor_components:
-                reason = "Startup failed for motion components: " + ", ".join(failed_motor_components)
-            elif startup_home_skip_reason is not None:
-                reason = startup_home_skip_reason
-            else:
-                reason = "Automatic homing disabled on initialization"
-            worker.set_needs_home(reason, axes=sorted(critical_motor_components))
-        elif failed_motor_components:
-            reason = "Startup failed for motion components: " + ", ".join(failed_motor_components)
-            worker.set_needs_home(reason, axes=failed_motor_components)
+        _apply_startup_needs_home(worker, robot, tracker, home_on_init, startup_home_skip_reason)
         try:
             interrupted_reason = await _interrupted_bin_crash_reason()
         except Exception as e:
@@ -272,16 +299,7 @@ async def init_robot_worker() -> None:
         _report_printer_status()
     except Exception as e:
         tracker.report("command_worker", "failed", reason="The robot command worker did not start.")
-        if listener is not None:
-            try:
-                await listener.stop()
-            except Exception as stop_error:
-                logger.warning("robot_event_listener_cleanup_failed: %s", stop_error, exc_info=True)
-        if worker is not None:
-            try:
-                await worker.shutdown()
-            except Exception as shutdown_error:
-                logger.warning("robot_worker_cleanup_failed: %s", shutdown_error, exc_info=True)
+        await _cleanup_failed_worker(worker, listener)
         set_robot_initialization_error(e)
         tracker.set_overall(OVERALL_FAILED, error=STARTUP_FAILED_MESSAGE)
         logger.warning("robot_worker_start_failed: %s", e, exc_info=True)

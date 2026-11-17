@@ -376,6 +376,30 @@ def _match_detected_cell(
 	return matched_cell
 
 
+def _require_configured_offset(*, scan_config: Any, side: StorageModuleSide) -> tuple[float, float]:
+	configured_offset = get_gripper_xy_correction(scan_config=scan_config, side=side)
+
+	if configured_offset is None:
+		# With nothing configured there is no prediction to make, and a proximity match at a
+		# ~105mm pitch silently lands on a neighbouring opening: one wrong match re-frames and
+		# persists every cell on the module.
+		side_name = "front" if side == StorageModuleSide.FRONT else "back"
+		raise ValueError(
+			f"reference offsets on the {side.value}: no "
+			f"robot.grid.scan.{side_name}_gripper_xy_correction_mm is configured, so there is nothing to "
+			"predict the manual cells' detected positions from; set a rough one first (it only "
+			"needs to land within a few tens of millimetres of the truth), then re-run; the "
+			"derivation replaces it with the value the reference cells imply"
+		)
+
+	return float(configured_offset[0]), float(configured_offset[1])
+
+
+def _median_of_present(values: list[float | None]) -> float | None:
+	present = [value for value in values if value is not None]
+	return None if len(present) == 0 else float(median(present))
+
+
 def derive_reference_offsets(
 	*,
 	grid: StorageGrid,
@@ -417,23 +441,7 @@ def derive_reference_offsets(
 			"run from; tick 'keep manual' when saving the bottom-left reference cell"
 		)
 
-	configured_offset = get_gripper_xy_correction(scan_config=scan_config, side=side)
-	configured_offset_x_mm = None if configured_offset is None else float(configured_offset[0])
-	configured_offset_y_mm = None if configured_offset is None else float(configured_offset[1])
-
-	if configured_offset_x_mm is None or configured_offset_y_mm is None:
-		# With nothing configured there is no prediction to make, and a proximity match at a
-		# ~105mm pitch silently lands on a neighbouring opening: one wrong match re-frames and
-		# persists every cell on the module.
-		side_name = "front" if side == StorageModuleSide.FRONT else "back"
-		raise ValueError(
-			f"reference offsets on the {side.value}: no "
-			f"robot.grid.scan.{side_name}_gripper_xy_correction_mm is configured, so there is nothing to "
-			"predict the manual cells' detected positions from; set a rough one first (it only "
-			"needs to land within a few tens of millimetres of the truth), then re-run; the "
-			"derivation replaces it with the value the reference cells imply"
-		)
-
+	configured_offset_x_mm, configured_offset_y_mm = _require_configured_offset(scan_config=scan_config, side=side)
 	predictor_x_mm = configured_offset_x_mm
 	predictor_y_mm = configured_offset_y_mm
 
@@ -526,14 +534,12 @@ def derive_reference_offsets(
 			},
 		)
 
-	offset_x_mm = float(median([sample.delta_x_mm for sample in samples]))
-	offset_y_mm = float(median([sample.delta_y_mm for sample in samples]))
-	spread_x_mm = max(sample.delta_x_mm for sample in samples) - min(
-		sample.delta_x_mm for sample in samples
-	)
-	spread_y_mm = max(sample.delta_y_mm for sample in samples) - min(
-		sample.delta_y_mm for sample in samples
-	)
+	deltas_x_mm = [sample.delta_x_mm for sample in samples]
+	deltas_y_mm = [sample.delta_y_mm for sample in samples]
+	offset_x_mm = float(median(deltas_x_mm))
+	offset_y_mm = float(median(deltas_y_mm))
+	spread_x_mm = max(deltas_x_mm) - min(deltas_x_mm)
+	spread_y_mm = max(deltas_y_mm) - min(deltas_y_mm)
 
 	if spread_x_mm > REFERENCE_MAX_SPREAD_MM or spread_y_mm > REFERENCE_MAX_SPREAD_MM:
 		raise ValueError(
@@ -543,17 +549,6 @@ def derive_reference_offsets(
 			"cells are marked manual before calibrating against them"
 		)
 
-	intercepts = [
-		sample.derived_intercept_mm
-		for sample in samples
-		if sample.derived_intercept_mm is not None
-	]
-	captured_stages = [
-		sample.z_captured_stage_mm
-		for sample in samples
-		if sample.z_captured_stage_mm is not None
-	]
-
 	return ReferenceOffsetResult(
 		side=side,
 		offset_x_mm=offset_x_mm,
@@ -561,11 +556,11 @@ def derive_reference_offsets(
 		spread_x_mm=spread_x_mm,
 		spread_y_mm=spread_y_mm,
 		samples=samples,
-		intercept_mm=None if len(intercepts) == 0 else float(median(intercepts)),
+		intercept_mm=_median_of_present([sample.derived_intercept_mm for sample in samples]),
 		slope_per_mm=slope_per_mm,
 		configured_offset_x_mm=configured_offset_x_mm,
 		configured_offset_y_mm=configured_offset_y_mm,
-		z_captured_stage_mm=None if len(captured_stages) == 0 else float(median(captured_stages)),
+		z_captured_stage_mm=_median_of_present([sample.z_captured_stage_mm for sample in samples]),
 		z_stage_extension_mm=None if stage_extension_mm is None else float(stage_extension_mm),
 		skipped=skipped,
 	)

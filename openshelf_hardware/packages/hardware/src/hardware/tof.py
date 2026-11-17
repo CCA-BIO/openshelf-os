@@ -103,6 +103,24 @@ class _FtdiI2CBus:
             raw_deinit()
 
 
+def _validate_sensor_tuning(
+    distance_mode: int | None,
+    roi_width: int | None,
+    roi_height: int | None,
+    roi_center: int | None,
+) -> None:
+    if distance_mode is not None and distance_mode not in (1, 2):
+        raise ToFConfigError("distance mode must be 1 (short) or 2 (long)")
+    if (roi_width is None) != (roi_height is None):
+        raise ToFConfigError("roi_width and roi_height must be configured together")
+    if roi_width is not None and (roi_width < 1 or roi_width > 16):
+        raise ToFConfigError("roi_width must be in range 1..16")
+    if roi_height is not None and (roi_height < 1 or roi_height > 16):
+        raise ToFConfigError("roi_height must be in range 1..16")
+    if roi_center is not None and (roi_center < 0 or roi_center > 255):
+        raise ToFConfigError("roi_center must be in range 0..255")
+
+
 class ToFSensorBus:
     def __init__(
         self,
@@ -129,16 +147,7 @@ class ToFSensorBus:
             raise ToFConfigError("channels must be in range 0..7")
         if timing_budget_ms <= 0 or read_timeout_s <= 0:
             raise ToFConfigError("timing budget and read timeout must be positive")
-        if distance_mode is not None and distance_mode not in (1, 2):
-            raise ToFConfigError("distance mode must be 1 (short) or 2 (long)")
-        if (roi_width is None) != (roi_height is None):
-            raise ToFConfigError("roi_width and roi_height must be configured together")
-        if roi_width is not None and (roi_width < 1 or roi_width > 16):
-            raise ToFConfigError("roi_width must be in range 1..16")
-        if roi_height is not None and (roi_height < 1 or roi_height > 16):
-            raise ToFConfigError("roi_height must be in range 1..16")
-        if roi_center is not None and (roi_center < 0 or roi_center > 255):
-            raise ToFConfigError("roi_center must be in range 0..255")
+        _validate_sensor_tuning(distance_mode, roi_width, roi_height, roi_center)
 
         self.ftdi_url = ftdi_url
         self.mux_address = mux_address

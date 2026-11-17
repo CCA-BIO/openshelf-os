@@ -257,13 +257,7 @@ class AngleRunnerMixin:
         config = get_root_config()
         scan_config = config.robot.grid.scan
         tool = worker._robot._tool
-
-        if tool._laser_enabled is False or tool._laser is None:
-            raise ValueError("Laser is not enabled")
-
-        if tool._mx is None or tool._my is None or tool._mg is None or tool._ms is None or tool._mr is None:
-            raise ValueError("x, y, z, stage, and rotation motors are required")
-
+        self._require_stage_stall_tool(tool)
         stage_motor = tool._ms
         rotation_motor = tool._mr
 
@@ -318,11 +312,7 @@ class AngleRunnerMixin:
         stage_timeout_s = float(STAGE_STALL_TIMEOUT_S)
         no_progress_timeout_s = float(getattr(scan_config, "angle_calibration_stage_stall_no_progress_timeout_s", 0.25))
         min_valid_stage_position_mm = float(STAGE_STALL_MIN_VALID_STAGE_POSITION_MM)
-        validation_retry_count = int(STAGE_STALL_VALIDATION_RETRY_COUNT)
-        coarse_retry_count = int(STAGE_STALL_COARSE_RETRY_COUNT)
         validation_plateau_tolerance_mm = float(STAGE_STALL_VALIDATION_PLATEAU_TOLERANCE_MM)
-        coarse_validation_count = int(STAGE_STALL_COARSE_VALIDATION_COUNT)
-        validation_high_side_window_deg = float(STAGE_STALL_VALIDATION_HIGH_SIDE_WINDOW_DEG)
         low_contact_retry_count = int(STAGE_STALL_LOW_CONTACT_RETRY_COUNT)
         validation_min_valid_sample_count = int(STAGE_STALL_VALIDATION_MIN_VALID_SAMPLE_COUNT)
         angle_args = argparse.Namespace(
@@ -331,9 +321,6 @@ class AngleRunnerMixin:
             scout_x_mm=None,
         )
         samples: list[angle_module.StageStallProbeSample] = []
-        coarse_samples: list[angle_module.StageStallProbeSample] = []
-        fine_samples: list[angle_module.StageStallProbeSample] = []
-        validation_samples: list[angle_module.StageStallProbeSample] = []
         capture_y_mm = float("nan")
 
         async with self._patch_status_callbacks(
@@ -380,9 +367,15 @@ class AngleRunnerMixin:
                     *,
                     pass_name: str,
                     pass_rotation_positions: list[float],
+                    home_status: str | None = None,
                 ) -> list[angle_module.StageStallProbeSample]:
                     nonlocal current_probe_start_mm
                     pass_samples: list[angle_module.StageStallProbeSample] = []
+
+                    if home_status is not None:
+                        angle_module.print_status(home_status)
+                        await stage_motor.home()
+                        current_probe_start_mm = probe_start_mm
 
                     for rotation_idx, rotation_deg in enumerate(pass_rotation_positions, start=1):
                         for low_contact_attempt_idx in range(low_contact_retry_count + 1):
@@ -499,115 +492,13 @@ class AngleRunnerMixin:
 
                     return pass_samples
 
-                coarse_samples = []
-
-                for coarse_attempt_idx in range(coarse_retry_count + 1):
-                    pass_name = "coarse" if coarse_attempt_idx == 0 else "coarse_retry"
-                    coarse_samples = await did_run_stage_stall_pass(
-                        pass_name=pass_name,
-                        pass_rotation_positions=rotation_positions,
-                    )
-                    _coarse_summaries, _raw_coarse_best_summary = _summarize_stage_stall_samples(
-                        coarse_samples,
-                        min_stage_position_mm=min_valid_stage_position_mm,
-                    )
-                    coarse_best_summary = _select_stage_stall_best_summary(
-                        _coarse_summaries,
-                        min_stage_position_mm=min_valid_stage_position_mm,
-                        plateau_tolerance_mm=validation_plateau_tolerance_mm,
-                    )
-
-                    if coarse_best_summary is not None:
-                        break
-
-                    angle_module.print_status(
-                        "stage_probe=coarse_reject "
-                        f"attempt={coarse_attempt_idx + 1}/{coarse_retry_count + 1} "
-                        f"min_stage_position_mm={min_valid_stage_position_mm:.3f}"
-                    )
-
-                    if coarse_attempt_idx < coarse_retry_count:
-                        angle_module.print_status("stage_probe=home_before_coarse_retry")
-                        await stage_motor.home()
-                        current_probe_start_mm = probe_start_mm
-
-                if coarse_best_summary is not None:
-                    fine_rotation_positions = _build_stage_stall_fine_rotation_positions(
-                        scan_config,
-                        float(coarse_best_summary["rotation_deg"]),
-                        rotation_center_deg,
-                        rotation_limit_deg,
-                    )
-                    angle_module.print_status(
-                        "stage_probe=fine_window "
-                        f"coarse_best_rotation_deg={float(coarse_best_summary['rotation_deg']):.3f} "
-                        f"positions={len(fine_rotation_positions)}"
-                    )
-
-                    if len(fine_rotation_positions) > 0:
-                        angle_module.print_status("stage_probe=home_before_fine")
-                        await stage_motor.home()
-                        current_probe_start_mm = probe_start_mm
-                        fine_samples = await did_run_stage_stall_pass(
-                            pass_name="fine",
-                            pass_rotation_positions=fine_rotation_positions,
-                        )
-
-                    fine_summaries, fine_best_summary = _summarize_stage_stall_samples(
-                        fine_samples,
-                        min_stage_position_mm=min_valid_stage_position_mm,
-                    )
-
-                    if fine_best_summary is not None:
-                        validation_count = int(STAGE_STALL_VALIDATION_COUNT)
-                        validation_repeats = int(STAGE_STALL_VALIDATION_REPEATS)
-                        validation_rotation_positions = _build_stage_stall_validation_rotation_positions(
-                            fine_summaries=fine_summaries,
-                            coarse_summaries=_coarse_summaries,
-                            validation_count=validation_count,
-                            validation_repeats=validation_repeats,
-                            coarse_validation_count=coarse_validation_count,
-                            high_side_window_deg=validation_high_side_window_deg,
-                        )
-
-                        if len(validation_rotation_positions) > 0:
-                            unique_validation_angles = len(set(validation_rotation_positions))
-                            angle_module.print_status(
-                                "stage_probe=validation_window "
-                                f"positions={len(validation_rotation_positions)} "
-                                f"unique_angles={unique_validation_angles} "
-                                f"repeats={validation_repeats}"
-                            )
-
-                            for validation_attempt_idx in range(validation_retry_count + 1):
-                                pass_name = "validation" if validation_attempt_idx == 0 else "validation_retry"
-                                angle_module.print_status(f"stage_probe=home_before_{pass_name}")
-                                await stage_motor.home()
-                                current_probe_start_mm = probe_start_mm
-                                attempt_samples = await did_run_stage_stall_pass(
-                                    pass_name=pass_name,
-                                    pass_rotation_positions=validation_rotation_positions,
-                                )
-                                attempt_summaries, _attempt_best_summary = _summarize_stage_stall_samples(
-                                    attempt_samples,
-                                    min_stage_position_mm=min_valid_stage_position_mm,
-                                )
-                                attempt_best_summary = _select_stage_stall_best_summary(
-                                    attempt_summaries,
-                                    min_stage_position_mm=min_valid_stage_position_mm,
-                                    plateau_tolerance_mm=validation_plateau_tolerance_mm,
-                                    min_valid_sample_count=validation_min_valid_sample_count,
-                                )
-                                validation_samples = attempt_samples
-
-                                if attempt_best_summary is not None:
-                                    break
-
-                                angle_module.print_status(
-                                    "stage_probe=validation_reject "
-                                    f"attempt={validation_attempt_idx + 1}/{validation_retry_count + 1} "
-                                    f"min_stage_position_mm={min_valid_stage_position_mm:.3f}"
-                                )
+                coarse_samples, fine_samples, validation_samples = await self._run_stage_stall_passes(
+                    did_run_stage_stall_pass,
+                    scan_config,
+                    rotation_positions,
+                    rotation_center_deg,
+                    rotation_limit_deg,
+                )
             finally:
                 if _should_skip_motion_cleanup_on_cancel() is False:
                     await angle_module.finish_stage_stall_capture(
@@ -668,30 +559,29 @@ class AngleRunnerMixin:
             selected_summaries = coarse_summaries
             best_summary = coarse_best_summary
 
-        if best_summary is None:
-            try:
-                debug_path = _write_stage_stall_angle_debug_document(
-                    side_name=side_module_name,
-                    previous_rotation_deg=previous_rotation_deg,
-                    rotation_center_deg=rotation_center_deg,
-                    capture_y_mm=capture_y_mm,
-                    probe_x_mm=probe_x_mm,
-                    fast_approach_mm=fast_approach_mm,
-                    min_valid_stage_position_mm=min_valid_stage_position_mm,
-                    validation_plateau_tolerance_mm=validation_plateau_tolerance_mm,
-                    samples=samples,
-                    coarse_summaries=coarse_summaries,
-                    fine_summaries=fine_summaries,
-                    validation_summaries=validation_summaries,
-                    selected_summaries=selected_summaries,
-                    best_summary=None,
-                    selected_pass="invalid",
-                    rotation_positions=rotation_positions,
-                )
-                angle_module.print_status(f"stage_probe=debug path={debug_path}")
-            except Exception as exc:
-                logger.warning("Failed to write stage-stall angle debug document: %s", exc, exc_info=exc)
+        debug_document_kwargs = dict(
+            side_name=side_module_name,
+            previous_rotation_deg=previous_rotation_deg,
+            rotation_center_deg=rotation_center_deg,
+            capture_y_mm=capture_y_mm,
+            probe_x_mm=probe_x_mm,
+            fast_approach_mm=fast_approach_mm,
+            min_valid_stage_position_mm=min_valid_stage_position_mm,
+            validation_plateau_tolerance_mm=validation_plateau_tolerance_mm,
+            samples=samples,
+            coarse_summaries=coarse_summaries,
+            fine_summaries=fine_summaries,
+            validation_summaries=validation_summaries,
+            selected_summaries=selected_summaries,
+            rotation_positions=rotation_positions,
+        )
 
+        if best_summary is None:
+            self._report_stage_stall_angle_debug_document(
+                **debug_document_kwargs,
+                best_summary=None,
+                selected_pass="invalid",
+            )
             raise ValueError("stage-stall angle calibration did not detect any valid stage contacts")
 
         updated_rotation_deg = float(best_summary["absolute_rotation_deg"])
@@ -703,28 +593,11 @@ class AngleRunnerMixin:
                 f"({updated_rotation_deg:.3f} deg is outside 0..{rotation_limit_deg:.3f})"
             )
 
-        try:
-            debug_path = _write_stage_stall_angle_debug_document(
-                side_name=side_module_name,
-                previous_rotation_deg=previous_rotation_deg,
-                rotation_center_deg=rotation_center_deg,
-                capture_y_mm=capture_y_mm,
-                probe_x_mm=probe_x_mm,
-                fast_approach_mm=fast_approach_mm,
-                min_valid_stage_position_mm=min_valid_stage_position_mm,
-                validation_plateau_tolerance_mm=validation_plateau_tolerance_mm,
-                samples=samples,
-                coarse_summaries=coarse_summaries,
-                fine_summaries=fine_summaries,
-                validation_summaries=validation_summaries,
-                selected_summaries=selected_summaries,
-                best_summary=best_summary,
-                selected_pass=selected_pass,
-                rotation_positions=rotation_positions,
-            )
-            angle_module.print_status(f"stage_probe=debug path={debug_path}")
-        except Exception as exc:
-            logger.warning("Failed to write stage-stall angle debug document: %s", exc, exc_info=exc)
+        self._report_stage_stall_angle_debug_document(
+            **debug_document_kwargs,
+            best_summary=best_summary,
+            selected_pass=selected_pass,
+        )
 
         if validation_reject_error is not None:
             raise ValueError(validation_reject_error)
@@ -742,6 +615,154 @@ class AngleRunnerMixin:
             updated_rotation_deg=updated_rotation_deg,
             stage_position_mm=float(best_summary["median_stage_position_mm"]),
         )
+
+    @staticmethod
+    def _require_stage_stall_tool(tool: Any) -> None:
+        if tool._laser_enabled is False or tool._laser is None:
+            raise ValueError("Laser is not enabled")
+
+        if tool._mx is None or tool._my is None or tool._mg is None or tool._ms is None or tool._mr is None:
+            raise ValueError("x, y, z, stage, and rotation motors are required")
+
+    @staticmethod
+    def _report_stage_stall_angle_debug_document(**kwargs: Any) -> None:
+        try:
+            debug_path = _write_stage_stall_angle_debug_document(**kwargs)
+            angle_module.print_status(f"stage_probe=debug path={debug_path}")
+        except Exception as exc:
+            logger.warning("Failed to write stage-stall angle debug document: %s", exc, exc_info=exc)
+
+    @staticmethod
+    async def _run_stage_stall_passes(
+        run_pass: Any,
+        scan_config: Any,
+        rotation_positions: list[float],
+        rotation_center_deg: float,
+        rotation_limit_deg: float,
+    ) -> tuple[
+        list[angle_module.StageStallProbeSample],
+        list[angle_module.StageStallProbeSample],
+        list[angle_module.StageStallProbeSample],
+    ]:
+        min_valid_stage_position_mm = float(STAGE_STALL_MIN_VALID_STAGE_POSITION_MM)
+        validation_retry_count = int(STAGE_STALL_VALIDATION_RETRY_COUNT)
+        coarse_retry_count = int(STAGE_STALL_COARSE_RETRY_COUNT)
+        validation_plateau_tolerance_mm = float(STAGE_STALL_VALIDATION_PLATEAU_TOLERANCE_MM)
+        coarse_validation_count = int(STAGE_STALL_COARSE_VALIDATION_COUNT)
+        validation_high_side_window_deg = float(STAGE_STALL_VALIDATION_HIGH_SIDE_WINDOW_DEG)
+        validation_min_valid_sample_count = int(STAGE_STALL_VALIDATION_MIN_VALID_SAMPLE_COUNT)
+        coarse_samples: list[angle_module.StageStallProbeSample] = []
+        fine_samples: list[angle_module.StageStallProbeSample] = []
+        validation_samples: list[angle_module.StageStallProbeSample] = []
+
+        for coarse_attempt_idx in range(coarse_retry_count + 1):
+            # The home before a retry runs inside the next pass, right after the reject status.
+            pass_name = "coarse" if coarse_attempt_idx == 0 else "coarse_retry"
+            coarse_samples = await run_pass(
+                pass_name=pass_name,
+                pass_rotation_positions=rotation_positions,
+                home_status=None if coarse_attempt_idx == 0 else "stage_probe=home_before_coarse_retry",
+            )
+            _coarse_summaries, _raw_coarse_best_summary = _summarize_stage_stall_samples(
+                coarse_samples,
+                min_stage_position_mm=min_valid_stage_position_mm,
+            )
+            coarse_best_summary = _select_stage_stall_best_summary(
+                _coarse_summaries,
+                min_stage_position_mm=min_valid_stage_position_mm,
+                plateau_tolerance_mm=validation_plateau_tolerance_mm,
+            )
+
+            if coarse_best_summary is not None:
+                break
+
+            angle_module.print_status(
+                "stage_probe=coarse_reject "
+                f"attempt={coarse_attempt_idx + 1}/{coarse_retry_count + 1} "
+                f"min_stage_position_mm={min_valid_stage_position_mm:.3f}"
+            )
+
+        if coarse_best_summary is None:
+            return coarse_samples, fine_samples, validation_samples
+
+        fine_rotation_positions = _build_stage_stall_fine_rotation_positions(
+            scan_config,
+            float(coarse_best_summary["rotation_deg"]),
+            rotation_center_deg,
+            rotation_limit_deg,
+        )
+        angle_module.print_status(
+            "stage_probe=fine_window "
+            f"coarse_best_rotation_deg={float(coarse_best_summary['rotation_deg']):.3f} "
+            f"positions={len(fine_rotation_positions)}"
+        )
+
+        if len(fine_rotation_positions) > 0:
+            fine_samples = await run_pass(
+                pass_name="fine",
+                pass_rotation_positions=fine_rotation_positions,
+                home_status="stage_probe=home_before_fine",
+            )
+
+        fine_summaries, fine_best_summary = _summarize_stage_stall_samples(
+            fine_samples,
+            min_stage_position_mm=min_valid_stage_position_mm,
+        )
+
+        if fine_best_summary is None:
+            return coarse_samples, fine_samples, validation_samples
+
+        validation_count = int(STAGE_STALL_VALIDATION_COUNT)
+        validation_repeats = int(STAGE_STALL_VALIDATION_REPEATS)
+        validation_rotation_positions = _build_stage_stall_validation_rotation_positions(
+            fine_summaries=fine_summaries,
+            coarse_summaries=_coarse_summaries,
+            validation_count=validation_count,
+            validation_repeats=validation_repeats,
+            coarse_validation_count=coarse_validation_count,
+            high_side_window_deg=validation_high_side_window_deg,
+        )
+
+        if len(validation_rotation_positions) == 0:
+            return coarse_samples, fine_samples, validation_samples
+
+        unique_validation_angles = len(set(validation_rotation_positions))
+        angle_module.print_status(
+            "stage_probe=validation_window "
+            f"positions={len(validation_rotation_positions)} "
+            f"unique_angles={unique_validation_angles} "
+            f"repeats={validation_repeats}"
+        )
+
+        for validation_attempt_idx in range(validation_retry_count + 1):
+            pass_name = "validation" if validation_attempt_idx == 0 else "validation_retry"
+            attempt_samples = await run_pass(
+                pass_name=pass_name,
+                pass_rotation_positions=validation_rotation_positions,
+                home_status=f"stage_probe=home_before_{pass_name}",
+            )
+            attempt_summaries, _attempt_best_summary = _summarize_stage_stall_samples(
+                attempt_samples,
+                min_stage_position_mm=min_valid_stage_position_mm,
+            )
+            attempt_best_summary = _select_stage_stall_best_summary(
+                attempt_summaries,
+                min_stage_position_mm=min_valid_stage_position_mm,
+                plateau_tolerance_mm=validation_plateau_tolerance_mm,
+                min_valid_sample_count=validation_min_valid_sample_count,
+            )
+            validation_samples = attempt_samples
+
+            if attempt_best_summary is not None:
+                break
+
+            angle_module.print_status(
+                "stage_probe=validation_reject "
+                f"attempt={validation_attempt_idx + 1}/{validation_retry_count + 1} "
+                f"min_stage_position_mm={min_valid_stage_position_mm:.3f}"
+            )
+
+        return coarse_samples, fine_samples, validation_samples
 
 
     async def _apply_angle_calibration(

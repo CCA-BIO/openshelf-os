@@ -382,28 +382,7 @@ class MockRobotRuntime:
 			)
 			occupied = {(row.side, row.shelf_idx, row.cell_idx) for row in occupied_result}
 			occupied.update(await reserved_bin_locations(session))
-			location: tuple[str, int, int] | None = None
-			requested_location = item_payload.get("location")
-			if requested_location is not None:
-				parsed_location = _parse_requested_location(requested_location)
-				if parsed_location is None:
-					raise MockCommandExecutionError("Invalid location")
-				if parsed_location in occupied:
-					raise MockCommandExecutionError("That cell is not available.")
-				location = parsed_location
-			else:
-				for side in MOCK_SIDES:
-					for shelf_idx in range(MOCK_SHELVES_PER_SIDE):
-						for cell_idx in range(MOCK_CELLS_PER_SHELF):
-							if (side, shelf_idx, cell_idx) not in occupied:
-								location = (side, shelf_idx, cell_idx)
-								break
-						if location is not None:
-							break
-					if location is not None:
-						break
-			if location is None:
-				raise MockCommandExecutionError("No open cell fits this item.")
+			location = self._store_location(item_payload.get("location"), occupied)
 
 			weight = item.weight if item is not None else item_payload.get("weight")
 			if (item is not None and item.tare_weight is not None) or (item is None and item_payload.get("tare_weight") is not None):
@@ -443,6 +422,24 @@ class MockRobotRuntime:
 			"location": {"side": side, "shelf_idx": shelf_idx, "cell_idx": cell_idx},
 			"weight": float(weight),
 		}
+
+	@staticmethod
+	def _store_location(
+		requested_location: Any, occupied: set[tuple[str, int, int]]
+	) -> tuple[str, int, int]:
+		if requested_location is not None:
+			parsed_location = _parse_requested_location(requested_location)
+			if parsed_location is None:
+				raise MockCommandExecutionError("Invalid location")
+			if parsed_location in occupied:
+				raise MockCommandExecutionError("That cell is not available.")
+			return parsed_location
+		for side in MOCK_SIDES:
+			for shelf_idx in range(MOCK_SHELVES_PER_SIDE):
+				for cell_idx in range(MOCK_CELLS_PER_SHELF):
+					if (side, shelf_idx, cell_idx) not in occupied:
+						return side, shelf_idx, cell_idx
+		raise MockCommandExecutionError("No open cell fits this item.")
 
 	async def _execute_retrieve(self, command_id: str, payload: dict[str, Any]) -> dict[str, Any]:
 		location = payload.get("location")

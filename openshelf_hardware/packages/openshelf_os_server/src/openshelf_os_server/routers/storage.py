@@ -878,106 +878,123 @@ async def create_bin_workflow(
     if request.operation == "retrieve":
         bin_row = await service.item_bin(item.id)
         assert bin_row is not None
-        bin_items = (
-            (
-                await session.execute(
-                    select(Item)
-                    .join(StorageBinItem, StorageBinItem.item_id == Item.id)
-                    .where(StorageBinItem.bin_id == bin_row.id)
-                )
-            )
-            .scalars()
-            .all()
-        )
-        denied = [
-            candidate
-            for candidate in bin_items
-            if can_user_retrieve_item(current_user, candidate) is False
-        ]
-        if denied:
-            raise api_error(
-                403,
-                "bin_access_denied",
-                f"This bin also holds items you cannot access: "
-                f"{_denied_item_names(denied)}. Ask a supervisor to retrieve it.",
-            )
+        await _ensure_bin_retrievable(session, bin_row, current_user)
 
-    workflow = None
     worker = robot_core.robot_worker
     if get_operating_mode() == common.OperatingMode.mock:
-        try:
-            async with robot_command_enqueue_guard():
-                if await get_mock_robot_runtime().has_active_commands():
-                    raise BinWorkflowConflict("The robot has other tasks waiting.")
-                workflow = await service.begin(request.operation, item, current_user.id)
-                if workflow is not None:
-                    await service.transition(workflow, "awaiting_operator", "mock bin delivered")
-        except NoCompatibleBinError as exc:
-            # Without an explicit bin request the item may still go to its own cell.
-            if request.storage_mode != "bin":
-                return {"storage_mode": "direct", "workflow": None}
-            raise api_error(409, "no_compatible_bin", str(exc)) from exc
-        except BinWorkflowConflict as exc:
-            raise api_error(409, "bin_workflow_conflict", str(exc)) from exc
-        if workflow is None:
-            return {"storage_mode": "direct", "workflow": None}
-        mock_runtime = get_mock_robot_runtime()
-        mock_runtime.set_bin_io_box_occupied(True)
-        await mock_runtime.publish_status()
-        return {"storage_mode": "bin", "workflow": await service.serialize_workflow(workflow)}
+        return await _start_mock_bin_workflow(service, request, item, current_user)
 
-    if worker is None:
-        try:
-            workflow = await service.begin(request.operation, item, current_user.id)
-        except NoCompatibleBinError as exc:
-            # Without an explicit bin request the item may still go to its own cell.
-            if request.storage_mode != "bin":
-                return {"storage_mode": "direct", "workflow": None}
-            raise api_error(409, "no_compatible_bin", str(exc)) from exc
-        except BinWorkflowConflict as exc:
-            raise api_error(409, "bin_workflow_conflict", str(exc)) from exc
-        if workflow is None:
+    if worker is not None:
+        return await _start_worker_bin_workflow(service, request, item, current_user, worker)
+    try:
+        workflow = await service.begin(request.operation, item, current_user.id)
+    except NoCompatibleBinError as exc:
+        # Without an explicit bin request the item may still go to its own cell.
+        if request.storage_mode != "bin":
             return {"storage_mode": "direct", "workflow": None}
-        workflow.error = "The robot is not running."
-        await service.fail(workflow, workflow.error, tray_moved=False)
-    else:
-        try:
-            async with robot_command_enqueue_guard():
-                if await is_io_box_occupied(worker):
-                    raise api_error(
-                        409,
-                        "io_box_occupied",
-                        "",
-                    )
-                ensure_worker_homed_for_bin_motion(worker)
-                await ensure_worker_queue_empty_for_bin_start(worker)
-                workflow = await service.begin(request.operation, item, current_user.id)
-                if workflow is not None:
-                    await service.start_retrieval(workflow, worker)
-                else:
-                    # A store without a bin raised NoCompatibleBinError above; a
-                    # retrieve can lose its membership to a concurrent edit.
-                    return {"storage_mode": "direct", "workflow": None}
-            try:
-                await service.publish_workflow(worker, workflow)
-            except Exception as publish_error:
-                logger.warning("Failed to publish bin workflow start: %s", publish_error, exc_info=publish_error)
-        except NoCompatibleBinError as exc:
-            # Without an explicit bin request the item may still go to its own cell.
-            if request.storage_mode != "bin":
-                return {"storage_mode": "direct", "workflow": None}
-            raise api_error(409, "no_compatible_bin", str(exc)) from exc
-        except BinWorkflowConflict as exc:
-            raise api_error(409, "bin_workflow_conflict", str(exc)) from exc
-        except HTTPException:
-            raise
-        except Exception as exc:
+        raise api_error(409, "no_compatible_bin", str(exc)) from exc
+    except BinWorkflowConflict as exc:
+        raise api_error(409, "bin_workflow_conflict", str(exc)) from exc
+    if workflow is None:
+        return {"storage_mode": "direct", "workflow": None}
+    workflow.error = "The robot is not running."
+    await service.fail(workflow, workflow.error, tray_moved=False)
+    return {"storage_mode": "bin", "workflow": await service.serialize_workflow(workflow)}
+
+
+async def _ensure_bin_retrievable(session: AsyncSession, bin_row: StorageBin, current_user: User) -> None:
+    bin_items = (
+        (
+            await session.execute(
+                select(Item)
+                .join(StorageBinItem, StorageBinItem.item_id == Item.id)
+                .where(StorageBinItem.bin_id == bin_row.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    denied = [
+        candidate
+        for candidate in bin_items
+        if can_user_retrieve_item(current_user, candidate) is False
+    ]
+    if denied:
+        raise api_error(
+            403,
+            "bin_access_denied",
+            f"This bin also holds items you cannot access: "
+            f"{_denied_item_names(denied)}. Ask a supervisor to retrieve it.",
+        )
+
+
+async def _start_mock_bin_workflow(
+    service: BinStorageService, request: BinWorkflowCreate, item: Item, current_user: User
+) -> Dict[str, Any]:
+    workflow = None
+    try:
+        async with robot_command_enqueue_guard():
+            if await get_mock_robot_runtime().has_active_commands():
+                raise BinWorkflowConflict("The robot has other tasks waiting.")
+            workflow = await service.begin(request.operation, item, current_user.id)
             if workflow is not None:
-                logger.warning("Bin workflow start failed: %s", exc, exc_info=exc)
-                workflow.error = failure_detail(exc, "tray_fetch_failed")[1]
-                await service.fail(workflow, workflow.error, tray_moved=False)
+                await service.transition(workflow, "awaiting_operator", "mock bin delivered")
+    except NoCompatibleBinError as exc:
+        # Without an explicit bin request the item may still go to its own cell.
+        if request.storage_mode != "bin":
+            return {"storage_mode": "direct", "workflow": None}
+        raise api_error(409, "no_compatible_bin", str(exc)) from exc
+    except BinWorkflowConflict as exc:
+        raise api_error(409, "bin_workflow_conflict", str(exc)) from exc
+    if workflow is None:
+        return {"storage_mode": "direct", "workflow": None}
+    mock_runtime = get_mock_robot_runtime()
+    mock_runtime.set_bin_io_box_occupied(True)
+    await mock_runtime.publish_status()
+    return {"storage_mode": "bin", "workflow": await service.serialize_workflow(workflow)}
+
+
+async def _start_worker_bin_workflow(
+    service: BinStorageService, request: BinWorkflowCreate, item: Item, current_user: User, worker: Any
+) -> Dict[str, Any]:
+    workflow = None
+    try:
+        async with robot_command_enqueue_guard():
+            if await is_io_box_occupied(worker):
+                raise api_error(
+                    409,
+                    "io_box_occupied",
+                    "",
+                )
+            ensure_worker_homed_for_bin_motion(worker)
+            await ensure_worker_queue_empty_for_bin_start(worker)
+            workflow = await service.begin(request.operation, item, current_user.id)
+            if workflow is not None:
+                await service.start_retrieval(workflow, worker)
             else:
-                raise
+                # A store without a bin raised NoCompatibleBinError above; a
+                # retrieve can lose its membership to a concurrent edit.
+                return {"storage_mode": "direct", "workflow": None}
+        try:
+            await service.publish_workflow(worker, workflow)
+        except Exception as publish_error:
+            logger.warning("Failed to publish bin workflow start: %s", publish_error, exc_info=publish_error)
+    except NoCompatibleBinError as exc:
+        # Without an explicit bin request the item may still go to its own cell.
+        if request.storage_mode != "bin":
+            return {"storage_mode": "direct", "workflow": None}
+        raise api_error(409, "no_compatible_bin", str(exc)) from exc
+    except BinWorkflowConflict as exc:
+        raise api_error(409, "bin_workflow_conflict", str(exc)) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        if workflow is not None:
+            logger.warning("Bin workflow start failed: %s", exc, exc_info=exc)
+            workflow.error = failure_detail(exc, "tray_fetch_failed")[1]
+            await service.fail(workflow, workflow.error, tray_moved=False)
+        else:
+            raise
     return {"storage_mode": "bin", "workflow": await service.serialize_workflow(workflow)}
 
 
@@ -1185,6 +1202,24 @@ async def lookup_item(
     return await _build_item_payload_with_bin(item, locations, current_user, session)
 
 
+def _create_item_fields(item: ItemCreate, existing: Optional[Item]) -> tuple[Any, Dict[str, Any], Optional[int]]:
+    dimensions = item.dimensions
+    metadata = item.item_metadata or {}
+    access_level_id = item.access_level_id
+    if existing is not None:
+        # A re-post changes what it names. A field it omits keeps its stored value, as
+        # weight already does; it used to reset the size to the 1 mm default, the
+        # metadata to empty and the access level to none.
+        provided_fields = item.model_fields_set
+        if "dimensions" not in provided_fields:
+            dimensions = existing.dimensions
+        if "item_metadata" not in provided_fields:
+            metadata = existing.item_metadata or {}
+        if "access_level_id" not in provided_fields:
+            access_level_id = existing.access_level_id
+    return dimensions, metadata, access_level_id
+
+
 @router.post(
     "/items",
     dependencies=[Depends(require_relay_or_permissions("storage:write"))],
@@ -1218,21 +1253,9 @@ async def create_item(
         raise api_error(409, "reserved_bin_barcode", "")
     existing = await storage_service.get_item(item.barcode)
     bin_service = BinStorageService(session)
-    dimensions = item.dimensions
-    metadata = item.item_metadata or {}
-    access_level_id = item.access_level_id
     member_bin = await bin_service.item_bin(existing.id) if existing is not None else None
     provided_fields = item.model_fields_set
-    if existing is not None:
-        # A re-post changes what it names. A field it omits keeps its stored value, as
-        # weight already does; it used to reset the size to the 1 mm default, the
-        # metadata to empty and the access level to none.
-        if "dimensions" not in provided_fields:
-            dimensions = existing.dimensions
-        if "item_metadata" not in provided_fields:
-            metadata = existing.item_metadata or {}
-        if "access_level_id" not in provided_fields:
-            access_level_id = existing.access_level_id
+    dimensions, metadata, access_level_id = _create_item_fields(item, existing)
     if member_bin is not None:
         dimensions_changed = (
             "dimensions" in provided_fields and item.dimensions != existing.dimensions

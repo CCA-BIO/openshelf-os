@@ -110,7 +110,7 @@ def _shelf_center_y(shelf: Any) -> float | None:
     return sum(ys) / len(ys)
 
 
-def _preserve_manual_cells(scanned_shelves: list[Any], existing_shelves: list[Any]) -> list[Any]:
+def _manual_cell_groups(existing_shelves: list[Any]) -> list[tuple[Any, list[Any]]]:
     manual_groups: list[tuple[Any, list[Any]]] = []
     for shelf in existing_shelves:
         manual_cells = [
@@ -120,6 +120,42 @@ def _preserve_manual_cells(scanned_shelves: list[Any], existing_shelves: list[An
         if len(manual_cells) > 0:
             manual_groups.append((shelf, manual_cells))
 
+    return manual_groups
+
+
+def _match_manual_shelf(shelves: list[Any], manual_cells: list[Any]) -> Any:
+    # Match on the manual cells alone: the stale auto cells of the old shelf can sit on a
+    # different row and drag its center away from the opening the datum actually belongs to.
+    source_y = sum(float(cell.calibration_point.y) for cell in manual_cells) / len(manual_cells)
+    target = None
+
+    if source_y is not None:
+        within = [
+            (abs((_shelf_center_y(shelf) or 1e9) - source_y), shelf)
+            for shelf in shelves
+            if _shelf_center_y(shelf) is not None
+        ]
+        within = [pair for pair in within if pair[0] <= _MANUAL_SHELF_MATCH_TOLERANCE_MM]
+        if len(within) > 0:
+            target = min(within, key=lambda pair: pair[0])[1]
+
+    return target
+
+
+def _renumber_cells(shelf: Any) -> None:
+    calibrated = sorted(
+        [cell for cell in shelf.cells if cell.calibration_point is not None],
+        key=lambda cell: float(cell.calibration_point.x),
+    )
+    uncalibrated = [cell for cell in shelf.cells if cell.calibration_point is None]
+    for idx, cell in enumerate(calibrated):
+        cell.cell_idx = idx
+    shelf.cells = calibrated + uncalibrated
+
+
+def _preserve_manual_cells(scanned_shelves: list[Any], existing_shelves: list[Any]) -> list[Any]:
+    manual_groups = _manual_cell_groups(existing_shelves)
+
     if len(manual_groups) == 0:
         return scanned_shelves
 
@@ -128,20 +164,7 @@ def _preserve_manual_cells(scanned_shelves: list[Any], existing_shelves: list[An
     appended_shelf = False
 
     for source_shelf, manual_cells in manual_groups:
-        # Match on the manual cells alone: the stale auto cells of the old shelf can sit on a
-        # different row and drag its center away from the opening the datum actually belongs to.
-        source_y = sum(float(cell.calibration_point.y) for cell in manual_cells) / len(manual_cells)
-        target = None
-
-        if source_y is not None:
-            within = [
-                (abs((_shelf_center_y(shelf) or 1e9) - source_y), shelf)
-                for shelf in result
-                if _shelf_center_y(shelf) is not None
-            ]
-            within = [pair for pair in within if pair[0] <= _MANUAL_SHELF_MATCH_TOLERANCE_MM]
-            if len(within) > 0:
-                target = min(within, key=lambda pair: pair[0])[1]
+        target = _match_manual_shelf(result, manual_cells)
 
         if target is None:
             preserved = source_shelf.model_copy(deep=True)
@@ -162,16 +185,8 @@ def _preserve_manual_cells(scanned_shelves: list[Any], existing_shelves: list[An
         modified_shelf_ids.add(id(target))
 
     for shelf in result:
-        if id(shelf) not in modified_shelf_ids:
-            continue
-        calibrated = sorted(
-            [cell for cell in shelf.cells if cell.calibration_point is not None],
-            key=lambda cell: float(cell.calibration_point.x),
-        )
-        uncalibrated = [cell for cell in shelf.cells if cell.calibration_point is None]
-        for idx, cell in enumerate(calibrated):
-            cell.cell_idx = idx
-        shelf.cells = calibrated + uncalibrated
+        if id(shelf) in modified_shelf_ids:
+            _renumber_cells(shelf)
 
     # An appended shelf still carries its old index, which can collide with a scanned one.
     if appended_shelf is True:
@@ -217,6 +232,17 @@ async def _install_applied_grid(worker: RobotWorker, grid_path: Path) -> None:
         occupied = await StorageService(session).get_all_occupied_cells()
     worker._robot._grid = grid
     worker._robot.sync_occupied_cells([(side, shelf_idx, cell_idx) for side, shelf_idx, cell_idx, _ in occupied])
+
+
+def _report_unmeasured_shelves(
+    analysis: Any, *, sampled_shelves: set[int], side: StorageModuleSide, manual_intercept_mm: float
+) -> None:
+    for shelf in analysis.shelves:
+        if len(shelf.cells) > 0 and int(shelf.shelf_idx) not in sampled_shelves:
+            laser_module.print_status(
+                f"grip_edge=shelf_unmeasured side={side.value} shelf={int(shelf.shelf_idx)} "
+                f"y_mm={float(shelf.center_y_mm):.1f} uses_intercept_mm={manual_intercept_mm:.3f}"
+            )
 
 
 class ApplyRunnerMixin:
@@ -346,15 +372,12 @@ class ApplyRunnerMixin:
         cell_z_offsets = {
             (int(sample.shelf_idx), int(sample.cell_idx)): float(sample.target_z_mm) for sample in result.samples
         }
-        sampled_shelves = {int(sample.shelf_idx) for sample in result.samples}
-
-        for shelf in analysis.shelves:
-            if len(shelf.cells) > 0 and int(shelf.shelf_idx) not in sampled_shelves:
-                laser_module.print_status(
-                    f"grip_edge=shelf_unmeasured side={side.value} shelf={int(shelf.shelf_idx)} "
-                    f"y_mm={float(shelf.center_y_mm):.1f} uses_intercept_mm={manual_intercept_mm:.3f}"
-                )
-
+        _report_unmeasured_shelves(
+            analysis,
+            sampled_shelves={int(sample.shelf_idx) for sample in result.samples},
+            side=side,
+            manual_intercept_mm=manual_intercept_mm,
+        )
         stage_extension_mm = float(await worker._robot._tool.get_param(_side_to_stage_extension_param_name(side)))
         z_place_mm = float(await worker._robot._tool.get_param("Z_EXTENSION_PLACE"))
         # A partial scope measures only its own shelves: the stored entries of the others stay.

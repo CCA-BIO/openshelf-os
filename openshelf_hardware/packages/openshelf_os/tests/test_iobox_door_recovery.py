@@ -19,6 +19,7 @@ def make_iobox() -> IOBox:
     motor.get_position.return_value = 0.0
     motor.is_bus_busy = Mock(return_value=False)
     motor.is_homed = Mock(return_value=True)
+    motor.invalidate_position = Mock(side_effect=lambda: motor.is_homed.configure_mock(return_value=False))
 
     iobox = IOBox.__new__(IOBox)
     iobox._md = motor
@@ -73,6 +74,46 @@ async def test_bad_reading_recovery_is_deferred_during_door_motion() -> None:
 
     iobox._md.home.assert_awaited_once()
     assert iobox._door_bad_reading_count == 0
+
+
+@pytest.mark.asyncio
+async def test_failed_bad_reading_recovery_drops_the_door_coordinates() -> None:
+    # The recovery home approached a target on the counter it had just rejected, and a home
+    # failing before its zero left the door homed, so every later poll homed it again and the
+    # next door move ran positionally on those coordinates.
+    iobox = make_iobox()
+    iobox._door_bad_reading_count = 4
+    iobox._md.get_position.return_value = 2000.0
+    iobox._md.home.side_effect = HardwareMotorError("Failed to start homing movement")
+
+    assert await iobox.refresh_door_state(force=True) is True
+    for _ in range(5):
+        assert await iobox.refresh_door_state(force=True) is True
+
+    iobox._md.home.assert_awaited_once()
+    assert iobox._md.is_homed() is False
+
+    iobox._md.home.side_effect = None
+    await iobox.open_door()
+
+    assert [c.kwargs for c in iobox._md.home.await_args_list] == [{"skip_pre_home_approach": True}] * 2
+    calls = [name for name, *_ in iobox._md.mock_calls if name in ("home", "move_to_position")]
+    assert calls == ["home", "home", "move_to_position"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("move", ["open_door", "close_door"])
+async def test_unhomed_door_is_homed_before_a_positional_move(move: str) -> None:
+    # A failed door move or recovery drops the coordinates without deferring a home; moving the
+    # door to a position on a counter nothing vouches for can drive it into an end stop.
+    iobox = make_iobox()
+    iobox._md.is_homed.return_value = False
+
+    await getattr(iobox, move)()
+
+    iobox._md.home.assert_awaited_once_with(skip_pre_home_approach=True)
+    calls = [name for name, *_ in iobox._md.mock_calls if name in ("home", "move_to_position")]
+    assert calls == ["home", "move_to_position"]
 
 
 @pytest.mark.asyncio

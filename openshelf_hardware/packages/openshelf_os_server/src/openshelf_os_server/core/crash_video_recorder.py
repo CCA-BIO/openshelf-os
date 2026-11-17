@@ -615,16 +615,7 @@ class CrashVideoRecorder:
         # frame. No key frame means no packet can decode, so fail with
         # a reason the artifact can record instead of a codec parse
         # error from the first P-slice.
-        if is_hevc:
-            has_key_frame = any(
-                _au_contains_hevc_keyframe(data) for _pts, data in window.frames
-            )
-        else:
-            has_key_frame = any(
-                _au_contains_idr(data, window.au_is_avcc)
-                for _pts, data in window.frames
-            )
-        if not has_key_frame:
+        if not self._nalu_window_has_key_frame(window, is_hevc):
             raise ValueError("NALU window contains no key frame")
 
         safe_camera_id = CAMERA_ID_PATTERN.sub("-", camera_id).strip("-") or "camera"
@@ -680,16 +671,8 @@ class CrashVideoRecorder:
                                     "OpenCV VP8 video encoder is unavailable"
                                 )
 
-                        resized: np.ndarray
-                        if (frame.shape[1], frame.shape[0]) != output_size:
-                            resized = cv2.resize(
-                                frame, output_size, interpolation=cv2.INTER_AREA
-                            )
-                        else:
-                            resized = frame
-
                         assert writer is not None
-                        writer.write(resized)
+                        writer.write(self._fit_frame(frame, output_size))
                         decoded_frame_count += 1
                         del decoded
                 except av.error.InvalidDataError:
@@ -717,6 +700,22 @@ class CrashVideoRecorder:
             if writer is not None:
                 writer.release()
             output_path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _nalu_window_has_key_frame(window: NaluWindow, is_hevc: bool) -> bool:
+        if is_hevc:
+            return any(
+                _au_contains_hevc_keyframe(data) for _pts, data in window.frames
+            )
+        return any(
+            _au_contains_idr(data, window.au_is_avcc) for _pts, data in window.frames
+        )
+
+    @staticmethod
+    def _fit_frame(frame: np.ndarray, output_size: tuple[int, int]) -> np.ndarray:
+        if (frame.shape[1], frame.shape[0]) != output_size:
+            return cv2.resize(frame, output_size, interpolation=cv2.INTER_AREA)
+        return frame
 
     def _encode_camera_sync(
         self,
