@@ -285,6 +285,30 @@ async def validate_direct_store_reservation(
                 raise DirectStoreReservationError("reserved_tray_item")
 
 
+def _bin_row_values(entry: Any) -> dict[str, Any]:
+    """Return the StorageBin column values a configured bin entry defines."""
+    inner_dimensions = entry.inner_dimensions.model_dump(mode="json")
+    max_item_dimensions = getattr(entry, "max_item_dimensions", None)
+    layout = getattr(entry, "compartment_layout", None)
+    return {
+        "compartment_layout": layout.model_dump(mode="json") if layout is not None else None,
+        "side": entry.home_location.side,
+        "shelf_idx": entry.home_location.shelf_idx,
+        "cell_idx": entry.home_location.cell_idx,
+        "inner_dimensions": inner_dimensions,
+        "max_item_dimensions": (
+            max_item_dimensions.model_dump(mode="json")
+            if max_item_dimensions is not None
+            else {
+                "width": inner_dimensions["width"],
+                "length": inner_dimensions["length"],
+            }
+        ),
+        "max_items": entry.max_items,
+        "active": True,
+    }
+
+
 class BinStorageService:
     def __init__(self, session: AsyncSession):
         self.session = session
@@ -327,27 +351,7 @@ class BinStorageService:
                     },
                 )
             row = existing.get(entry.barcode)
-            inner_dimensions = entry.inner_dimensions.model_dump(mode="json")
-            max_item_dimensions = getattr(entry, "max_item_dimensions", None)
-            layout = getattr(entry, "compartment_layout", None)
-            layout_value = layout.model_dump(mode="json") if layout is not None else None
-            values = {
-                "compartment_layout": layout_value,
-                "side": entry.home_location.side,
-                "shelf_idx": entry.home_location.shelf_idx,
-                "cell_idx": entry.home_location.cell_idx,
-                "inner_dimensions": inner_dimensions,
-                "max_item_dimensions": (
-                    max_item_dimensions.model_dump(mode="json")
-                    if max_item_dimensions is not None
-                    else {
-                        "width": inner_dimensions["width"],
-                        "length": inner_dimensions["length"],
-                    }
-                ),
-                "max_items": entry.max_items,
-                "active": True,
-            }
+            values = _bin_row_values(entry)
             if row is None:
                 self.session.add(StorageBin(barcode=entry.barcode, status="at_home", **values))
             else:
@@ -363,7 +367,7 @@ class BinStorageService:
                         "cell_idx",
                     )
                 )
-                if geometry_changed and (row.compartment_layout or layout_value):
+                if geometry_changed and (row.compartment_layout or values["compartment_layout"]):
                     unfinished = await self.session.scalar(
                         select(StorageBinWorkflow.id)
                         .where(
