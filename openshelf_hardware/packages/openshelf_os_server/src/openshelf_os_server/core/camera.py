@@ -1093,6 +1093,28 @@ class ToolCameraStreamManager:
 		self.stop_event = None
 		self.frame_queue = None
 
+	def _fan_out_nalu(self, tick_aus: list[bytes]) -> None:
+		# The rings keep Annex-B for the recorder; the AVCC conversion,
+		# framing, and fan-out are browser-subscriber work and cost a
+		# slice of a core per camera, so skip them with no subscribers.
+		if len(tick_aus) == 0 or len(self.nalu_subscribers) == 0:
+			return
+		if self._nalu_au_is_annexb() is True:
+			tick_aus = [_annexb_to_avcc_au(unit) for unit in tick_aus]
+		message = _encode_nalu_frames(tick_aus)
+		for subscriber in list(self.nalu_subscribers):
+			try:
+				subscriber.put_nowait(message)
+			except asyncio.QueueFull:
+				try:
+					subscriber.get_nowait()
+				except asyncio.QueueEmpty:
+					pass
+				try:
+					subscriber.put_nowait(message)
+				except asyncio.QueueFull:
+					pass
+
 	async def _capture_loop(self) -> None:
 		mjpeg_restart_delay = 1.0
 		nalu_restart_delay = 1.0
@@ -1142,25 +1164,7 @@ class ToolCameraStreamManager:
 				await asyncio.sleep(nalu_restart_delay)
 				continue
 
-			# The rings keep Annex-B for the recorder; the AVCC conversion,
-			# framing, and fan-out are browser-subscriber work and cost a
-			# slice of a core per camera, so skip them with no subscribers.
-			if len(tick_aus) > 0 and len(self.nalu_subscribers) > 0:
-				if self._nalu_au_is_annexb() is True:
-					tick_aus = [_annexb_to_avcc_au(unit) for unit in tick_aus]
-				message = _encode_nalu_frames(tick_aus)
-				for subscriber in list(self.nalu_subscribers):
-					try:
-						subscriber.put_nowait(message)
-					except asyncio.QueueFull:
-						try:
-							subscriber.get_nowait()
-						except asyncio.QueueEmpty:
-							pass
-						try:
-							subscriber.put_nowait(message)
-						except asyncio.QueueFull:
-							pass
+			self._fan_out_nalu(tick_aus)
 
 			# On-demand MJPEG decode worker.
 			if self.process is not None:
