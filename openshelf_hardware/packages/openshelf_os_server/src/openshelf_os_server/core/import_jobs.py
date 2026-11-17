@@ -470,15 +470,7 @@ class ImportJobService:
                 )
                 if command is None:
                     continue
-                if command.status in ("queued", "running"):
-                    if unit.stage != "storing":
-                        unit.stage = "storing"
-                        changed = True
-                elif command.status == "succeeded":
-                    self._mark_loaded(unit)
-                    changed = True
-                elif command.status == "failed":
-                    self._mark_store_failed(job, unit, (command.result or {}).get("error"))
+                if self._follow_command(job, unit, command):
                     changed = True
             elif unit.stage == "returning":
                 workflow = await self.session.get(StorageBinWorkflow, unit.request_id)
@@ -498,6 +490,20 @@ class ImportJobService:
         if await self.settle(job):
             changed = True
         return changed
+
+    def _follow_command(self, job: ImportJob, unit: ImportJobUnit, command: RobotCommand) -> bool:
+        """Move a measured or storing unit along with its store command; whether the unit changed."""
+        if command.status in ("queued", "running"):
+            if unit.stage == "storing":
+                return False
+            unit.stage = "storing"
+        elif command.status == "succeeded":
+            self._mark_loaded(unit)
+        elif command.status == "failed":
+            self._mark_store_failed(job, unit, (command.result or {}).get("error"))
+        else:
+            return False
+        return True
 
     async def _recovered_home(self, bin_id: int) -> bool:
         tray = await self.session.get(StorageBin, bin_id)
