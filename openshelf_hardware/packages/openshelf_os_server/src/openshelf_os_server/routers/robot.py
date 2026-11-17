@@ -523,6 +523,20 @@ async def _validate_mock_store(command: StoreItemCommand, db: AsyncSession) -> N
         await _validate_mock_store_location(item_data, item.dimensions, db)
         return
 
+    dimensions = _validate_new_mock_store_item(item_data)
+    await _validate_mock_store_location(item_data, dimensions, db)
+
+    try:
+        validate_mass(item_data)
+    except ValidationError as exc:
+        raise api_error(422, "validation_failed", str(exc)) from exc
+
+    access_level_id = item_data.get("access_level_id")
+    if access_level_id is not None and await db.get(AccessLevel, access_level_id) is None:
+        raise api_error(status.HTTP_422_UNPROCESSABLE_ENTITY, "access_level_invalid", "")
+
+
+def _validate_new_mock_store_item(item_data: dict[str, Any]) -> dict[str, Any]:
     name = item_data.get("name")
     dimensions = item_data.get("dimensions")
     if not isinstance(name, str) or name.strip() == "" or not isinstance(dimensions, dict):
@@ -539,17 +553,7 @@ async def _validate_mock_store(command: StoreItemCommand, db: AsyncSession) -> N
             raise ValueError
     except (KeyError, TypeError, ValueError) as exc:
         raise api_error(status.HTTP_422_UNPROCESSABLE_ENTITY, "dimension_invalid", "Enter a size and weight greater than zero.") from exc
-
-    await _validate_mock_store_location(item_data, dimensions, db)
-
-    try:
-        validate_mass(item_data)
-    except ValidationError as exc:
-        raise api_error(422, "validation_failed", str(exc)) from exc
-
-    access_level_id = item_data.get("access_level_id")
-    if access_level_id is not None and await db.get(AccessLevel, access_level_id) is None:
-        raise api_error(status.HTTP_422_UNPROCESSABLE_ENTITY, "access_level_invalid", "")
+    return dimensions
 
 
 async def _validate_direct_store_reservation(item_data: dict[str, Any], db: AsyncSession) -> None:
