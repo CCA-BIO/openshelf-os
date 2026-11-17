@@ -396,6 +396,7 @@ class IOBox:
                 ):
                     await asyncio.sleep(0.05)
 
+                await self._home_door_if_unhomed()
                 await self._move_door_with_retry(
                     self._params.motors.by_name("door").lim,
                     operation="open",
@@ -416,6 +417,7 @@ class IOBox:
         try:
             async with self._door_motion_lock:
                 door_cfg = self._params.motors.by_name("door")
+                await self._home_door_if_unhomed()
                 await self._move_door_with_retry(
                     door_cfg.lower_lim,
                     operation="close",
@@ -429,6 +431,12 @@ class IOBox:
                 raise
 
             raise MotorError(f"Failed to close door: {str(e)}") from e
+
+    async def _home_door_if_unhomed(self) -> None:
+        """Home a door that lost its coordinates before moving it to a position, under the door
+        lock: a positional move on a counter nothing vouches for can drive it into an end stop."""
+        if self._md.is_homed() is not True:
+            await self._home_door_and_cache_closed()
 
     async def home_door(self) -> None:
         if self._md is None:
@@ -489,6 +497,12 @@ class IOBox:
         self._door_candidate_state = None
         self._door_candidate_since = None
         self._door_bad_reading_count = 0
+
+    def _cache_door_open_while_unhomed(self) -> None:
+        """Without trusted coordinates the door counts as open, so the light curtain guards it."""
+        self._door_open = True
+        self._door_candidate_state = None
+        self._door_candidate_since = None
 
     async def _home_door_and_cache_closed(self) -> None:
         """Home the door and record its authoritative closed state on success."""
@@ -625,6 +639,13 @@ class IOBox:
                 )
                 return position_mm
             else:
+                # The readings stayed out of range and the re-read did not fix them, so the door
+                # has no coordinates. Dropping them makes the home seek directly instead of
+                # approaching a target on the rejected counter, and if the home fails the door
+                # reads open (the light curtain keeps guarding it), the poll stops retrying, and
+                # the next door move homes it first.
+                self._md.invalidate_position()
+                self._cache_door_open_while_unhomed()
                 await self._home_door_and_cache_closed()
                 self._logger.info("Door motor homed successfully after bad readings")
         except Exception as home_exc:
@@ -650,9 +671,7 @@ class IOBox:
         if self._md.is_homed() is not True:
             if self._door_open is not True:
                 self._logger.info("Door not homed; treating it as open")
-            self._door_open = True
-            self._door_candidate_state = None
-            self._door_candidate_since = None
+            self._cache_door_open_while_unhomed()
             return True
 
         if self._door_force_refresh_on_block:
