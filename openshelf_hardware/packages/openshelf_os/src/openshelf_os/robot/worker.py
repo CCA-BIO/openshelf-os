@@ -926,6 +926,15 @@ class RobotWorker:
             exc=report_exception,
         )
 
+    @staticmethod
+    def _tag_sentry_hardware_fault(scope: Any, hardware_fault: Any) -> None:
+        if hardware_fault and isinstance(hardware_fault, dict):
+            scope.set_tag("exception_type", hardware_fault.get("exception_type", "unknown"))
+            needs_home_axes = hardware_fault.get("needs_home_axes")
+            if isinstance(needs_home_axes, list) and len(needs_home_axes) <= 6:
+                scope.set_tag("needs_home_axes", ",".join(str(axis) for axis in needs_home_axes))
+            scope.set_context("hardware_fault", hardware_fault)
+
     def _report_error(
         self,
         error: WorkerError,
@@ -947,12 +956,7 @@ class RobotWorker:
                     scope.set_tag("command", getattr(self._current_command, "command", "unknown"))
                 elif context.get("command") and isinstance(context.get("command"), dict):
                     scope.set_tag("command", context["command"].get("command", "unknown"))
-                if hardware_fault and isinstance(hardware_fault, dict):
-                    scope.set_tag("exception_type", hardware_fault.get("exception_type", "unknown"))
-                    needs_home_axes = hardware_fault.get("needs_home_axes")
-                    if isinstance(needs_home_axes, list) and len(needs_home_axes) <= 6:
-                        scope.set_tag("needs_home_axes", ",".join(str(axis) for axis in needs_home_axes))
-                    scope.set_context("hardware_fault", hardware_fault)
+                self._tag_sentry_hardware_fault(scope, hardware_fault)
                 if context:
                     scope.set_context("worker_error", context)
                 if operation_context:
