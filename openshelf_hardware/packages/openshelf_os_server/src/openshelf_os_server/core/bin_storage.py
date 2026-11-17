@@ -1014,18 +1014,9 @@ class BinStorageService:
                 .where(StorageBinItem.bin_id == bin_row.id)
             )
         ).all()
-        member_ids = {member.id for member in members}
-        joining = [item for item in items if item.id not in member_ids]
-        # Unconfirmed members leave on completion, so they do not count for the
-        # items joining now; only the members that stay hold room and one level.
-        staying = [member for member in members if member.id in confirmed_ids]
-        if any(not self._fits(item, bin_row) for item in joining):
-            return "One of the confirmed items does not fit this bin."
-        if joining:
-            if not self._joining_items_have_volume(joining, staying, bin_row):
-                return "The confirmed items need more space than this bin has."
-            if not self._joining_items_share_a_level(joining, staying):
-                return "The confirmed items have different access levels."
+        joining_error = self._joining_items_error(items, members, confirmed_ids, bin_row)
+        if joining_error:
+            return joining_error
         direct_item = (
             await self.session.execute(
                 select(ItemLocation.item_id).where(ItemLocation.item_id.in_(confirmed_ids)).limit(1)
@@ -1055,6 +1046,28 @@ class BinStorageService:
             )
             if any(member.compartment != positions.get(str(member.item_id)) for member in memberships):
                 return "The item's compartment changed since this task started."
+        return None
+
+    @classmethod
+    def _joining_items_error(
+        cls,
+        items: Sequence[Item],
+        members: Sequence[Item],
+        confirmed_ids: set[int],
+        bin_row: StorageBin,
+    ) -> Optional[str]:
+        member_ids = {member.id for member in members}
+        joining = [item for item in items if item.id not in member_ids]
+        # Unconfirmed members leave on completion, so they do not count for the
+        # items joining now; only the members that stay hold room and one level.
+        staying = [member for member in members if member.id in confirmed_ids]
+        if any(not cls._fits(item, bin_row) for item in joining):
+            return "One of the confirmed items does not fit this bin."
+        if joining:
+            if not cls._joining_items_have_volume(joining, staying, bin_row):
+                return "The confirmed items need more space than this bin has."
+            if not cls._joining_items_share_a_level(joining, staying):
+                return "The confirmed items have different access levels."
         return None
 
     async def _store_invariant_error(self, bin_row: StorageBin, item: Item) -> Optional[str]:
