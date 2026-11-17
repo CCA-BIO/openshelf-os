@@ -345,8 +345,30 @@ def _transform_worker_status_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     transformed["queued_operations"] = normalized_operations
     transformed["queue_length"] = payload.get("queue_length", len(normalized_operations))
 
-    robot_status_payload = payload.get("robot_status") or {}
+    transformed["robot_status"] = _transform_robot_status(payload.get("robot_status") or {})
 
+    errors: List[Dict[str, Any]] = []
+    for error in payload.get("error_queue", []):
+        if isinstance(error, dict):
+            errors.append(error)
+    transformed["error_queue"] = errors
+
+    transformed["is_crashed"] = payload.get("is_crashed", False)
+    transformed["crash_reason"] = payload.get("crash_reason")
+    transformed["crash_code"] = payload.get("crash_code")
+    transformed["crash_context"] = payload.get("crash_context")
+    transformed["is_emergency_stopped"] = payload.get("is_emergency_stopped", False)
+    transformed["is_emergency_stop_active"] = payload.get("is_emergency_stop_active", False)
+    transformed["emergency_stop_reason"] = payload.get("emergency_stop_reason")
+    transformed["needs_home"] = payload.get("needs_home", False)
+    transformed["needs_home_reason"] = payload.get("needs_home_reason")
+    transformed["needs_home_axes"] = payload.get("needs_home_axes", [])
+    transformed["tray_on_tool"] = payload.get("tray_on_tool", False)
+
+    return transformed
+
+
+def _transform_robot_status(robot_status_payload: Dict[str, Any]) -> Dict[str, Any]:
     state_payload = robot_status_payload.get("state") or {"current_cell": None}
     storage_payload = robot_status_payload.get("storage") or {"front_module": [], "back_module": []}
     cabinet_doors = robot_status_payload.get("cabinet_doors")
@@ -354,7 +376,7 @@ def _transform_worker_status_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     scale_payload = robot_status_payload.get("scale")
     storage_payload = _normalize_storage_payload(storage_payload)
 
-    transformed["robot_status"] = {
+    return {
         "gantry": {
             "x_axis": _normalize_axis_status(((robot_status_payload.get("gantry") or {}).get("x_axis"))),
             "y_axis": _normalize_axis_status(((robot_status_payload.get("gantry") or {}).get("y_axis"))),
@@ -378,26 +400,6 @@ def _transform_worker_status_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
             if isinstance(payload, dict)
         },
     }
-
-    errors: List[Dict[str, Any]] = []
-    for error in payload.get("error_queue", []):
-        if isinstance(error, dict):
-            errors.append(error)
-    transformed["error_queue"] = errors
-
-    transformed["is_crashed"] = payload.get("is_crashed", False)
-    transformed["crash_reason"] = payload.get("crash_reason")
-    transformed["crash_code"] = payload.get("crash_code")
-    transformed["crash_context"] = payload.get("crash_context")
-    transformed["is_emergency_stopped"] = payload.get("is_emergency_stopped", False)
-    transformed["is_emergency_stop_active"] = payload.get("is_emergency_stop_active", False)
-    transformed["emergency_stop_reason"] = payload.get("emergency_stop_reason")
-    transformed["needs_home"] = payload.get("needs_home", False)
-    transformed["needs_home_reason"] = payload.get("needs_home_reason")
-    transformed["needs_home_axes"] = payload.get("needs_home_axes", [])
-    transformed["tray_on_tool"] = payload.get("tray_on_tool", False)
-
-    return transformed
 
 
 def _normalize_storage_payload(storage: Dict[str, Any]) -> Dict[str, Any]:
