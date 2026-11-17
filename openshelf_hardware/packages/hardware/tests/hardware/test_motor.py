@@ -1077,6 +1077,31 @@ async def test_move_after_a_home_failing_in_its_seek_setup_runs_as_an_absolute_m
 
 
 @pytest.mark.asyncio
+async def test_home_trigger_write_failure_stops_the_drive_and_unhomes(mock_controller):
+    # A lost reply does not mean the drive missed the trigger: the seek could run on unwatched
+    # while the axis still read homed.
+    motor = Motor(mock_controller, make_motor_params(motor_name="x_axis"))
+    echo_registers(mock_controller, {})
+    motor.clear_alarm = AsyncMock()
+    motor._move_near_home = AsyncMock()
+    motor._is_homed = True
+    writes = mock_controller.write_single_register.side_effect
+
+    async def lose_the_trigger_reply(unit, address, value, **kwargs):
+        await writes(unit, address, value, **kwargs)
+        if address == motor_helpers.TRIGGER and value == 0x10:
+            raise MotorError("no response to the trigger write")
+
+    mock_controller.write_single_register.side_effect = lose_the_trigger_reply
+
+    with pytest.raises(MotorError, match="Failed to start homing movement"):
+        await motor.home()
+
+    assert call(1, motor_helpers.TRIGGER, 0x40) in mock_controller.write_single_register.await_args_list
+    assert motor.is_homed() is False
+
+
+@pytest.mark.asyncio
 async def test_y_axis_home_lifts_off_the_stop_and_stays_after_restoring_overrides(mock_controller):
     # lb4a-4: the first climb straight from the homed zero tripped alarm 32 at ~90 mm.
     motor = y_home_motor(mock_controller)

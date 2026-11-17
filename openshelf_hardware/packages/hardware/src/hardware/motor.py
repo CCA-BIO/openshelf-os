@@ -2342,6 +2342,23 @@ class Motor():
             # The trigger may have landed; no wait_for_move is watching yet, so stop the drive.
             await asyncio.shield(self._cancel_motion(homing=True))
             raise
+        except Exception as trigger_exc:
+            # A write that raised can still have reached the drive and started an unwatched seek:
+            # drop the coordinates, stop it, and report the trigger failure itself.
+            self.invalidate_position()
+            self._should_skip_pre_home_once = True
+            self._clear_pending_motion()
+            stop_exc = await self._stop_to_completion()
+            if stop_exc is not None:
+                self._logger.error(
+                    "Failed to stop motor after a failed homing trigger",
+                    extra={"motor_id": self._motor_id, "error": str(stop_exc)},
+                    exc_info=stop_exc,
+                )
+            current = asyncio.current_task()
+            if stop_exc is None and current is not None and current.cancelling() > 0:
+                raise asyncio.CancelledError() from trigger_exc
+            raise
         # The drive seeks its home limit, which is the logical far end on an inverted axis.
         self._commanded_direction = 1 if self._is_physical_mapping_inverted() is True else -1
         self._status = MotorStatus.MOVING
