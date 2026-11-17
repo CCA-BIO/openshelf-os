@@ -243,7 +243,7 @@ async def _walk_line_from_center(
 	if left_gap_idx is None or right_gap_idx is None:
 		return None
 
-	if left_wall_found is False:
+	def didInferNearEdge() -> Optional[LineGapSegment]:
 		# A bottom-row opening can extend below the axis floor, so the gap runs out of window
 		# at index 0 and its lower edge is never seen. Mirror the far-edge rule: only infer
 		# from a measured upper edge and a hole-sized measured span.
@@ -283,7 +283,7 @@ async def _walk_line_from_center(
 			center_mm=float(refined_segment.end_mm) - (float(expected_span_mm) / 2.0),
 		)
 
-	if right_wall_found is False:
+	def didInferFarEdge() -> Optional[LineGapSegment]:
 		if should_infer_far_edge is False:
 			return None
 
@@ -328,6 +328,12 @@ async def _walk_line_from_center(
 			width_mm=float(expected_span_mm),
 			center_mm=float(refined_segment.start_mm) + (float(expected_span_mm) / 2.0),
 		)
+
+	if left_wall_found is False:
+		return didInferNearEdge()
+
+	if right_wall_found is False:
+		return didInferFarEdge()
 
 	start_mm = positions[left_gap_idx] - (step_mm / 2.0)
 	end_mm = positions[right_gap_idx] + (step_mm / 2.0)
