@@ -319,16 +319,7 @@ class Robot:
         """
         startup_home_skip_reason: Optional[str] = None
         self._failed_init_components = set()
-        self._emit_init("motor_bus", "connecting")
-        try:
-            await self._connect_controller("motor", self._motorbus, self._bus_settings["motor"])
-        except Exception:
-            self._emit_init("motor_bus", "failed", reason="The motor bus did not connect. Check its cable and power.")
-            for name in _INIT_MOTOR_COMPONENTS:
-                if self._get_motor_by_name(name) is not None:
-                    self._emit_init(name, "failed", reason="The motor bus is not connected.")
-            raise
-        self._emit_init("motor_bus", "ready")
+        await self._connect_motor_bus()
 
         io_scale_config = self._config.get("robot.io.scale", None)
         scale_enabled = getattr(io_scale_config, "enabled", True) if io_scale_config is not None else True
@@ -374,17 +365,7 @@ class Robot:
         # the same inputs that guard motion once the worker runs.
         await self._tool.configure(isolate=isolate, home_on_init=False)
         await self._io.configure(isolate=isolate, scale_bus_ready=scale_bus_ready, home_on_init=False)
-        cabinet = getattr(self, "_cabinet", None)
-        if cabinet is not None:
-            self._emit_init("cabinet", "configuring")
-            try:
-                await cabinet.configure()
-                self._emit_init("cabinet", "ready")
-            except Exception as exc:
-                self._emit_init("cabinet", "failed", reason="The cabinet did not start. Check its connection.")
-                if isolate is False:
-                    raise
-                self._logger.warning("Cabinet configure failed", exc_info=exc)
+        await self._configure_cabinet(isolate)
 
         fridge = getattr(self, "_fridge", None)
         if fridge is not None:
@@ -403,6 +384,32 @@ class Robot:
                 motor._on_move_complete = self._did_complete_motor_move
 
         return startup_home_skip_reason
+
+    async def _connect_motor_bus(self) -> None:
+        self._emit_init("motor_bus", "connecting")
+        try:
+            await self._connect_controller("motor", self._motorbus, self._bus_settings["motor"])
+        except Exception:
+            self._emit_init("motor_bus", "failed", reason="The motor bus did not connect. Check its cable and power.")
+            for name in _INIT_MOTOR_COMPONENTS:
+                if self._get_motor_by_name(name) is not None:
+                    self._emit_init(name, "failed", reason="The motor bus is not connected.")
+            raise
+        self._emit_init("motor_bus", "ready")
+
+    async def _configure_cabinet(self, isolate: bool) -> None:
+        cabinet = getattr(self, "_cabinet", None)
+        if cabinet is None:
+            return
+        self._emit_init("cabinet", "configuring")
+        try:
+            await cabinet.configure()
+            self._emit_init("cabinet", "ready")
+        except Exception as exc:
+            self._emit_init("cabinet", "failed", reason="The cabinet did not start. Check its connection.")
+            if isolate is False:
+                raise
+            self._logger.warning("Cabinet configure failed", exc_info=exc)
 
     async def _run_startup_home(self, isolate: bool) -> Optional[str]:
         """Home every axis unless a safety input is tripped before or during it.
