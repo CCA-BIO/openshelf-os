@@ -87,6 +87,13 @@ def _parse_skip(value: str) -> list[dict[str, Any]]:
 	return patterns
 
 
+def _matches_skip(loc: dict[str, Any], patterns: list[dict[str, Any]]) -> bool:
+	return any(
+		loc["side"] == p["side"] and loc["shelf"] == p["shelf"] and (p["cell"] is None or loc["cell"] == p["cell"])
+		for p in patterns
+	)
+
+
 def _parse_start(value: str) -> tuple[str, int, int]:
 	parts = value.split(":")
 	if len(parts) != 3 or parts[0].upper() not in SIDES:
@@ -526,13 +533,7 @@ class CycleTestRunner:
 		if config.skip is not None:
 			patterns = _parse_skip(config.skip)
 			before = len(locations)
-			locations = [
-				loc for loc in locations
-				if not any(
-					loc["side"] == p["side"] and loc["shelf"] == p["shelf"] and (p["cell"] is None or loc["cell"] == p["cell"])
-					for p in patterns
-				)
-			]
+			locations = [loc for loc in locations if not _matches_skip(loc, patterns)]
 			if before != len(locations):
 				self.log(f"  Skipped {before - len(locations)} cells matching skip patterns")
 			if not locations:
