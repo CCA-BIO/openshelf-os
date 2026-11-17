@@ -1398,22 +1398,7 @@ class BinStorageService:
             return
         await self.transition(workflow, "completed")
 
-    async def begin_return(
-        self, barcode: str, user_id: Optional[int] = None
-    ) -> Optional[StorageBinWorkflow]:
-        tray = await self.session.scalar(
-            select(StorageBin).where(StorageBin.barcode == barcode, StorageBin.active.is_(True))
-        )
-        if tray is None:
-            return None
-        # Serialize duplicate scans on this tray across database sessions.
-        await self.session.execute(
-            update(StorageBin).where(StorageBin.id == tray.id).values(updated_at=_utc_now())
-        )
-        await self.session.refresh(tray)
-        if tray.status != "outside":
-            await self.session.rollback()
-            raise BinWorkflowConflict("This bin is already in the machine.")
+    async def _claim_return_slot(self, tray: StorageBin) -> Optional[StorageBinWorkflow]:
         pending = (
             await self.session.scalars(
                 select(StorageBinWorkflow).where(
@@ -1437,6 +1422,9 @@ class BinStorageService:
             # A barcode return supersedes a dismissed/abandoned item instruction.
             workflow.state = "cancelled"
             workflow.completed_at = _utc_now()
+        return None
+
+    async def _return_seed(self, tray: StorageBin) -> Optional[StorageBinWorkflow]:
         latest = await self.session.scalar(
             select(StorageBinWorkflow)
             .where(
@@ -1471,7 +1459,29 @@ class BinStorageService:
                 .limit(1)
             )
         ):
-            latest = None
+            return None
+        return latest
+
+    async def begin_return(
+        self, barcode: str, user_id: Optional[int] = None
+    ) -> Optional[StorageBinWorkflow]:
+        tray = await self.session.scalar(
+            select(StorageBin).where(StorageBin.barcode == barcode, StorageBin.active.is_(True))
+        )
+        if tray is None:
+            return None
+        # Serialize duplicate scans on this tray across database sessions.
+        await self.session.execute(
+            update(StorageBin).where(StorageBin.id == tray.id).values(updated_at=_utc_now())
+        )
+        await self.session.refresh(tray)
+        if tray.status != "outside":
+            await self.session.rollback()
+            raise BinWorkflowConflict("This bin is already in the machine.")
+        existing = await self._claim_return_slot(tray)
+        if existing is not None:
+            return existing
+        latest = await self._return_seed(tray)
         positions = (
             dict((latest.resolution or {}).get("candidate_compartments", {})) if latest else {}
         )
