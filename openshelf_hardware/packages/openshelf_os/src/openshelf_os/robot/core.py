@@ -1848,6 +1848,14 @@ class Robot:
 
         return await self.retrieve_by_location(resolved_location.model_dump(), barcode_hint=barcode)
 
+    @staticmethod
+    def _retrieved_barcode(cached_item: CellItem | None, barcode_hint: str | None) -> str | None:
+        retrieved_barcode: str | None = barcode_hint
+        if retrieved_barcode is None and cached_item is not None:
+            barcode_from_data = cached_item.data.get("barcode") if cached_item.data else None
+            retrieved_barcode = cached_item.barcode or (str(barcode_from_data) if barcode_from_data is not None else None)
+        return retrieved_barcode
+
     async def retrieve_by_location(
         self,
         location_payload: Dict[str, Any],
@@ -1883,10 +1891,7 @@ class Robot:
         # The commanded barcode is the one the server located in this cell; the grid's
         # in-memory item misses location edits made through the API, and reporting it
         # instead would remove the wrong item's location.
-        retrieved_barcode: str | None = barcode_hint
-        if retrieved_barcode is None and cached_item is not None:
-            barcode_from_data = cached_item.data.get("barcode") if cached_item.data else None
-            retrieved_barcode = cached_item.barcode or (str(barcode_from_data) if barcode_from_data is not None else None)
+        retrieved_barcode = self._retrieved_barcode(cached_item, barcode_hint)
 
         if tray is False and (blocked := self._blocked_fridge_cell_error(command_name, location)) is not None:
             return blocked
