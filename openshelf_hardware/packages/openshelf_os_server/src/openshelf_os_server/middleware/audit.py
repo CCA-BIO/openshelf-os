@@ -4,8 +4,7 @@ import json
 import logging
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict, Any, List, Callable
-from contextvars import ContextVar
+from typing import Optional, Dict, Any, Callable
 
 from fastapi import Request, Response
 from fastapi.responses import JSONResponse
@@ -113,13 +112,6 @@ RESPONSE_CAPTURE_LIMIT_BYTES = 64 * 1024
 CAPTURABLE_CONTENT_TYPE = "application/json"
 
 
-def _response_content_type(response: Response) -> str:
-    for key, value in response.raw_headers:
-        if key.lower() == b"content-type":
-            return value.decode("latin-1")
-    return ""
-
-
 async def capture_response_body(response: Response) -> tuple[Optional[Any], Response]:
     """Drain a JSON response up to a size cap and return (redacted body, replayable response)."""
     if isinstance(response, JSONResponse):
@@ -129,7 +121,7 @@ async def capture_response_body(response: Response) -> tuple[Optional[Any], Resp
         except Exception:
             return None, response
 
-    if CAPTURABLE_CONTENT_TYPE not in _response_content_type(response):
+    if CAPTURABLE_CONTENT_TYPE not in response.headers.get("content-type", ""):
         return None, response
 
     chunks: list[Any] = []
@@ -145,11 +137,15 @@ async def capture_response_body(response: Response) -> tuple[Optional[Any], Resp
     else:
         overflow = True
 
+    original_iterator = response.body_iterator
+
     async def replay() -> Any:
         for chunk in chunks:
             yield chunk
         if overflow:
-            async for chunk in response.body_iterator:
+            # response.body_iterator now points at replay() itself; drain the source we
+            # captured before the reassignment.
+            async for chunk in original_iterator:
                 yield chunk
 
     response.body_iterator = replay()

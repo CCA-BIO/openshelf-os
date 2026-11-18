@@ -14,6 +14,7 @@ from sqlalchemy import delete, func, select
 
 from openshelf_os_server.core.bin_storage import reserved_bin_locations
 from openshelf_os_server.core.command_lifecycle import ensure_target_not_in_flight
+from openshelf_os_server.utils.audit_constants import record_enqueued_command
 from openshelf_os_server.core.event_log import append_robot_event
 from openshelf_os_server.database.models import (
 	Item,
@@ -230,6 +231,7 @@ class MockRobotRuntime:
 				await session.commit()
 				await session.refresh(row)
 
+		record_enqueued_command(payload, row.command_id, "public")
 		self._wake.set()
 		await self.publish_status()
 		return row, False

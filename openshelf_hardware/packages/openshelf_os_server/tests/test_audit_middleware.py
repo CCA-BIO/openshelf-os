@@ -1,4 +1,5 @@
 import asyncio
+import json
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -278,6 +279,39 @@ async def test_response_bodies_are_captured_and_redacted(unauthenticated_client:
 
 
 @pytest.mark.anyio
+async def test_over_cap_response_streams_to_the_client_in_full(seeded_db) -> None:
+	# An audited JSON response larger than the capture cap is not stored, but the client
+	# must still receive every byte: the replay iterator once iterated itself after the
+	# cap, truncating the body at 64KB and then crashing the ASGI send. A failed read is
+	# the audited shape that can stream this much back.
+	from httpx import ASGITransport
+	from starlette.applications import Starlette
+	from starlette.responses import StreamingResponse
+	from starlette.routing import Route
+
+	from openshelf_os_server.middleware.audit import AuditMiddleware
+
+	chunks = [("x" * 1024).encode() for _ in range(200)]  # 200KB, well past the 64KB cap
+
+	async def oversized(request) -> StreamingResponse:
+		return StreamingResponse(iter(chunks), media_type="application/json", status_code=400)
+
+	small_app = Starlette(routes=[Route("/api/oversized", oversized, methods=["GET"])])
+	small_app.add_middleware(AuditMiddleware)
+
+	async with AsyncClient(transport=ASGITransport(app=small_app), base_url="http://test") as ac:
+		response = await ac.get("/api/oversized")
+
+	assert response.status_code == 400
+	assert response.content == b"".join(chunks)
+
+	row = await latest_audit_log("/api/oversized", "GET")
+	assert row is not None
+	assert row.response_status == 400
+	assert row.response_body is None
+
+
+@pytest.mark.anyio
 async def test_admitted_commands_land_in_the_requesting_row(unauthenticated_client: AsyncClient) -> None:
 	# A workflow store hides several internal motions behind one POST; the row must name
 	# each motion the request actually enqueued, or the trail proves intent only.
@@ -309,6 +343,34 @@ async def test_admitted_commands_land_in_the_requesting_row(unauthenticated_clie
 
 	verify = await unauthenticated_client.get("/api/audit/verify", headers=headers)
 	assert verify.json()["ok"] is True
+
+
+@pytest.mark.anyio
+async def test_mock_mode_enqueued_commands_land_in_the_requesting_row() -> None:
+	# Mock mode bypasses production admission, so the runtime itself must feed the
+	# requesting request's audit row or every mock motion vanishes from the trail.
+	from openshelf_os_server.core.mock_robot import MockRobotRuntime
+	from openshelf_os_server.database.models import MockRobotCommand
+	from openshelf_os_server.utils.audit_constants import command_records_context
+
+	runtime = MockRobotRuntime()
+	token = command_records_context.set([])
+	try:
+		payload = {"command": "move_to", "x": 1.0, "y": 2.0, "z": None}
+		row, replayed = await runtime.enqueue(payload, request_id=None, correlation_id=None)
+		assert replayed is False
+		assert command_records_context.get() == [
+			{
+				"command_id": row.command_id,
+				"visibility": "public",
+				"payload": payload,
+			}
+		]
+	finally:
+		command_records_context.reset(token)
+		async with AsyncSessionLocal() as db:
+			await db.execute(delete(MockRobotCommand).where(MockRobotCommand.command_id == row.command_id))
+			await db.commit()
 
 
 def test_command_records_skip_when_no_request_is_in_flight() -> None:
