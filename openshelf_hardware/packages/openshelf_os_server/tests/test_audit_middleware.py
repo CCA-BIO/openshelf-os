@@ -95,7 +95,9 @@ async def test_concurrent_requests_keep_one_unbroken_chain(unauthenticated_clien
 
 
 @pytest.mark.anyio
-async def test_retention_prune_keeps_clock_skewed_chain_entry(unauthenticated_client: AsyncClient) -> None:
+async def test_retention_prune_keeps_clock_skewed_chain_entry(
+	unauthenticated_client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
 	response = await unauthenticated_client.get("/api/users")
 	assert response.status_code == 401
 
@@ -118,6 +120,10 @@ async def test_retention_prune_keeps_clock_skewed_chain_entry(unauthenticated_cl
 		)
 		await db.commit()
 
+	# The prune runs once per process-hour; open the gate so this write prunes.
+	from openshelf_os_server.middleware import audit as audit_module
+
+	monkeypatch.setattr(audit_module, "_last_prune", 0.0)
 	response = await unauthenticated_client.get("/api/users")
 	assert response.status_code == 401
 

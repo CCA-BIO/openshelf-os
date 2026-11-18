@@ -12,7 +12,7 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.types import ASGIApp
 
-from ..database.session import AsyncSessionLocal
+from ..database.session import AsyncSession, AsyncSessionLocal
 from ..database.models import AuditLog
 from sqlalchemy import delete, func, select
 from ..utils.audit_integrity import (
@@ -160,6 +160,12 @@ async def capture_response_body(response: Response) -> tuple[Optional[Any], Resp
         return redact_sensitive_values(json.loads(b"".join(bytes(chunk) for chunk in chunks))), response
     except Exception:
         return None, response
+
+
+# Retention only moves forward an hour at a time, so the prune runs once per process-hour
+# instead of as two DELETEs on every audited request.
+AUDIT_PRUNE_INTERVAL_S = 3600.0
+_last_prune: Optional[float] = 0.0
 
 
 # Each entry links to the one before it, so reading the chain head and committing the new
@@ -363,27 +369,10 @@ class AuditMiddleware(BaseHTTPMiddleware):
 					hmac_key_id=key_id,
 				)
 
-				cutoff = now - timedelta(days=AUDIT_RETENTION_DAYS)
-				oldest_kept_seq = await db.scalar(
-					select(func.min(AuditLog.seq_no)).where(
-						AuditLog.seq_no.isnot(None),
-						AuditLog.timestamp >= cutoff,
-					)
-				)
-				prune_boundary = int(oldest_kept_seq) if oldest_kept_seq is not None else seq_no
-				await db.execute(
-					delete(AuditLog).where(
-						AuditLog.seq_no.isnot(None),
-						AuditLog.seq_no < prune_boundary,
-					)
-				)
-				await db.execute(
-					delete(AuditLog).where(
-						AuditLog.seq_no.is_(None),
-						AuditLog.timestamp < cutoff,
-					)
-				)
-
+				global _last_prune
+				if now.timestamp() - _last_prune >= AUDIT_PRUNE_INTERVAL_S:
+					await self._prune_retention(db, seq_no, now)
+					_last_prune = now.timestamp()
 				db.add(audit_log)
 				await db.commit()
 			except Exception as exc:
@@ -391,3 +380,31 @@ class AuditMiddleware(BaseHTTPMiddleware):
 					f"Audit entry not written for {request.method} {request.url.path}",
 					exc_info=exc,
 				)
+
+	@staticmethod
+	async def _prune_retention(db: AsyncSession, next_seq: int, now: datetime) -> None:
+		"""Drop entries older than the retention window, under the chain lock."""
+		try:
+			cutoff = now - timedelta(days=AUDIT_RETENTION_DAYS)
+			oldest_kept_seq = await db.scalar(
+				select(func.min(AuditLog.seq_no)).where(
+					AuditLog.seq_no.isnot(None),
+					AuditLog.timestamp >= cutoff,
+				)
+			)
+			prune_boundary = int(oldest_kept_seq) if oldest_kept_seq is not None else next_seq
+			await db.execute(
+				delete(AuditLog).where(
+					AuditLog.seq_no.isnot(None),
+					AuditLog.seq_no < prune_boundary,
+				)
+			)
+			await db.execute(
+				delete(AuditLog).where(
+					AuditLog.seq_no.is_(None),
+					AuditLog.timestamp < cutoff,
+				)
+			)
+			await db.commit()
+		except Exception as exc:
+			logger.error("Audit retention prune failed", exc_info=exc)
