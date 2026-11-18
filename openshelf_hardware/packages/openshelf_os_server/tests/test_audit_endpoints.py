@@ -1,3 +1,5 @@
+import uuid
+
 import pytest
 from sqlalchemy import select
 from httpx import AsyncClient
@@ -104,3 +106,26 @@ def test_auth_service_rejects_empty_secret() -> None:
 		permissions=["storage:read"],
 	)
 	assert auth.decode_token(token) is not None
+
+
+@pytest.mark.anyio
+async def test_log_search_matches_bodies_and_user_email(client: AsyncClient) -> None:
+	token = await login(client, "admin@opshelf.com", "1234")
+	headers = {"Authorization": f"Bearer {token}"}
+	role_name = f"searchable_{uuid.uuid4().hex}"
+
+	role = await client.post("/api/roles", headers=headers, json={"name": role_name, "permissions": []})
+	assert role.status_code == 200
+
+	by_body = await client.get(f"/api/audit/logs?search={role_name}", headers=headers)
+	assert by_body.status_code == 200
+	assert [log["request_body"]["name"] for log in by_body.json()["logs"]] == [role_name]
+
+	by_email = await client.get("/api/audit/logs?search=admin@opshelf.com", headers=headers)
+	assert by_email.status_code == 200
+	assert by_email.json()["total"] >= 1
+	assert all(log["user_email"] == "admin@opshelf.com" for log in by_email.json()["logs"])
+
+	miss = await client.get("/api/audit/logs?search=no-such-needle", headers=headers)
+	assert miss.status_code == 200
+	assert miss.json()["total"] == 0

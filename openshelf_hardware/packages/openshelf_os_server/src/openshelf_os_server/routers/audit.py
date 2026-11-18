@@ -6,7 +6,8 @@ from typing import Optional, List, Any, cast
 
 from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import and_, select, func
+from sqlalchemy import String, and_, func, or_, select
+from sqlalchemy import cast as sql_cast
 from sqlalchemy.orm import selectinload
 from pydantic import BaseModel
 
@@ -71,6 +72,7 @@ async def list_audit_logs(
 	method: Optional[str] = Query(None, description="Filter by HTTP method"),
 	status_code: Optional[int] = Query(None, description="Filter by response status"),
 	correlation_id: Optional[str] = Query(None, description="Filter by exact correlation ID"),
+	search: Optional[str] = Query(None, max_length=200, description="Case-insensitive substring across endpoint, user email, request and response bodies, command records, and error text"),
 	limit: int = Query(100, ge=1, le=1000, description="Max results"),
 	offset: int = Query(0, ge=0, description="Pagination offset"),
 	db: AsyncSession = Depends(get_db),
@@ -79,13 +81,31 @@ async def list_audit_logs(
 	"""Query request audit records.
 
 	Requires `audit:read`. Returns an offset page filtered by inclusive date bounds, user,
-	endpoint substring, HTTP method, response status, or exact correlation ID. Use
+	endpoint substring, HTTP method, response status, exact correlation ID, or a `search`
+	substring matched across the endpoint, user email, request and response bodies, command
+	records, and error text. Use
 	correlation IDs to relate requests to command activity; audit records are not a
 	replacement for command polling.
 	"""
 	query = select(AuditLog)
-	
+	count_query = select(func.count()).select_from(AuditLog)
 	filters = []
+
+	if search is not None:
+		# The one path into the audit page arrives as a user's email; everything else a
+		# person would look for (a barcode, an endpoint, an error sentence) lives in the
+		# body or error columns. SQLite LIKE is ASCII-case-insensitive on its own.
+		needle = f"%{search}%"
+		query = query.outerjoin(User)
+		count_query = count_query.outerjoin(User)
+		filters.append(or_(
+			AuditLog.endpoint.like(needle),
+			User.email.like(needle),
+			AuditLog.error_message.like(needle),
+			sql_cast(AuditLog.request_body, String).like(needle),
+			sql_cast(AuditLog.response_body, String).like(needle),
+			sql_cast(AuditLog.command_records, String).like(needle),
+		))
 	
 	if user_id is not None:
 		filters.append(AuditLog.user_id == user_id)
@@ -111,7 +131,6 @@ async def list_audit_logs(
 	if filters:
 		query = query.filter(and_(*filters))
 	
-	count_query = select(func.count()).select_from(AuditLog)
 	if filters:
 		count_query = count_query.filter(and_(*filters))
 	
