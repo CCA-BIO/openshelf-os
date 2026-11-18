@@ -18,9 +18,6 @@ async def test_verify_detects_tamper(client: AsyncClient) -> None:
     token = await login(client, "admin@opshelf.com", "1234")
     headers = {"Authorization": f"Bearer {token}"}
 
-    # Create an entry by hitting an endpoint
-    _ = await client.get("/api/users", headers=headers)
-
     # Tamper with the latest log
     async with AsyncSessionLocal() as db:
         res = await db.execute(select(AuditLog).order_by(AuditLog.seq_no.desc()).limit(1))

@@ -36,21 +36,40 @@ async def admin_headers(unauthenticated_client: AsyncClient) -> dict[str, str]:
 
 
 @pytest.mark.anyio
-async def test_audit_chain_integrity_verifies_after_skipped_requests(unauthenticated_client: AsyncClient) -> None:
+async def test_audit_records_mutations_and_failures_but_not_successful_reads(
+	unauthenticated_client: AsyncClient,
+) -> None:
 	headers = await admin_headers(unauthenticated_client)
 
-	first = await unauthenticated_client.get("/api/users", headers=headers)
+	first = await unauthenticated_client.post(
+		"/api/roles", headers=headers, json={"name": f"policy_{uuid.uuid4().hex}", "permissions": []}
+	)
+	skipped_read = await unauthenticated_client.get("/api/users", headers=headers)
 	skipped_health = await unauthenticated_client.get("/api/health", headers=headers)
-	skipped_me = await unauthenticated_client.get("/api/auth/me", headers=headers)
-	second = await unauthenticated_client.get("/api/users", headers=headers)
+	denied_read = await unauthenticated_client.get("/api/users")
+	second = await unauthenticated_client.post(
+		"/api/roles", headers=headers, json={"name": f"policy_{uuid.uuid4().hex}", "permissions": []}
+	)
 	verify = await unauthenticated_client.get("/api/audit/verify", headers=headers)
 
 	assert first.status_code == 200
+	assert skipped_read.status_code == 200
 	assert skipped_health.status_code == 200
-	assert skipped_me.status_code == 200
+	assert denied_read.status_code == 401
 	assert second.status_code == 200
 	assert verify.status_code == 200
 	assert verify.json()["ok"] is True
+
+	denied_log = await latest_audit_log("/api/users", "GET")
+	assert denied_log is not None and denied_log.response_status == 401
+	# The successful read and the health check left no row of their own.
+	async with AsyncSessionLocal() as db:
+		successful_reads = await db.scalar(
+			select(func.count())
+			.select_from(AuditLog)
+			.where(AuditLog.method == "GET", AuditLog.response_status == 200)
+		)
+	assert successful_reads == 0
 
 
 @pytest.mark.anyio
@@ -60,11 +79,11 @@ async def test_concurrent_requests_keep_one_unbroken_chain(unauthenticated_clien
 	headers = await admin_headers(unauthenticated_client)
 
 	responses = await asyncio.gather(
-		*(unauthenticated_client.get("/api/users", headers=headers) for _ in range(8))
+		*(unauthenticated_client.get("/api/users") for _ in range(8))
 	)
 	verify = await unauthenticated_client.get("/api/audit/verify", headers=headers)
 
-	assert all(response.status_code == 200 for response in responses)
+	assert all(response.status_code == 401 for response in responses)
 	assert verify.json()["ok"] is True
 	async with AsyncSessionLocal() as db:
 		duplicated = await db.scalar(
@@ -76,9 +95,9 @@ async def test_concurrent_requests_keep_one_unbroken_chain(unauthenticated_clien
 
 
 @pytest.mark.anyio
-async def test_retention_prune_keeps_clock_skewed_chain_entry(client: AsyncClient) -> None:
-	response = await client.get("/api/users")
-	assert response.status_code == 200
+async def test_retention_prune_keeps_clock_skewed_chain_entry(unauthenticated_client: AsyncClient) -> None:
+	response = await unauthenticated_client.get("/api/users")
+	assert response.status_code == 401
 
 	async with AsyncSessionLocal() as db:
 		anchor_seq = await db.scalar(select(func.max(AuditLog.seq_no)))
@@ -99,8 +118,8 @@ async def test_retention_prune_keeps_clock_skewed_chain_entry(client: AsyncClien
 		)
 		await db.commit()
 
-	response = await client.get("/api/users")
-	assert response.status_code == 200
+	response = await unauthenticated_client.get("/api/users")
+	assert response.status_code == 401
 
 	async with AsyncSessionLocal() as db:
 		still_present = await db.scalar(
@@ -180,14 +199,14 @@ async def test_request_without_user_agent_keeps_the_chain_verifiable(
 ) -> None:
 	# The entry hash covered a null user agent while the row stored "", so one such request
 	# made verify report tampering from that entry on.
-	headers = await admin_headers(unauthenticated_client)
-	request = unauthenticated_client.build_request("GET", "/api/users", headers=headers)
+	request = unauthenticated_client.build_request("GET", "/api/users")
 	del request.headers["user-agent"]
 
 	response = await unauthenticated_client.send(request)
+	headers = await admin_headers(unauthenticated_client)
 	verify = await unauthenticated_client.get("/api/audit/verify", headers=headers)
 
-	assert response.status_code == 200
+	assert response.status_code == 401
 	log = await latest_audit_log("/api/users", "GET")
 	assert log is not None and log.user_agent == ""
 	assert verify.json()["ok"] is True

@@ -46,32 +46,10 @@ SUCCESSFUL_READ_POST_ENDPOINTS = frozenset([
     "/api/system/config/validate",
 	"/api/users/login-barcode/resolve",
 ])
-SUCCESSFUL_READ_EXCLUDED_ENDPOINTS = frozenset([
-    "/api/auth/me",
-	"/api/auth/experience",
-    "/api/auth/users",
-	"/api/auth/scans",
-    "/api/access_levels",
-    "/api/access-levels",
-    "/api/storage/items",
-    "/api/storage/grid",
-    "/api/storage/locations",
-    "/api/system/info",
-    "/api/system/mode",
-    "/api/telemetry",
-    "/api/camera",
-    "/api/robot/status",
-    "/api/robot/events",
-    "/api/robot/debug/scale",
-    "/api/robot/debug/scale/calibration/status",
-    "/api/robot/debug/scale/calibration/params",
-    "/api/calibration/status",
-    "/api/calibration/laser/status",
-])
-SUCCESSFUL_READ_EXCLUDED_PREFIXES = (
-    "/api/storage/items/",
-    "/api/robot/debug/",
-)
+# Auditing is for what changed and what failed: every successful mutation is recorded,
+# every failed request is recorded (a refused read says as much about access control as a
+# refused write), and a successful read is never recorded. A read-only poll that belongs
+# in the trail anyway must move behind a POST or join SUCCESSFUL_READ_POST_ENDPOINTS.
 SENSITIVE_FIELD_NAMES = frozenset([
     "pin",
 	"identifier",
@@ -89,12 +67,6 @@ SENSITIVE_FIELD_NAMES = frozenset([
 REDACTED_VALUE = "[REDACTED]"
 
 
-def is_successful_read_excluded_endpoint(path: str) -> bool:
-    if path in SUCCESSFUL_READ_EXCLUDED_ENDPOINTS:
-        return True
-    return any(path.startswith(prefix) for prefix in SUCCESSFUL_READ_EXCLUDED_PREFIXES)
-
-
 def should_skip_before_request(request: Request) -> bool:
     if request.method in IGNORED_METHODS:
         return True
@@ -106,9 +78,7 @@ def should_skip_after_response(request: Request, status_code: int) -> bool:
         return False
     if request.url.path in SUCCESSFUL_READ_POST_ENDPOINTS:
         return True
-    if request.method not in SUCCESSFUL_READ_METHODS:
-        return False
-    return is_successful_read_excluded_endpoint(request.url.path)
+    return request.method in SUCCESSFUL_READ_METHODS
 
 
 def _encodable_text(value: str) -> str:
