@@ -11,6 +11,7 @@ from sqlalchemy import delete, func, select
 from openshelf_os.robot.models import QueuedOperation
 from openshelf_os_server.database.models import Item, RobotCommand
 from openshelf_os_server.database.session import AsyncSessionLocal
+from openshelf_os_server.utils.audit_constants import record_enqueued_command
 
 COMMAND_LIMIT = 32
 COMMAND_RETENTION_DAYS = 7
@@ -155,6 +156,7 @@ async def admit(
 				session.add(enrollment_item)
 			await session.commit()
 			await session.refresh(row)
+			record_enqueued_command(payload, row.command_id, visibility)
 			return row, False
 
 

@@ -22,14 +22,16 @@ from ..utils.audit_integrity import (
     build_binding_message,
     get_hmac_key_id,
 )
-from ..utils.audit_constants import AUDIT_RETENTION_DAYS, LEGACY_COMMAND_RECORDS_FIELD
+from ..utils.audit_constants import (
+    AUDIT_RETENTION_DAYS,
+    LEGACY_COMMAND_RECORDS_FIELD,
+    command_records_context,
+)
 from ..utils.cors_policy import response_allow_origin, resolve_allowed_origins
 from ..routers.auth_deps import get_current_user_optional
 from ..errors import capture_unhandled_exception, client_detail, error_detail, internal_error_detail, request_correlation_id
 
 logger = logging.getLogger(__name__)
-
-command_records_context: ContextVar[List[Dict[str, Any]]] = ContextVar("command_records", default=[])
 
 IGNORED_METHODS = frozenset(["OPTIONS"])
 ALWAYS_EXCLUDED_ENDPOINTS = frozenset([
@@ -101,6 +103,63 @@ def redact_sensitive_values(value: Any) -> Any:
     if isinstance(value, str):
         return _encodable_text(value)
     return value
+
+
+# The response of a mutation is the only place that records what the machine actually did
+# (the cell the workflow chose, the weight it measured, the reason a command was refused),
+# so every audited row captures it. A response larger than the cap, or a stream a client
+# is still reading, is left uncaptured rather than buffered.
+RESPONSE_CAPTURE_LIMIT_BYTES = 64 * 1024
+CAPTURABLE_CONTENT_TYPE = "application/json"
+
+
+def _response_content_type(response: Response) -> str:
+    for key, value in response.raw_headers:
+        if key.lower() == b"content-type":
+            return value.decode("latin-1")
+    return ""
+
+
+async def capture_response_body(response: Response) -> tuple[Optional[Any], Response]:
+    """Drain a JSON response up to a size cap and return (redacted body, replayable response)."""
+    if isinstance(response, JSONResponse):
+        # The unhandled-500 path builds the response here; its body is already in memory.
+        try:
+            return redact_sensitive_values(json.loads(response.body)), response
+        except Exception:
+            return None, response
+
+    if CAPTURABLE_CONTENT_TYPE not in _response_content_type(response):
+        return None, response
+
+    chunks: list[Any] = []
+    total = 0
+    overflow = False
+    while total < RESPONSE_CAPTURE_LIMIT_BYTES:
+        try:
+            chunk = await response.body_iterator.__anext__()
+        except StopAsyncIteration:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+    else:
+        overflow = True
+
+    async def replay() -> Any:
+        for chunk in chunks:
+            yield chunk
+        if overflow:
+            async for chunk in response.body_iterator:
+                yield chunk
+
+    response.body_iterator = replay()
+    if overflow or any(isinstance(chunk, dict) for chunk in chunks):
+        return None, response
+
+    try:
+        return redact_sensitive_values(json.loads(b"".join(bytes(chunk) for chunk in chunks))), response
+    except Exception:
+        return None, response
 
 
 # Each entry links to the one before it, so reading the chain head and committing the new
@@ -182,6 +241,12 @@ class AuditMiddleware(BaseHTTPMiddleware):
 
 		if should_skip_after_response(request, status_code):
 			return response
+
+		try:
+			response_body, response = await capture_response_body(response)
+		except Exception as exc:
+			response_body = None
+			logger.debug(f"Response body not captured for {request.method} {request.url.path}", exc_info=exc)
 
 		try:
 			await self._log_request(

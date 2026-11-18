@@ -4,9 +4,9 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 from httpx import AsyncClient
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 
-from openshelf_os_server.database.models import AuditLog
+from openshelf_os_server.database.models import AuditLog, RobotCommand
 from openshelf_os_server.database.session import AsyncSessionLocal
 from openshelf_os_server.utils.audit_constants import AUDIT_RETENTION_DAYS, LEGACY_COMMAND_RECORDS_FIELD
 from openshelf_os_server.utils.audit_integrity import (
@@ -241,3 +241,104 @@ async def test_request_without_user_agent_keeps_the_chain_verifiable(
 		f"/api/audit/verify?from_seq={seq_no}&to_seq={seq_no}", headers=headers
 	)
 	assert legacy_verify.json() == {"ok": True, "checked": 1, "first_error_seq": None, "message": None}
+
+
+@pytest.mark.anyio
+async def test_response_bodies_are_captured_and_redacted(unauthenticated_client: AsyncClient) -> None:
+	# The response of a mutation or a failure is the only record of what the machine
+	# actually did (the cell it chose, the reason it refused), so it belongs in the row —
+	# minus the tokens a successful sign-in hands out.
+	login_response = await unauthenticated_client.post(
+		"/api/auth/login/json", json={"email": "admin@opshelf.com", "pin": "1234"}
+	)
+	assert login_response.status_code == 200
+
+	login_log = await latest_audit_log("/api/auth/login/json", "POST")
+	assert login_log is not None
+	assert login_log.response_body is not None
+	assert login_log.response_body["access_token"] == "[REDACTED]"
+	assert login_log.response_body.get("refresh_token") in (None, "[REDACTED]")
+
+	denied = await unauthenticated_client.get("/api/users")
+	assert denied.status_code == 401
+	denied_log = await latest_audit_log("/api/users", "GET")
+	assert denied_log is not None and denied_log.response_status == 401
+	assert denied_log.response_body is not None
+	assert "detail" in denied_log.response_body
+
+	headers = {"Authorization": f"Bearer {login_response.json()['access_token']}"}
+	verify = await unauthenticated_client.get("/api/audit/verify", headers=headers)
+	assert verify.json()["ok"] is True
+
+
+@pytest.mark.anyio
+async def test_admitted_commands_land_in_the_requesting_row(unauthenticated_client: AsyncClient) -> None:
+	# A workflow store hides several internal motions behind one POST; the row must name
+	# each motion the request actually enqueued, or the trail proves intent only.
+	from openshelf_os_server.core.command_lifecycle import admit
+	from openshelf_os_server.utils.audit_constants import command_records_context
+
+	headers = await admin_headers(unauthenticated_client)
+	token = command_records_context.set([])
+	try:
+		row, replayed = await admit(
+			{"command": "move_to", "x": 1.0, "y": 2.0, "z": None},
+			request_id=None,
+			correlation_id=None,
+		)
+		assert replayed is False
+		records = command_records_context.get()
+		assert records == [
+			{
+				"command_id": row.command_id,
+				"visibility": "public",
+				"payload": {"command": "move_to", "x": 1.0, "y": 2.0, "z": None},
+			}
+		]
+	finally:
+		command_records_context.reset(token)
+		async with AsyncSessionLocal() as db:
+			await db.execute(delete(RobotCommand).where(RobotCommand.command_id == row.command_id))
+			await db.commit()
+
+	verify = await unauthenticated_client.get("/api/audit/verify", headers=headers)
+	assert verify.json()["ok"] is True
+
+
+def test_command_records_skip_when_no_request_is_in_flight() -> None:
+	# The recorder must never touch the shared default list, or rows from different
+	# requests would bleed into each other. An empty context is any non-request caller.
+	import contextvars
+
+	from openshelf_os_server.utils.audit_constants import (
+		command_records_context,
+		record_enqueued_command,
+	)
+
+	def record_and_check() -> None:
+		record_enqueued_command({"command": "home"}, "cmd-x", "public")
+		assert command_records_context.get(None) is None
+
+	contextvars.Context().run(record_and_check)
+
+
+def test_command_records_truncate_at_the_limit() -> None:
+	from openshelf_os_server.utils.audit_constants import (
+		COMMAND_RECORD_LIMIT,
+		command_records_context,
+		record_enqueued_command,
+	)
+
+	token = command_records_context.set([])
+	try:
+		for index in range(COMMAND_RECORD_LIMIT):
+			record_enqueued_command({"command": "move_to", "x": index}, f"cmd-{index}", "internal")
+		record_enqueued_command({"command": "move_to", "x": 999}, "cmd-overflow", "internal")
+		record_enqueued_command({"command": "move_to", "x": 1000}, "cmd-overflow-2", "internal")
+
+		records = command_records_context.get()
+		assert len(records) == COMMAND_RECORD_LIMIT + 1
+		assert records[-1] == {"command": "records_truncated"}
+		assert all(record["payload"]["x"] < 999 for record in records[:-1])
+	finally:
+		command_records_context.reset(token)
