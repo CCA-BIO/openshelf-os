@@ -119,6 +119,10 @@ def log_io_box_guard(
     )
 
 
+# Crash reports that each stand for one incident to handle on its own: Sentry would otherwise
+# merge every crash with the same exception and stack, across machines, into one issue.
+CRASH_INCIDENT_ERROR_TYPES = frozenset({"HardwareFault", "GripVerification"})
+
 SCALE_OCCUPIED_THRESHOLD_GRAMS = 5.0
 SCALE_POLL_INTERVAL_SECONDS = 1.0
 SCALE_STATUS_FRESH_SECONDS = 3.0
@@ -929,6 +933,17 @@ class RobotWorker:
         )
 
     @staticmethod
+    def _crash_incident_id(context: dict[str, Any]) -> str:
+        """The crashed command's id, so a report sent twice for one crash stays one issue;
+        a crash outside any command gets an id of its own."""
+        queued_operation = context.get("queued_operation")
+        if isinstance(queued_operation, dict):
+            command_id = queued_operation.get("command_id")
+            if command_id:
+                return str(command_id)
+        return str(uuid.uuid4())
+
+    @staticmethod
     def _tag_sentry_hardware_fault(scope: Any, hardware_fault: Any) -> None:
         if hardware_fault and isinstance(hardware_fault, dict):
             scope.set_tag("exception_type", hardware_fault.get("exception_type", "unknown"))
@@ -959,6 +974,10 @@ class RobotWorker:
                 elif context.get("command") and isinstance(context.get("command"), dict):
                     scope.set_tag("command", context["command"].get("command", "unknown"))
                 self._tag_sentry_hardware_fault(scope, hardware_fault)
+                if error.error_type in CRASH_INCIDENT_ERROR_TYPES:
+                    incident_id = self._crash_incident_id(context)
+                    scope.fingerprint = ["robot-crash", incident_id]
+                    scope.set_tag("incident_id", incident_id)
                 if context:
                     scope.set_context("worker_error", context)
                 if operation_context:
