@@ -1169,8 +1169,12 @@ export async function sendScannerScan(barcode: string): Promise<{ message: strin
 	});
 }
 
+export type LabelSymbology = 'code128' | 'qr';
+
 export interface PrinterConfig {
 	feed_dots: number;
+	item_symbology: LabelSymbology;
+	qr_module_dots: number;
 }
 
 export interface PrinterStatus {
@@ -1192,13 +1196,14 @@ export interface PrintLabelResult {
 	message: string;
 	barcode: string;
 	printed: boolean;
+	symbology: LabelSymbology;
 }
 
 export async function getPrinterConfig(): Promise<PrinterConfig> {
 	return apiFetch<PrinterConfig>('/print/config');
 }
 
-export async function setPrinterConfig(config: PrinterConfig): Promise<PrinterConfig> {
+export async function setPrinterConfig(config: Partial<PrinterConfig>): Promise<PrinterConfig> {
 	return apiFetch<PrinterConfig>('/print/config', {
 		method: 'PUT',
 		headers: { 'Content-Type': 'application/json' },
@@ -1210,11 +1215,14 @@ export async function getPrinterStatus(): Promise<PrinterStatus> {
 	return apiFetch<PrinterStatus>('/print/status');
 }
 
-export async function printPrinterLabel(barcode: string): Promise<PrintLabelResult> {
+export async function printPrinterLabel(
+	barcode: string,
+	symbology: LabelSymbology | null = null
+): Promise<PrintLabelResult> {
 	return apiFetch<PrintLabelResult>('/print', {
 		method: 'POST',
 		headers: { 'Content-Type': 'application/json' },
-		body: JSON.stringify({ barcode })
+		body: JSON.stringify(symbology === null ? { barcode } : { barcode, symbology })
 	});
 }
 
