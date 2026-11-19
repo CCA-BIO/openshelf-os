@@ -6,6 +6,7 @@
 		getPrinterStatus,
 		printPrinterLabel,
 		setPrinterConfig,
+		type LabelSymbology,
 		type PrinterStatus
 	} from '$lib';
 	import { generateRandomBarcode } from '$lib/barcode';
@@ -14,6 +15,10 @@
 
 	let status: PrinterStatus | null = null;
 	let feedDots = 18;
+	let itemSymbology: LabelSymbology = 'code128';
+	let qrModuleDots = 4;
+	let humanReadable = true;
+	let printAs: LabelSymbology | 'config' = 'config';
 	let code = '';
 	let statusError = '';
 	let configError = '';
@@ -33,10 +38,22 @@
 		}
 	}
 
+	function applyConfig(config: {
+		feed_dots: number;
+		item_symbology: LabelSymbology;
+		qr_module_dots: number;
+		human_readable: boolean;
+	}): void {
+		feedDots = config.feed_dots;
+		itemSymbology = config.item_symbology;
+		qrModuleDots = config.qr_module_dots;
+		humanReadable = config.human_readable;
+	}
+
 	async function fetchConfig(): Promise<void> {
 		try {
 			const config = await getPrinterConfig();
-			feedDots = config.feed_dots;
+			applyConfig(config);
 			configError = '';
 		} catch (err) {
 			configError = err instanceof Error ? err.message : 'Failed to read printer config.';
@@ -54,15 +71,24 @@
 			configError = 'Feed dots must be a whole number from 0 to 128.';
 			return;
 		}
+		if (Number.isInteger(qrModuleDots) === false || qrModuleDots < 2 || qrModuleDots > 8) {
+			configError = 'QR module dots must be a whole number from 2 to 8.';
+			return;
+		}
 
 		isSaving = true;
 		configError = '';
 		message = '';
 
 		try {
-			const config = await setPrinterConfig({ feed_dots: feedDots });
-			feedDots = config.feed_dots;
-			message = `Feed set to ${feedDots} dots.`;
+			const config = await setPrinterConfig({
+				feed_dots: feedDots,
+				item_symbology: itemSymbology,
+				qr_module_dots: qrModuleDots,
+				human_readable: humanReadable
+			});
+			applyConfig(config);
+			message = `Saved: feed ${feedDots} dots, item labels ${symbologyName(itemSymbology)}, QR module ${qrModuleDots} dots, text ${humanReadable ? 'on' : 'off'}.`;
 		} catch (err) {
 			configError = err instanceof Error ? err.message : 'Failed to save printer config.';
 		} finally {
@@ -81,11 +107,11 @@
 		message = '';
 
 		try {
-			const result = await printPrinterLabel(code);
+			const result = await printPrinterLabel(code, printAs === 'config' ? null : printAs);
 			if (result.printed === false) {
 				printError = 'The printer is turned off, so the label was not printed.';
 			} else {
-				message = `Printed ${result.barcode}.`;
+				message = `Printed ${result.barcode} as ${symbologyName(result.symbology)}.`;
 			}
 		} catch (err) {
 			printError = err instanceof Error ? err.message : 'Failed to print label.';
@@ -93,6 +119,10 @@
 			isPrinting = false;
 			await fetchStatus();
 		}
+	}
+
+	function symbologyName(symbology: LabelSymbology): string {
+		return symbology === 'qr' ? 'QR (2D)' : 'Code 128 (1D)';
 	}
 
 	function didClickGenerate(): void {
@@ -175,7 +205,7 @@
 
 			<thead>
 				<tr>
-					<th colspan="2">feed calibration</th>
+					<th colspan="2">label settings</th>
 				</tr>
 			</thead>
 			<tbody>
@@ -183,6 +213,34 @@
 					<td><label for="feed-dots">feed dots</label></td>
 					<td>
 						<input id="feed-dots" type="number" min="0" max="128" step="1" bind:value={feedDots} />
+					</td>
+				</tr>
+				<tr>
+					<td><label for="item-symbology">item labels</label></td>
+					<td>
+						<select id="item-symbology" bind:value={itemSymbology}>
+							<option value="code128">Code 128 (1D)</option>
+							<option value="qr">QR (2D)</option>
+						</select>
+					</td>
+				</tr>
+				<tr>
+					<td><label for="qr-module-dots">QR module dots</label></td>
+					<td>
+						<input
+							id="qr-module-dots"
+							type="number"
+							min="2"
+							max="8"
+							step="1"
+							bind:value={qrModuleDots}
+						/>
+					</td>
+				</tr>
+				<tr>
+					<td><label for="human-readable">human-readable text</label></td>
+					<td>
+						<input id="human-readable" type="checkbox" bind:checked={humanReadable} />
 					</td>
 				</tr>
 			</tbody>
@@ -200,13 +258,23 @@
 						<button type="button" class="inline-button" on:click={didClickGenerate}>random</button>
 					</td>
 				</tr>
+				<tr>
+					<td><label for="print-as">print as</label></td>
+					<td>
+						<select id="print-as" bind:value={printAs}>
+							<option value="config">saved item setting</option>
+							<option value="code128">Code 128 (1D)</option>
+							<option value="qr">QR (2D)</option>
+						</select>
+					</td>
+				</tr>
 			</tbody>
 		</table>
 	</div>
 
 	<div class="action-buttons">
 		<button type="button" on:click={didClickRefresh} disabled={isRefreshing}>refresh</button>
-		<button type="button" on:click={didClickSave} disabled={isSaving}>save feed</button>
+		<button type="button" on:click={didClickSave} disabled={isSaving}>save settings</button>
 		<button type="button" on:click={didClickPrint} disabled={isPrinting || code === ''}>
 			print label
 		</button>
@@ -230,11 +298,21 @@
 {/if}
 
 <style>
-	input {
+	input,
+	select {
 		width: 12em;
 		padding: 4px;
 		border: 1px solid black;
 		font-family: inherit;
+	}
+
+	select {
+		width: auto;
+		min-width: 12em;
+	}
+
+	input[type='checkbox'] {
+		width: auto;
 	}
 
 	input[type='number'] {

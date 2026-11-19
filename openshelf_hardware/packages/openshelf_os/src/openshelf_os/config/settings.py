@@ -94,6 +94,11 @@ class PrinterSettings(BaseModel):
     enabled: bool = False
     queue: Optional[str] = None
     feed_dots: int = Field(18, ge=0, le=128)
+    # Item labels only: bin and login labels stay Code 128. Scanning accepts both regardless.
+    item_symbology: Literal["code128", "qr"] = "code128"
+    qr_module_dots: int = Field(4, ge=2, le=8)
+    # Item labels only: bin labels always carry their text (it names the home cell).
+    human_readable: bool = True
 
 
 class ScannerSettings(BaseModel):
