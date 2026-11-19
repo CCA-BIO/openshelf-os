@@ -66,14 +66,14 @@
 		isRefreshing = false;
 	}
 
-	async function didClickSave(): Promise<void> {
+	async function didClickSave(): Promise<boolean> {
 		if (Number.isInteger(feedDots) === false || feedDots < 0 || feedDots > 128) {
 			configError = 'Feed dots must be a whole number from 0 to 128.';
-			return;
+			return false;
 		}
 		if (Number.isInteger(qrModuleDots) === false || qrModuleDots < 2 || qrModuleDots > 8) {
 			configError = 'QR module dots must be a whole number from 2 to 8.';
-			return;
+			return false;
 		}
 
 		isSaving = true;
@@ -89,8 +89,10 @@
 			});
 			applyConfig(config);
 			message = `Saved: feed ${feedDots} dots, item labels ${symbologyName(itemSymbology)}, QR module ${qrModuleDots} dots, text ${humanReadable ? 'on' : 'off'}.`;
+			return true;
 		} catch (err) {
 			configError = err instanceof Error ? err.message : 'Failed to save printer config.';
+			return false;
 		} finally {
 			isSaving = false;
 		}
@@ -99,6 +101,10 @@
 	async function didClickPrint(): Promise<void> {
 		if (code.length === 0) {
 			printError = 'Enter a code to print.';
+			return;
+		}
+		// Test prints must reflect the settings on screen, so persist them first.
+		if ((await didClickSave()) === false) {
 			return;
 		}
 
@@ -262,7 +268,7 @@
 					<td><label for="print-as">print as</label></td>
 					<td>
 						<select id="print-as" bind:value={printAs}>
-							<option value="config">saved item setting</option>
+							<option value="config">same as item labels</option>
 							<option value="code128">Code 128 (1D)</option>
 							<option value="qr">QR (2D)</option>
 						</select>
