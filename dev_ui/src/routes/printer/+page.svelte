@@ -17,6 +17,7 @@
 	let feedDots = 18;
 	let itemSymbology: LabelSymbology = 'code128';
 	let qrModuleDots = 4;
+	let humanReadable = true;
 	let printAs: LabelSymbology | 'config' = 'config';
 	let code = '';
 	let statusError = '';
@@ -41,10 +42,12 @@
 		feed_dots: number;
 		item_symbology: LabelSymbology;
 		qr_module_dots: number;
+		human_readable: boolean;
 	}): void {
 		feedDots = config.feed_dots;
 		itemSymbology = config.item_symbology;
 		qrModuleDots = config.qr_module_dots;
+		humanReadable = config.human_readable;
 	}
 
 	async function fetchConfig(): Promise<void> {
@@ -81,10 +84,11 @@
 			const config = await setPrinterConfig({
 				feed_dots: feedDots,
 				item_symbology: itemSymbology,
-				qr_module_dots: qrModuleDots
+				qr_module_dots: qrModuleDots,
+				human_readable: humanReadable
 			});
 			applyConfig(config);
-			message = `Saved: feed ${feedDots} dots, item labels ${symbologyName(itemSymbology)}, QR module ${qrModuleDots} dots.`;
+			message = `Saved: feed ${feedDots} dots, item labels ${symbologyName(itemSymbology)}, QR module ${qrModuleDots} dots, text ${humanReadable ? 'on' : 'off'}.`;
 		} catch (err) {
 			configError = err instanceof Error ? err.message : 'Failed to save printer config.';
 		} finally {
@@ -209,7 +213,6 @@
 					<td><label for="feed-dots">feed dots</label></td>
 					<td>
 						<input id="feed-dots" type="number" min="0" max="128" step="1" bind:value={feedDots} />
-						<span class="hint">blank paper fed after each label (8 dots = 1 mm)</span>
 					</td>
 				</tr>
 				<tr>
@@ -219,7 +222,6 @@
 							<option value="code128">Code 128 (1D)</option>
 							<option value="qr">QR (2D)</option>
 						</select>
-						<span class="hint">bin and login labels always print Code 128; scanning reads both</span>
 					</td>
 				</tr>
 				<tr>
@@ -233,10 +235,12 @@
 							step="1"
 							bind:value={qrModuleDots}
 						/>
-						<span class="hint">
-							12-digit ID ≈ {((25 * qrModuleDots) / 8).toFixed(1)} mm square; lower is smaller but
-							harder to scan
-						</span>
+					</td>
+				</tr>
+				<tr>
+					<td><label for="human-readable">human-readable text</label></td>
+					<td>
+						<input id="human-readable" type="checkbox" bind:checked={humanReadable} />
 					</td>
 				</tr>
 			</tbody>
@@ -296,20 +300,23 @@
 <style>
 	input,
 	select {
-		min-width: 12em;
+		width: 12em;
 		padding: 4px;
 		border: 1px solid black;
 		font-family: inherit;
 	}
 
-	input[type='number'] {
-		width: 6em;
+	select {
+		width: auto;
+		min-width: 12em;
 	}
 
-	.hint {
-		margin-left: 0.5em;
-		color: #555;
-		font-size: 0.85em;
+	input[type='checkbox'] {
+		width: auto;
+	}
+
+	input[type='number'] {
+		width: 6em;
 	}
 
 	.inline-button {

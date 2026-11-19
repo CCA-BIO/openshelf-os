@@ -44,69 +44,20 @@ def _font(size: int) -> ImageFont.FreeTypeFont:
     return ImageFont.truetype(FONT_PATH, size)
 
 
-def _fit_text(text: str, width: int) -> tuple[str, ImageFont.FreeTypeFont]:
-    """Shrink the font to fit ``width``, then truncate with an ellipsis at the floor size."""
-    for size in range(TEXT_MAX_SIZE, TEXT_MIN_SIZE - 1, -1):
+def _wrap_text(text: str, width: int, height: int) -> tuple[list[str], ImageFont.FreeTypeFont]:
+    """Fit ``text`` into ``width`` x ``height`` with the largest font, preferring a single line.
+
+    The largest font whose whole text fits ``width`` on one line wins. Otherwise ``text`` breaks at
+    any character into lines of the largest font whose lines fit ``height``; at the floor size the
+    lines that do not fit are dropped and the last kept line gets an ellipsis. ``height`` below one
+    line height (e.g. 0) keeps a single line.
+    """
+    sizes = range(TEXT_MAX_SIZE, TEXT_MIN_SIZE - 1, -1)
+    for size in sizes:
         font = _font(size)
         if font.getlength(text) <= width:
-            return text, font
-    while len(text) > 1 and font.getlength(text + "…") > width:
-        text = text[:-1]
-    return text + "…", font
-
-
-def render_label(payload: str, location: str | None = None) -> Image.Image:
-    """Render a Code 128 barcode using the layout tuned on the T9E-US.
-
-    The payload is printed as a human-readable line above the bars, joined by a mid dot to
-    the storage location when given (bin labels).
-    """
-    code = barcode.get("code128", payload, writer=ImageWriter())
-    barcode_image = code.render(
-        writer_options={
-            "module_height": 12.0,
-            "quiet_zone": 1,
-            "write_text": False,
-            "font_size": 0,
-            "text_distance": 3,
-        }
-    ).convert("L")
-
-    available_width = LABEL_WIDTH_DOTS - LEFT_MARGIN_DOTS - RIGHT_MARGIN_DOTS
-    # One dot narrower: the text is double-struck one dot to the right.
-    text, font = _fit_text(f"{payload} · {location}" if location else payload, available_width - 1)
-    text_height = font.getbbox("Ag")[3] + TEXT_GAP_DOTS
-    available_height = LABEL_HEIGHT_DOTS - TOP_MARGIN_DOTS - BOTTOM_MARGIN_DOTS - text_height
-    source_width, source_height = barcode_image.size
-    rendered_height = min(
-        available_height,
-        round(source_height * (available_width / source_width)),
-    )
-    barcode_image = barcode_image.resize(
-        (available_width, rendered_height),
-        Image.Resampling.NEAREST,
-    )
-
-    label = Image.new("L", (LABEL_WIDTH_DOTS, LABEL_HEIGHT_DOTS), 255)
-    x = LEFT_MARGIN_DOTS + (available_width - barcode_image.width) // 2
-    y = TOP_MARGIN_DOTS + text_height + (available_height - barcode_image.height) // 2
-    label.paste(barcode_image, (x, y))
-
-    # Text sits above the bars so it stays visible over the back lip of a shelf.
-    # Double-striking one dot apart thickens the strokes without closing the zeros' counters.
-    text_x = LEFT_MARGIN_DOTS + (available_width - 1 - font.getlength(text)) / 2
-    draw = ImageDraw.Draw(label)
-    for dx in (0, 1):
-        draw.text((text_x + dx, TOP_MARGIN_DOTS), text, font=font, fill=0)
-    return label
-
-
-def _wrap_text(text: str, width: int, height: int) -> tuple[list[str], ImageFont.FreeTypeFont]:
-    """Break ``text`` at any character into lines of the largest font that fits ``width`` x ``height``.
-
-    At the floor size the lines that do not fit are dropped and the last kept line gets an ellipsis.
-    """
-    for size in range(TEXT_MAX_SIZE, TEXT_MIN_SIZE - 1, -1):
+            return [text], font
+    for size in sizes:
         font = _font(size)
         lines: list[str] = []
         for char in text:
@@ -126,10 +77,64 @@ def _wrap_text(text: str, width: int, height: int) -> tuple[list[str], ImageFont
     return lines, font
 
 
+def render_label(payload: str, location: str | None = None, *, text: bool = True) -> Image.Image:
+    """Render a Code 128 barcode using the layout tuned on the T9E-US.
+
+    With ``text`` the payload is printed as a human-readable line above the bars, joined by a
+    mid dot to the storage location when given (bin labels); without it the bars take the
+    whole label.
+    """
+    code = barcode.get("code128", payload, writer=ImageWriter())
+    barcode_image = code.render(
+        writer_options={
+            "module_height": 12.0,
+            "quiet_zone": 1,
+            "write_text": False,
+            "font_size": 0,
+            "text_distance": 3,
+        }
+    ).convert("L")
+
+    available_width = LABEL_WIDTH_DOTS - LEFT_MARGIN_DOTS - RIGHT_MARGIN_DOTS
+    text_height = 0
+    if text:
+        # One dot narrower: the text is double-struck one dot to the right.
+        lines, font = _wrap_text(f"{payload} · {location}" if location else payload, available_width - 1, 0)
+        line = lines[0] if lines else ""
+        text_height = font.getbbox("Ag")[3] + TEXT_GAP_DOTS
+    available_height = LABEL_HEIGHT_DOTS - TOP_MARGIN_DOTS - BOTTOM_MARGIN_DOTS - text_height
+    source_width, source_height = barcode_image.size
+    rendered_height = min(
+        available_height,
+        round(source_height * (available_width / source_width)),
+    )
+    barcode_image = barcode_image.resize(
+        (available_width, rendered_height),
+        Image.Resampling.NEAREST,
+    )
+
+    label = Image.new("L", (LABEL_WIDTH_DOTS, LABEL_HEIGHT_DOTS), 255)
+    x = LEFT_MARGIN_DOTS + (available_width - barcode_image.width) // 2
+    y = TOP_MARGIN_DOTS + text_height + (available_height - barcode_image.height) // 2
+    label.paste(barcode_image, (x, y))
+
+    if text:
+        # Text sits above the bars so it stays visible over the back lip of a shelf.
+        # Double-striking one dot apart thickens the strokes without closing the zeros' counters.
+        text_x = LEFT_MARGIN_DOTS + (available_width - 1 - font.getlength(line)) / 2
+        draw = ImageDraw.Draw(label)
+        for dx in (0, 1):
+            draw.text((text_x + dx, TOP_MARGIN_DOTS), line, font=font, fill=0)
+    return label
+
+
 def render_qr_label(
-    payload: str, location: str | None = None, *, module_dots: int = QR_DEFAULT_MODULE_DOTS
+    payload: str,
+    *,
+    module_dots: int = QR_DEFAULT_MODULE_DOTS,
+    text: bool = True,
 ) -> Image.Image:
-    """Render a QR code at the label's left edge with the payload wrapped beside it.
+    """Render a QR code at the label's left edge, with the payload wrapped beside it when ``text``.
 
     The code sits flush left so the label can be trimmed to just the code for small items.
     ``module_dots`` is shrunk when the code would not fit the label height.
@@ -152,11 +157,13 @@ def render_qr_label(
             if dark:
                 x = code_x + col_idx * module_dots
                 draw.rectangle((x, y, x + module_dots - 1, y + module_dots - 1), fill=0)
+    if not text:
+        return label
 
     text_x = code_x + side + QR_TEXT_GAP_DOTS
     # One dot narrower: the text is double-struck one dot to the right.
     text_width = LABEL_WIDTH_DOTS - RIGHT_MARGIN_DOTS - text_x - 1
-    lines, font = _wrap_text(f"{payload} · {location}" if location else payload, text_width, available_height)
+    lines, font = _wrap_text(payload, text_width, available_height)
     line_height = font.getbbox("Ag")[3] + TEXT_GAP_DOTS
     text_y = TOP_MARGIN_DOTS + (available_height - len(lines) * line_height + TEXT_GAP_DOTS) // 2
     for idx, line in enumerate(lines):
@@ -207,12 +214,13 @@ def build_label_job(
     location: str | None = None,
     symbology: Symbology = "code128",
     qr_module_dots: int = QR_DEFAULT_MODULE_DOTS,
+    human_readable: bool = True,
 ) -> bytes:
     """Build the complete ESC/POS raster job for one label without doing I/O."""
     if symbology == "qr":
-        label = render_qr_label(payload, location, module_dots=qr_module_dots)
+        label = render_qr_label(payload, module_dots=qr_module_dots, text=human_readable)
     else:
-        label = render_label(payload, location)
+        label = render_label(payload, location, text=human_readable)
     packed, bytes_per_row, height = _pack_raster(_add_feed_rows(label, feed_dots))
     raster_header = (
         GS

@@ -1175,6 +1175,7 @@ export interface PrinterConfig {
 	feed_dots: number;
 	item_symbology: LabelSymbology;
 	qr_module_dots: number;
+	human_readable: boolean;
 }
 
 export interface PrinterStatus {

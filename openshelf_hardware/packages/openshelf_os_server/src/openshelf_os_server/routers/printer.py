@@ -42,6 +42,7 @@ class PrinterConfig(BaseModel):
     feed_dots: int = Field(ge=0, le=128)
     item_symbology: Symbology
     qr_module_dots: int = Field(ge=2, le=8)
+    human_readable: bool
 
 
 class PrinterConfigUpdate(BaseModel):
@@ -50,6 +51,7 @@ class PrinterConfigUpdate(BaseModel):
     feed_dots: int | None = Field(None, ge=0, le=128)
     item_symbology: Symbology | None = None
     qr_module_dots: int | None = Field(None, ge=2, le=8)
+    human_readable: bool | None = None
 
 
 class PrinterStatusResponse(BaseModel):
@@ -142,6 +144,7 @@ class USBPrinter:
         location: str | None = None,
         symbology: Symbology = "code128",
         qr_module_dots: int,
+        human_readable: bool = True,
     ) -> None:
         """Write one label job with the configured feed distance to the printer."""
         self._write_all(
@@ -151,6 +154,7 @@ class USBPrinter:
                 location=location,
                 symbology=symbology,
                 qr_module_dots=qr_module_dots,
+                human_readable=human_readable,
             )
         )
 
@@ -180,7 +184,8 @@ async def get_printer_config() -> PrinterConfig:
     """Read printer label settings.
 
     Returns the feed distance in printer dots, the symbology printed on item labels
-    (`code128` or `qr`), and the QR module size in dots. Does not print a label.
+    (`code128` or `qr`), the QR module size in dots, and whether item labels carry the
+    human-readable barcode text. Does not print a label.
     """
     return _printer_config(get_root_config().printer)
 
@@ -196,8 +201,9 @@ async def update_printer_config(request: PrinterConfigUpdate) -> PrinterConfig:
     """Set printer label settings.
 
     Requires `printer:print`. Persists the feed distance used after printing, the item
-    label symbology and the QR module size; omitted fields keep their stored value. Bin
-    and login labels stay Code 128, and scanning accepts 1D and 2D codes regardless.
+    label symbology, the QR module size and whether item labels carry human-readable
+    text; omitted fields keep their stored value. Bin and login labels stay Code 128 with
+    text, and scanning accepts 1D and 2D codes regardless.
     This updates configuration without printing a test label.
     """
     changes = request.model_dump(exclude_none=True)
@@ -269,13 +275,20 @@ def _bin_home_label(payload: str) -> str | None:
     return None
 
 
-def _print_payload(payload: str, symbology: Symbology = "code128") -> bool:
+def _print_payload(
+    payload: str,
+    settings: PrinterSettings | None = None,
+    *,
+    location: str | None = None,
+    symbology: Symbology = "code128",
+    human_readable: bool = True,
+) -> bool:
     if get_operating_mode() == OperatingMode.mock:
         return True
 
-    location = _bin_home_label(payload)
-    settings = get_settings()
-    if settings.printer.enabled is False:
+    if settings is None:
+        settings = get_root_config().printer
+    if settings.enabled is False:
         logger.info("Printer disabled; skipping label print for %s", payload)
         return False
 
@@ -283,20 +296,15 @@ def _print_payload(payload: str, symbology: Symbology = "code128") -> bool:
         try:
             printer.print_label(
                 payload,
-                feed_dots=settings.printer.feed_dots,
+                feed_dots=settings.feed_dots,
                 location=location,
                 symbology=symbology,
-                qr_module_dots=settings.printer.qr_module_dots,
+                qr_module_dots=settings.qr_module_dots,
+                human_readable=human_readable,
             )
         finally:
             printer.close()
     return True
-
-
-def _item_label_symbology(payload: str, requested: Symbology | None) -> Symbology:
-    if _bin_home_label(payload) is not None:
-        return "code128"
-    return requested or get_root_config().printer.item_symbology
 
 
 @router.post(
@@ -313,16 +321,26 @@ async def print_label(request: PrintLabelRequest) -> PrintLabelResponse:
     request body, so every customer barcode is printable. Item labels use the configured
     `item_symbology` unless the request sets `symbology`: `code128` prints the bars with
     the barcode as text above them, `qr` prints a QR code at the left edge with the
-    barcode wrapped beside it, so the label can be trimmed for small items. A multi-item
-    bin's label is always Code 128 and adds its home cell (e.g. `F:0:0`). The response
+    barcode wrapped beside it, so the label can be trimmed for small items. Item labels
+    omit the text when `human_readable` is off in the printer config. A multi-item bin's
+    label is always Code 128 with text and adds its home cell (e.g. `F:0:0`). The response
     reports the symbology used. Mock mode simulates printing without a physical artifact.
     This operation has no idempotency key; a retry may print another label. A printer
     write failure returns `503`.
     """
-    symbology = _item_label_symbology(request.barcode, request.symbology)
-    return PrintLabelResponse(
-        message="success",
-        barcode=request.barcode,
-        printed=await asyncio.to_thread(_print_payload, request.barcode, symbology),
+    settings = get_root_config().printer
+    location = _bin_home_label(request.barcode)
+    if location is None:
+        symbology: Symbology = request.symbology or settings.item_symbology
+        human_readable = settings.human_readable
+    else:
+        symbology, human_readable = "code128", True
+    printed = await asyncio.to_thread(
+        _print_payload,
+        request.barcode,
+        settings,
+        location=location,
         symbology=symbology,
+        human_readable=human_readable,
     )
+    return PrintLabelResponse(message="success", barcode=request.barcode, printed=printed, symbology=symbology)
