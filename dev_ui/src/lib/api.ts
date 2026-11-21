@@ -528,6 +528,10 @@ export type CycleTestSnapshot = {
 	config: CycleTestConfig | null;
 	loop: number;
 	loops_passed: number;
+	cycles: number;
+	failures: number;
+	cycle_avg_s: number | null;
+	elapsed_s: number;
 	total: number;
 	current: string | null;
 	results: CycleTestCellResult[];

@@ -158,6 +158,10 @@ class CycleTestSnapshot(BaseModel):
 	config: Optional[CycleTestConfig] = None
 	loop: int = 0
 	loops_passed: int = 0
+	cycles: int = Field(0, description="Store and retrieve commands (quick tests in quick modes) that succeeded, across all loops")
+	failures: int = Field(0, description="Cells that failed, across all loops")
+	cycle_avg_s: Optional[float] = Field(None, description="Mean duration of a succeeded cycle")
+	elapsed_s: float = Field(0.0, description="Run time so far; stops when the run ends")
 	total: int = 0
 	current: Optional[str] = None
 	results: list[CellResult] = Field(default_factory=list, description="Cell results of the current loop")
@@ -270,6 +274,7 @@ class CycleTestRunner:
 			timeout=COMMAND_TIMEOUT_S + 10,
 		)
 		self.barcode_counter: Optional[int] = None
+		self.cycle_total_s = 0.0
 		self.ref = ""
 		self.new_ref()
 		self.is_mock = get_operating_mode() == OperatingMode.mock
@@ -291,6 +296,12 @@ class CycleTestRunner:
 	def set_error(self, failure: Failure) -> None:
 		self.snapshot.code, self.snapshot.error = failure
 		self.snapshot.correlation_id = self.ref
+
+	def count_cycle(self, started: float) -> None:
+		snapshot = self.snapshot
+		self.cycle_total_s += time.monotonic() - started
+		snapshot.cycles += 1
+		snapshot.cycle_avg_s = round(self.cycle_total_s / snapshot.cycles, 1)
 
 	# -- robot state -------------------------------------------------------
 
@@ -449,28 +460,40 @@ class CycleTestRunner:
 
 	async def store(self, barcode: str, side: str, shelf: int, cell: int) -> Optional[Failure]:
 		location = {"side": side, "shelf_idx": shelf, "cell_idx": cell}
+		started = time.monotonic()
 		error = await self.run_command({"command": "store_item", "item": {"barcode": barcode, "location": location}})
 		if error is not None:
 			return error
 		ok, _ = await self.wait_for_location(barcode, side, shelf, cell, True)
-		return None if ok else ("cycle_test_location_mismatch", CODE_MESSAGES["cycle_test_location_mismatch"])
+		if not ok:
+			return "cycle_test_location_mismatch", CODE_MESSAGES["cycle_test_location_mismatch"]
+		self.count_cycle(started)
+		return None
 
 	async def retrieve(self, barcode: str, side: str, shelf: int, cell: int) -> Optional[Failure]:
 		location = {"side": side, "shelf_idx": shelf, "cell_idx": cell}
+		started = time.monotonic()
 		error = await self.run_command({"command": "retrieve_item", "barcode": barcode, "location": location})
 		if error is not None:
 			return error
 		ok, _ = await self.wait_for_location(barcode, side, shelf, cell, False)
-		return None if ok else ("cycle_test_location_mismatch", CODE_MESSAGES["cycle_test_location_mismatch"])
+		if not ok:
+			return "cycle_test_location_mismatch", CODE_MESSAGES["cycle_test_location_mismatch"]
+		self.count_cycle(started)
+		return None
 
 	async def quick(self, side: str, shelf: int, cell: int) -> Optional[Failure]:
 		params = {"lift": f"{self.config.lift_mm:g}"} if self.config.lift_mm is not None else None
+		started = time.monotonic()
 		resp = await self.client.post(
 			"/api/calibration/test",
 			params=params,
 			json={"side": side, "shelf_idx": shelf, "cell_idx": cell},
 		)
-		return None if resp.status_code == 200 else _failure(resp)
+		if resp.status_code != 200:
+			return _failure(resp)
+		self.count_cycle(started)
+		return None
 
 	# -- cells -------------------------------------------------------------
 
@@ -667,6 +690,8 @@ class CycleTestRunner:
 				result.code, result.error = "cycle_test_request_failed", CODE_MESSAGES["cycle_test_request_failed"]
 				self.log(f"  - FAIL - {result.error}")
 			result.duration_s = round(time.monotonic() - started, 1)
+			if not result.passed:
+				snapshot.failures += 1
 			snapshot.current = None
 			self.manager.publish()
 
@@ -736,6 +761,7 @@ class CycleTestManager:
 		self._log: deque[str] = deque(maxlen=LOG_LIMIT)
 		self._subscribers: set[asyncio.Queue[str]] = set()
 		self._task: Optional[asyncio.Task[None]] = None
+		self._started = 0.0
 		self._continue = asyncio.Event()
 		self._abort = False
 		self._lock = asyncio.Lock()
@@ -749,6 +775,8 @@ class CycleTestManager:
 
 	def serialize(self) -> str:
 		self.snapshot.log = list(self._log)
+		if self.is_active():
+			self.snapshot.elapsed_s = round(time.monotonic() - self._started, 1)
 		return self.snapshot.model_dump_json()
 
 	def publish(self) -> None:
@@ -801,6 +829,7 @@ class CycleTestManager:
 				started_at=now,
 				updated_at=now,
 			)
+			self._started = time.monotonic()
 			runner = CycleTestRunner(self, app, user, config)
 			self._task = asyncio.create_task(runner.run())
 			return self.snapshot.model_copy(deep=True)
