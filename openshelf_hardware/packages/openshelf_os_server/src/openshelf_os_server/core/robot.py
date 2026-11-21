@@ -30,6 +30,7 @@ from openshelf_os_server.core.robot_events import RobotEventListener
 from openshelf_os_server.core.storage import StorageService
 from openshelf_os_server.core.bin_storage import BinStorageService, reserved_bin_locations
 from openshelf_os_server.core.command_lifecycle import handle_worker_lifecycle
+from openshelf_os_server.core.manual_motion import get_manual_motion_operation
 from openshelf_os_server.database.session import AsyncSessionLocal
 from openshelf_os_server.settings import check_config_requirements, get_root_config
 
@@ -180,6 +181,11 @@ async def _cleanup_failed_worker(
             logger.warning("robot_worker_cleanup_failed: %s", shutdown_error, exc_info=True)
 
 
+def external_motion_active() -> bool:
+    """Server-side motion the scheduled home must not start under; queueing a command is not motion."""
+    return get_manual_motion_operation() not in {None, "robot_command_enqueue"}
+
+
 async def init_robot_worker() -> None:
     """Bring up the robot in the background, reporting progress into the init tracker.
 
@@ -272,6 +278,7 @@ async def init_robot_worker() -> None:
             crash_artifact_provider=capture_motion_crash_artifacts,
             crash_artifact_begin_provider=begin_motion_crash_artifacts,
             command_lifecycle_callback=handle_worker_lifecycle,
+            external_motion_active=external_motion_active,
         )
         _apply_startup_needs_home(worker, robot, tracker, home_on_init, startup_home_skip_reason)
         try:

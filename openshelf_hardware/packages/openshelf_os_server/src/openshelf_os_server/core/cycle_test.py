@@ -428,10 +428,12 @@ class CycleTestRunner:
 			return _failure(resp)
 		command_id = resp.json().get("command_id")
 		start = time.monotonic()
+		running_since: Optional[float] = None
 		last_fault_check = start
 		while True:
 			now = time.monotonic()
-			if now - start > COMMAND_TIMEOUT_S:
+			# Time queued behind the worker's scheduled full home is not this command's run time.
+			if now - (running_since or start) > COMMAND_TIMEOUT_S:
 				logger.warning(
 					"cycle test command %s had no result after %ss (correlation_id=%s)", command_id, COMMAND_TIMEOUT_S, self.ref
 				)
@@ -445,6 +447,8 @@ class CycleTestRunner:
 			row = await self.client.get(f"/api/robot/commands/{command_id}")
 			if row.status_code == 200:
 				data = row.json()
+				if running_since is None and data["status"] != "queued":
+					running_since = time.monotonic()
 				if data["status"] == "succeeded":
 					return None
 				if data["status"] == "failed":

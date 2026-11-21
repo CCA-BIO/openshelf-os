@@ -140,6 +140,13 @@ TRAY_ON_TOOL_ERROR = "The gripper is still holding a tray or bin. Release it and
 # gripper action outside the queue.
 TRAY_ON_TOOL_ALLOWED_COMMANDS = (HomeCommand, StopCommand)
 
+# Extended runs showed position drift: a full home is owed after this many store/retrieve
+# commands, or once the robot has sat idle this long after one. A full home resets both.
+HOME_EVERY_CYCLES = 100
+IDLE_HOME_AFTER_S = 300.0
+SCHEDULED_HOME_FAILED_REASON = "The scheduled full home did not finish. Home the robot before continuing."
+CYCLE_COMMANDS = (StoreItemCommand, RetrieveItemCommand)
+
 CrashArtifactProvider = Callable[[str], Awaitable[CrashReportArtifacts]]
 CrashArtifactBeginProvider = Callable[[str], Awaitable[CrashReportArtifacts]]
 CommandLifecycleCallback = Callable[
@@ -440,6 +447,7 @@ class RobotWorker:
         crash_artifact_provider: CrashArtifactProvider | None = None,
         crash_artifact_begin_provider: CrashArtifactBeginProvider | None = None,
         command_lifecycle_callback: CommandLifecycleCallback | None = None,
+        external_motion_active: Callable[[], bool] | None = None,
     ):
         if RobotWorker._instance is not None:
             raise RuntimeError("RobotWorker is a singleton.")
@@ -448,6 +456,15 @@ class RobotWorker:
         self._crash_artifact_provider = crash_artifact_provider
         self._crash_artifact_begin_provider = crash_artifact_begin_provider
         self._command_lifecycle_callback = command_lifecycle_callback
+        # Motion the server runs outside the queue (debug moves, calibration) holds its own lock;
+        # the scheduled home must not start under it.
+        self._external_motion_active = external_motion_active
+        self._cycles_since_home = 0
+        self._idle_since = time.monotonic()
+        self._scheduled_home: Optional[QueuedOperation] = None
+        # A cycle dequeued while a home was due; it stays in _queued_commands so discards still fail it.
+        self._held_operation: Optional[QueuedOperation] = None
+        self._scheduled_home_failed = False
         self._worker_task: Optional[asyncio.Task] = None
         self._scale_poll_task: Optional[asyncio.Task] = None
         self._estop_monitor_task: Optional[asyncio.Task] = None
@@ -1596,6 +1613,8 @@ class RobotWorker:
                 and isinstance(result, RobotCommandSuccessful)
             ):
                 self._clear_fault_state_after_home(command)
+            if isinstance(command, HomeCommand) and command.axes is None and isinstance(result, RobotCommandSuccessful):
+                self._cycles_since_home = 0
             if isinstance(result, RobotCommandSuccessful):
                 payload = self._success_payload(result, command, operation)
                 await self.publish_event(payload)
@@ -1764,6 +1783,21 @@ class RobotWorker:
         self._current_task = None
         self._current_command = None
         self._command_started_at = None
+        self._after_command_finished(operation)
+
+    def _after_command_finished(self, operation: Optional[QueuedOperation]) -> None:
+        self._idle_since = time.monotonic()
+        if operation is None or operation is not self._scheduled_home:
+            return
+        self._scheduled_home = None
+        if self._cycles_since_home == 0:
+            return
+        # The cycles queued behind it would run unhomed; they are failed before the next dispatch.
+        self._scheduled_home_failed = True
+        if self.needs_reset() is False:
+            # A failure that left no fault state behind would retry the home on every loop.
+            self.set_needs_home(SCHEDULED_HOME_FAILED_REASON)
+        logger.warning("Scheduled full home did not finish; a home is owed")
 
     async def _terminalize_current_command(
         self, *, interruption_reason: Optional[str] = None
@@ -1816,6 +1850,7 @@ class RobotWorker:
         reason: str,
         *,
         interruption_boundary: Optional[int] = None,
+        code: str = "command_interrupted",
     ) -> None:
         """Fail queued commands admitted before the interruption boundary."""
         async with self._terminalization_lock:
@@ -1848,6 +1883,7 @@ class RobotWorker:
                         queued_operation.command,
                         reason,
                         queued_operation,
+                        code=code,
                     )
 
             for queued_operation in drained_operations:
@@ -2009,19 +2045,110 @@ class RobotWorker:
 
             logger.info("Starting command execution: %s", command.command)
             self._command_started_at = time.monotonic()
+            if isinstance(command, CYCLE_COMMANDS):
+                self._cycles_since_home += 1
             with _operation_log_context(queued_operation):
                 self._current_task = asyncio.create_task(self._robot.handle_command(command))
         return True
 
+    def _scheduled_home_due(self) -> bool:
+        if self._cycles_since_home == 0:
+            return False
+        return (
+            self._cycles_since_home >= HOME_EVERY_CYCLES
+            or time.monotonic() - self._idle_since >= IDLE_HOME_AFTER_S
+        )
+
+    def _may_start_scheduled_home(self) -> bool:
+        if (
+            self._current_command is not None
+            or self.needs_reset() is True
+            or self._is_estop_active is True
+            or self._is_stopped() is True
+            or self.is_safety_blocking() is True
+            or self._tray_on_tool is True
+            or self._demo_cycling is True
+        ):
+            return False
+        if self._external_motion_active is not None and self._external_motion_active() is True:
+            return False
+        head = next((op for op in self._queued_commands if op is not self._current_operation), None)
+        if head is not None:
+            # Only a cycle waits for the home; a queued stop, home or manual move goes first.
+            return isinstance(head.command, CYCLE_COMMANDS)
+        # Nobody asked for motion: leave an operator working at the IO box or in the cabinet alone.
+        # The raw sensor counts even when a bypass dropped the cabinet from the safety sources.
+        if (self._cabinet_doors or {}).get("open") is True:
+            return False
+        scale = self._latest_scale_status
+        return self._door_open is not True and (scale is None or scale.occupied is not True)
+
+    async def _start_scheduled_home(self) -> bool:
+        """Run a due full home ahead of anything queued; True when it started."""
+        if self._scheduled_home_due() is False:
+            return False
+        if self._may_start_scheduled_home() is False:
+            return False
+        # A tray can be left held outside the queue without the cached flag knowing; a full home would drag it.
+        if await self.refresh_tray_on_tool() is True:
+            return False
+        command = HomeCommand()
+        async with self._terminalization_lock:
+            # Checked and claimed without an await in between, so manual motion cannot slip in.
+            if self._may_start_scheduled_home() is False:
+                return False
+            operation = QueuedOperation(
+                command=command,
+                timestamp=datetime.now(timezone.utc),
+                admission_generation=self._interruption_generation,
+                command_id=None,
+                visibility="internal",
+            )
+            self._current_command = command
+            self._current_operation = operation
+            self._scheduled_home = operation
+        logger.info(
+            "Starting scheduled full home",
+            extra={"cycles_since_home": self._cycles_since_home, "idle_s": round(time.monotonic() - self._idle_since, 1)},
+        )
+        await self._publish_status()
+        if await self._start_admitted_command(command, operation) is False:
+            self._scheduled_home = None
+            return False
+        return True
+
     async def _dispatch_next_command(self) -> bool:
         """Dequeue, admit and start one command; False skips the loop's trailing sleep."""
-        try:
-            queued_operation = await asyncio.wait_for(self._command_queue.get(), timeout=1)
-        except asyncio.TimeoutError:
-            safety_changed = await self._evaluate_safety_guard()
-            if safety_changed is True:
-                await self._publish_status()
+        if self._scheduled_home_failed is True:
+            self._scheduled_home_failed = False
+            await self._discard_queued_commands(SCHEDULED_HOME_FAILED_REASON, code="home_required")
+            await self._publish_status()
+        if await self._start_scheduled_home() is True:
             return True
+        if self._held_operation is None:
+            try:
+                queued_operation = await asyncio.wait_for(self._command_queue.get(), timeout=1)
+            except asyncio.TimeoutError:
+                safety_changed = await self._evaluate_safety_guard()
+                if safety_changed is True:
+                    await self._publish_status()
+                return True
+            if isinstance(queued_operation.command, CYCLE_COMMANDS) and self._scheduled_home_due() is True:
+                # The home was declined while nothing was queued; a cycle arriving during that wait must not jump it.
+                self._held_operation = queued_operation
+                if await self._start_scheduled_home() is True:
+                    return True
+        if self._held_operation is not None:
+            if self._scheduled_home_due() is True and (
+                self.is_safety_blocking() is True
+                or (self._external_motion_active is not None and self._external_motion_active() is True)
+            ):
+                # A transient block: the cycle must not run unhomed once it clears, so keep holding and retry.
+                safety_changed = await self._evaluate_safety_guard()
+                if safety_changed is True:
+                    await self._publish_status()
+                return True
+            queued_operation, self._held_operation = self._held_operation, None
 
         command = queued_operation.command
         if await self._admit_queued_operation(command, queued_operation) is False:
@@ -2080,10 +2207,12 @@ class RobotWorker:
             logger.warning("Failed to publish error status: %s", publish_err, exc_info=publish_err)
 
         self._remove_current_operation()
+        operation = self._current_operation
         self._current_task = None
         self._current_command = None
         self._current_operation = None
         self._command_started_at = None
+        self._after_command_finished(operation)
         await asyncio.sleep(1)
 
     async def process_commands(self) -> None:
