@@ -711,6 +711,7 @@ class Tool:
             target_position: Literal["front", "back"] = "front" if coordinate.s == 0 else "back"
 
             await self._gs.safe_open()
+            await self._rotate_before_move(coordinate, target_position)
             await self.move(coordinate)
             # Open any door gating the cell before rotating: rotation may extend
             # the stage to its rotation-safe extension.
@@ -753,6 +754,7 @@ class Tool:
             target_position: Literal["front", "back"] = "front" if coordinate.s == 0 else "back"
 
             await self._gs.safe_open()
+            await self._rotate_before_move(coordinate, target_position)
             await self.move(coordinate)
             await self.rotate_to_position(target_position)
             await self.extend_empty(coordinate)
@@ -795,6 +797,7 @@ class Tool:
         try:
             target_position: Literal["front", "back"] = "front" if coordinate.s == 0 else "back"
 
+            await self._rotate_before_move(coordinate, target_position)
             await self.move(coordinate)
             # Open any door gating the cell before rotating: rotation may extend
             # the stage to its rotation-safe extension.
@@ -1088,7 +1091,8 @@ class Tool:
     #  Rotation
     # ------------------------------------------------------------------ #
 
-    async def rotate_to_position(self, position: Literal["front", "back"]) -> None:
+    async def rotate_to_position(self, position: Literal["front", "back"], *, restore_x: bool = True) -> None:
+        """Turn to `position`; restore_x=False leaves X in the rotation window for a move that follows."""
         if self._mr is None:
             raise MotorError("Rotate motor required for rotation")
 
@@ -1109,7 +1113,8 @@ class Tool:
                 await self.ensure_safe_rotation_stage_extension()
                 await self._mr.move_to_position(target_angle)
             finally:
-                await self.restore_safe_rotation_x_position(original_x)
+                if restore_x is True:
+                    await self.restore_safe_rotation_x_position(original_x)
 
         except Exception as e:
             await self._handle_fault(e)
@@ -1118,6 +1123,36 @@ class Tool:
                 raise
 
             raise MovementError(f"Tool rotation failed: {str(e)}") from e
+
+    async def _rotate_before_move(
+        self, coordinate: c.AxisCoordinate, position: Literal["front", "back"]
+    ) -> None:
+        """Turn to `position` before a gantry move to a target X outside the rotation window.
+
+        Turning after the move sends X back into the window and out to the target again; turning
+        first, at the window point nearest the current X, keeps X on its way. Not where rotation
+        extends the stage: a door gating the cell must open before that extension.
+        """
+        x_motor = getattr(self, "_mx", None)
+        rotate_motor = getattr(self, "_mr", None)
+        stage_motor = getattr(self, "_ms", None)
+        if x_motor is None or rotate_motor is None:
+            return
+        if getattr(x_motor, "_is_homed", True) is False or getattr(rotate_motor, "_is_homed", True) is False:
+            return
+        if stage_motor is not None and getattr(stage_motor._params, "rotation_safe_stage_extension_enabled", False):
+            return
+
+        window_min_mm, window_max_mm = self._rotation_x_window(x_motor)
+        if window_max_mm < window_min_mm or self._is_in_rotation_x_window(x_motor, float(coordinate.x)):
+            return
+
+        target_angle = await self.get_param("ROTATION_FRONT" if position == "front" else "ROTATION_BACK")
+        if target_angle is None or await self.is_rotation_at_position(target_angle):
+            return
+
+        await self._ensure_retracted()
+        await self.rotate_to_position(position, restore_x=False)
 
     async def rotate_to_home_orientation(
         self,
@@ -1251,11 +1286,24 @@ class Tool:
                         f"{maximum_stage_mm:.3f}mm"
                     )
             elif stage_extension_enabled is True:
+                # The rotation-safe extension is the only extended stage a turn allows.
                 minimum_stage_mm = float(self._ms._params.rotation_safe_stage_extension_mm)
+                maximum_stage_mm = max(
+                    minimum_stage_mm + SETTLED_ON_TARGET_TOLERANCE_MM,
+                    self._get_float_param(
+                        "ROTATION_STAGE_MAX_EXTENSION_MM",
+                        DEFAULT_ROTATION_STAGE_MAX_EXTENSION_MM,
+                    ),
+                )
                 if stage_position < minimum_stage_mm:
                     unsafe.append(
                         f"stage={stage_position:.3f}mm is below required "
                         f"{minimum_stage_mm:.3f}mm"
+                    )
+                elif stage_position > maximum_stage_mm:
+                    unsafe.append(
+                        f"stage={stage_position:.3f}mm exceeds maximum "
+                        f"{maximum_stage_mm:.3f}mm"
                     )
             else:
                 maximum_stage_mm = self._get_float_param(

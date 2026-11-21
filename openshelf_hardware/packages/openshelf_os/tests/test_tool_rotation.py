@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from openshelf_os.common import AxisCoordinate
 from openshelf_os.exceptions import MovementError, RotationClearanceError
 from openshelf_os.tool import (
     Tool,
@@ -126,8 +127,19 @@ async def test_rotate_to_position_restores_original_x_after_safe_edge_move() -> 
 
 
 @pytest.mark.asyncio
-async def test_rotate_to_position_refuses_unsafe_stage_clearance() -> None:
-    stage_motor = _mock_stage_motor(position=3.0)
+@pytest.mark.parametrize(
+    "position_mm, stage_extension_enabled, error",
+    [
+        pytest.param(3.0, False, "stage=3.000mm exceeds maximum 0.500mm", id="retract_interlock"),
+        # The rotation-safe extension guard must not let a stage still out in a cell turn.
+        pytest.param(30.0, True, "stage=30.000mm exceeds maximum 8.600mm", id="beyond_safe_extension"),
+    ],
+)
+async def test_rotate_to_position_refuses_unsafe_stage_clearance(
+    position_mm: float, stage_extension_enabled: bool, error: str
+) -> None:
+    stage_motor = _mock_stage_motor(position=position_mm)
+    stage_motor._params.rotation_safe_stage_extension_enabled = stage_extension_enabled
     rotate_motor = AsyncMock()
     rotate_motor.get_position = AsyncMock(return_value=2.0)
     rotate_motor.move_to_position = AsyncMock()
@@ -147,7 +159,7 @@ async def test_rotate_to_position_refuses_unsafe_stage_clearance() -> None:
         'ROTATION_BACK': 2.0,
     }[name])
 
-    with pytest.raises(MovementError, match="stage=3.000mm exceeds maximum 0.500mm"):
+    with pytest.raises(MovementError, match=error):
         await tool.rotate_to_position("front")
 
     rotate_motor.move_to_position.assert_not_awaited()
@@ -373,3 +385,100 @@ async def test_home_rotate_sequence_refuses_extended_z_before_any_x_motion() -> 
     tool._mx.home.assert_not_awaited()
     tool._mx.move_to_position.assert_not_awaited()
     tool._mr.home.assert_not_awaited()
+
+
+def _tool_for_place(
+    *, x_mm: float, rotate_deg: float = 4.0, stage_extension_enabled: bool = False, extended_mm: float = 0.0
+) -> tuple[Tool, list[str]]:
+    """A tool on a 0-600 mm X axis (rotation window 200-400 mm) whose motions append to `events`."""
+    events: list[str] = []
+    axes = {"x": x_mm, "rotate": rotate_deg, "stage": extended_mm, "z": extended_mm}
+
+    def motor(axis: str, *, log_moves: bool = True) -> AsyncMock:
+        m = AsyncMock()
+        m._is_homed = True
+        m.get_position = AsyncMock(side_effect=lambda: axes[axis])
+
+        async def move_to_position(mm: float, **_: object) -> None:
+            if log_moves:
+                events.append(f"{axis}:{mm}")
+            axes[axis] = float(mm)
+
+        m.move_to_position = AsyncMock(side_effect=move_to_position)
+        return m
+
+    tool = Tool.__new__(Tool)
+    tool._logger = Mock()
+    tool._params = SimpleNamespace(parameters=SimpleNamespace(
+        ROTATION_STAGE_MAX_EXTENSION_MM=0.5,
+        ROTATION_Z_MAX_EXTENSION_MM=0.5,
+    ))
+    tool._mx = motor("x")
+    tool._mx._params = SimpleNamespace(lim=600.0, lower_lim=0.0)
+    tool._mr = motor("rotate")
+    tool._ms = motor("stage", log_moves=False)
+    tool._ms._params = SimpleNamespace(
+        lim=50.0,
+        rotation_safe_stage_extension_enabled=stage_extension_enabled,
+        rotation_safe_stage_extension_mm=0.0,
+    )
+    tool._mg = motor("z", log_moves=False)
+    tool._handle_fault = AsyncMock()
+    tool.get_param = AsyncMock(side_effect=lambda name: {"ROTATION_FRONT": 4.0, "ROTATION_BACK": 184.0}[name])
+
+    async def retract_empty() -> None:
+        events.append("retract")
+        axes["stage"] = axes["z"] = 0.0
+
+    async def move(coordinate) -> None:
+        await tool._ensure_retracted()
+        events.append(f"move:{coordinate.x}")
+        axes["x"] = coordinate.x
+
+    tool.retract_empty = AsyncMock(side_effect=retract_empty)
+    tool.move = AsyncMock(side_effect=move)
+    tool.extend = AsyncMock()
+    tool.release = AsyncMock()
+    return tool, events
+
+
+@pytest.mark.asyncio
+async def test_place_turns_before_the_move_when_x_already_clears_the_uprights() -> None:
+    # The tool is still in its last cell; rotating there first must retract it, or the
+    # clearance check would fault where the old move-then-rotate order succeeded.
+    tool, events = _tool_for_place(x_mm=300.0, extended_mm=10.0)
+
+    await tool.place(AxisCoordinate(x=550.0, y=100.0, s=1))
+
+    assert events == ["retract", "rotate:184.0", "move:550.0", "retract"]
+    tool._handle_fault.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_place_turns_at_the_nearest_window_edge_instead_of_returning_from_the_target() -> None:
+    tool, events = _tool_for_place(x_mm=520.0)
+
+    await tool.place(AxisCoordinate(x=550.0, y=100.0, s=1))
+
+    assert events == ["x:400.0", "rotate:184.0", "move:550.0", "retract"]
+
+
+@pytest.mark.asyncio
+async def test_place_keeps_move_then_rotate_where_rotation_extends_the_stage() -> None:
+    # The stage reaches into the cell while turning, so its door must open first, at the cell.
+    tool, events = _tool_for_place(x_mm=300.0, stage_extension_enabled=True)
+
+    await tool.place(AxisCoordinate(x=550.0, y=100.0, s=1), before_approach=AsyncMock(
+        side_effect=lambda: events.append("open_door")
+    ))
+
+    assert events == ["move:550.0", "open_door", "x:400.0", "rotate:184.0", "x:550.0", "retract"]
+
+
+@pytest.mark.asyncio
+async def test_place_skips_rotation_and_its_x_clearance_moves_when_already_turned() -> None:
+    tool, events = _tool_for_place(x_mm=520.0, rotate_deg=184.0)
+
+    await tool.place(AxisCoordinate(x=550.0, y=100.0, s=1))
+
+    assert events == ["move:550.0", "retract"]
