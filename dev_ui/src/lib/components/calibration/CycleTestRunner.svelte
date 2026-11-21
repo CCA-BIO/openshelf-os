@@ -382,7 +382,7 @@
 						>
 							continue
 						</button>
-						<button type="button" onclick={didClickAbort} disabled={isActive === false || isRequesting}>
+						<button type="button" onclick={didClickAbort} disabled={isActive === false || snapshot?.aborting === true || isRequesting}>
 							abort
 						</button>
 					</div>

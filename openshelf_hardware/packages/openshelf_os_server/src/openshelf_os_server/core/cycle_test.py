@@ -162,6 +162,7 @@ class CycleTestSnapshot(BaseModel):
 	failures: int = Field(0, description="Cells that failed, across all loops")
 	cycle_avg_s: Optional[float] = Field(None, description="Mean duration of a succeeded cycle")
 	elapsed_s: float = Field(0.0, description="Run time so far; stops when the run ends")
+	aborting: bool = Field(False, description="Abort requested; the run stops after the current cell")
 	total: int = 0
 	current: Optional[str] = None
 	results: list[CellResult] = Field(default_factory=list, description="Cell results of the current loop")
@@ -846,6 +847,7 @@ class CycleTestManager:
 		if not self.is_active():
 			return False
 		self._abort = True
+		self.snapshot.aborting = True
 		self.log("Abort requested; stopping after the current cell")
 		self._continue.set()
 		return True

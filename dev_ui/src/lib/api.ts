@@ -532,6 +532,7 @@ export type CycleTestSnapshot = {
 	failures: number;
 	cycle_avg_s: number | null;
 	elapsed_s: number;
+	aborting: boolean;
 	total: number;
 	current: string | null;
 	results: CycleTestCellResult[];
