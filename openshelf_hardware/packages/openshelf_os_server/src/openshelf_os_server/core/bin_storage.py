@@ -10,7 +10,7 @@ import math
 from datetime import datetime, timezone
 
 
-from typing import Any, Callable, Optional, Protocol, Sequence, cast
+from typing import Any, Optional, Protocol, Sequence, cast
 
 
 from uuid import uuid4
@@ -41,7 +41,7 @@ from openshelf_os.robot.worker import (
 )
 
 
-from openshelf_os_server.core.manual_motion import get_manual_motion_operation
+from openshelf_os_server.core.manual_motion import _has_pending_commands, get_manual_motion_operation
 
 
 from openshelf_os_server.core.laser_auto_calibration import is_laser_auto_calibration_running
@@ -103,9 +103,10 @@ RESTART_INTERRUPTED_CODE = "command_interrupted"
 # cancelling the command leaves inventory as it was and no tray needs operator recovery. A
 # retrieve the worker refused up front (the gripper holds a tray, or the emergency stop is held)
 # never started either; a return refused the same way still has its tray in the IO box, so it is
-# not in this class.
-TRAY_NEVER_LEFT_CODES = {GRIP_PICK_FAILED_CODE, TRAY_ON_TOOL_CODE, EMERGENCY_STOP_CODE}
-REFUSED_BEFORE_START_CODES = {TRAY_ON_TOOL_CODE, EMERGENCY_STOP_CODE}
+# not in this class. The same holds for a command discarded behind a failed scheduled home.
+HOME_REQUIRED_CODE = "home_required"
+TRAY_NEVER_LEFT_CODES = {GRIP_PICK_FAILED_CODE, TRAY_ON_TOOL_CODE, EMERGENCY_STOP_CODE, HOME_REQUIRED_CODE}
+REFUSED_BEFORE_START_CODES = {TRAY_ON_TOOL_CODE, EMERGENCY_STOP_CODE, HOME_REQUIRED_CODE}
 
 logger = logging.getLogger(__name__)
 
@@ -131,17 +132,9 @@ async def ensure_worker_queue_empty_for_bin_start(worker: RobotWorker) -> None:
     if worker_state.get("_current_command") is not None:
         raise BinWorkflowConflict("The robot is busy with another task.")
 
-    command_queue = worker_state.get("_command_queue")
-    qsize = getattr(command_queue, "qsize", None)
-    if callable(qsize) is True:
-        try:
-            qsize_fn = cast(Callable[[], int], qsize)
-            if qsize_fn() > 0:
-                raise BinWorkflowConflict("The robot has other tasks waiting.")
-        except BinWorkflowConflict:
-            raise
-        except Exception:
-            pass
+    # A cycle held back for a due home is out of the queue but still tracked in _queued_commands.
+    if _has_pending_commands(worker_state):
+        raise BinWorkflowConflict("The robot has other tasks waiting.")
 
 
 async def is_io_box_occupied(worker: RobotWorker) -> bool:

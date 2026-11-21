@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -577,6 +578,35 @@ async def test_a_retrieve_refused_for_a_tray_on_the_tool_leaves_no_unfinished_mo
         assert await service.crash_interrupted_workflows() == []
         assert await service.has_unfinished_motion() is False
         assert (await service.item_bin(items[0].id)).id == trays[0].id
+
+
+@pytest.mark.anyio
+async def test_a_retrieve_discarded_behind_a_failed_scheduled_home_leaves_the_tray_home():
+    """The worker fails queued commands with home_required before starting them; the tray never left."""
+    async with AsyncSessionLocal() as db:
+        items, trays = await setup_trays(db)
+        service = BinStorageService(db)
+        w = await service.begin("retrieve", items[0], None)
+        await service.handle_robot_result(_motion_failure(w, "retrieve_item", "home_required"), FakeWorker())
+
+        assert w.state == "cancelled"
+        await db.refresh(trays[0])
+        assert trays[0].status == "at_home"
+        assert await service.has_unfinished_motion() is False
+
+
+@pytest.mark.anyio
+async def test_bin_start_refuses_while_a_cycle_is_held_out_of_the_queue():
+    """A cycle held for a due home is out of the queue but still tracked; a delivery behind it would hit an occupied IO box."""
+    worker = SimpleNamespace(
+        _current_command=None,
+        _current_operation=None,
+        _command_queue=asyncio.Queue(),
+        _queued_commands=[object()],
+    )
+
+    with pytest.raises(BinWorkflowConflict, match="other tasks waiting"):
+        await bin_storage.ensure_worker_queue_empty_for_bin_start(worker)
 
 
 @pytest.mark.anyio
