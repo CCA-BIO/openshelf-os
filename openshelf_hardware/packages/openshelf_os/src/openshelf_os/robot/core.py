@@ -1465,7 +1465,7 @@ class Robot:
         self.set_operation_context(phase="io_place.pick_from_shelf", target_coordinate=coord)
         await self._access_storage_cell("pick", coord, location, loaded=True)
         self.set_operation_context(phase="io_place.rotate_to_front")
-        await self._tool.rotate_to_position("front")
+        await self._tool.rotate_to_position("front", restore_x=False)
         # The door opens while the gantry approaches. The phase keeps its open_door name
         # for the whole step: the light curtain blocks motion during an opening door.
         self.set_operation_context(phase="io_place.open_door")
@@ -1510,7 +1510,7 @@ class Robot:
         # A store targets an available cell, so its tray comes off the shelf empty.
         await self._access_storage_cell("pick", coord, location, loaded=False)
         self.set_operation_context(phase="io_pick.rotate_to_front")
-        await self._tool.rotate_to_position("front")
+        await self._tool.rotate_to_position("front", restore_x=False)
         self.set_operation_context(phase="io_pick.open_door")
         await run_together(self._tool.move(AxisCoordinate(pph[0], pph[1])), self._io.open_door())
         self.set_operation_context(phase="io_pick.extend_into_io")
@@ -1568,7 +1568,7 @@ class Robot:
         self.set_operation_context(phase="deliver_tray.pick_from_shelf", target_coordinate=coord)
         await self._tool.pick(coord, loaded=True)
         self.set_operation_context(phase="deliver_tray.rotate_to_front")
-        await self._tool.rotate_to_position("front")
+        await self._tool.rotate_to_position("front", restore_x=False)
         self.set_operation_context(phase="deliver_tray.move_to_io")
         await self._tool.move(AxisCoordinate(position[0], position[1]))
         # A tray dropped on the way must not be reported as delivered; the door is still closed.
@@ -1599,7 +1599,7 @@ class Robot:
         self.set_operation_context(phase="return_tray.release")
         await self._set_tray_grip(engaged=False)
         self.set_operation_context(phase="return_tray.rotate_to_front")
-        await self._tool.rotate_to_position("front")
+        await self._tool.rotate_to_position("front", restore_x=False)
         self.set_operation_context(phase="return_tray.move_to_io")
         await self._tool.move(AxisCoordinate(position[0], position[1]))
         self.set_operation_context(phase="return_tray.open_door")
