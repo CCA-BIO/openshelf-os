@@ -127,8 +127,19 @@ async def test_rotate_to_position_restores_original_x_after_safe_edge_move() -> 
 
 
 @pytest.mark.asyncio
-async def test_rotate_to_position_refuses_unsafe_stage_clearance() -> None:
-    stage_motor = _mock_stage_motor(position=3.0)
+@pytest.mark.parametrize(
+    "position_mm, stage_extension_enabled, error",
+    [
+        pytest.param(3.0, False, "stage=3.000mm exceeds maximum 0.500mm", id="retract_interlock"),
+        # The rotation-safe extension guard must not let a stage still out in a cell turn.
+        pytest.param(30.0, True, "stage=30.000mm exceeds maximum 8.600mm", id="beyond_safe_extension"),
+    ],
+)
+async def test_rotate_to_position_refuses_unsafe_stage_clearance(
+    position_mm: float, stage_extension_enabled: bool, error: str
+) -> None:
+    stage_motor = _mock_stage_motor(position=position_mm)
+    stage_motor._params.rotation_safe_stage_extension_enabled = stage_extension_enabled
     rotate_motor = AsyncMock()
     rotate_motor.get_position = AsyncMock(return_value=2.0)
     rotate_motor.move_to_position = AsyncMock()
@@ -148,7 +159,7 @@ async def test_rotate_to_position_refuses_unsafe_stage_clearance() -> None:
         'ROTATION_BACK': 2.0,
     }[name])
 
-    with pytest.raises(MovementError, match="stage=3.000mm exceeds maximum 0.500mm"):
+    with pytest.raises(MovementError, match=error):
         await tool.rotate_to_position("front")
 
     rotate_motor.move_to_position.assert_not_awaited()
@@ -462,3 +473,12 @@ async def test_place_keeps_move_then_rotate_where_rotation_extends_the_stage() -
     ))
 
     assert events == ["move:550.0", "open_door", "x:400.0", "rotate:184.0", "x:550.0", "retract"]
+
+
+@pytest.mark.asyncio
+async def test_place_skips_rotation_and_its_x_clearance_moves_when_already_turned() -> None:
+    tool, events = _tool_for_place(x_mm=520.0, rotate_deg=184.0)
+
+    await tool.place(AxisCoordinate(x=550.0, y=100.0, s=1))
+
+    assert events == ["move:550.0", "retract"]

@@ -1286,11 +1286,24 @@ class Tool:
                         f"{maximum_stage_mm:.3f}mm"
                     )
             elif stage_extension_enabled is True:
+                # The rotation-safe extension is the only extended stage a turn allows.
                 minimum_stage_mm = float(self._ms._params.rotation_safe_stage_extension_mm)
+                maximum_stage_mm = max(
+                    minimum_stage_mm + SETTLED_ON_TARGET_TOLERANCE_MM,
+                    self._get_float_param(
+                        "ROTATION_STAGE_MAX_EXTENSION_MM",
+                        DEFAULT_ROTATION_STAGE_MAX_EXTENSION_MM,
+                    ),
+                )
                 if stage_position < minimum_stage_mm:
                     unsafe.append(
                         f"stage={stage_position:.3f}mm is below required "
                         f"{minimum_stage_mm:.3f}mm"
+                    )
+                elif stage_position > maximum_stage_mm:
+                    unsafe.append(
+                        f"stage={stage_position:.3f}mm exceeds maximum "
+                        f"{maximum_stage_mm:.3f}mm"
                     )
             else:
                 maximum_stage_mm = self._get_float_param(
