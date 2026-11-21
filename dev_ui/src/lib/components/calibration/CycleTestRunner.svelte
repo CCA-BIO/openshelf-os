@@ -37,11 +37,18 @@
 	let snapshot = $state<CycleTestSnapshot | null>(null);
 	let stream: ReconnectingEventSource | null = null;
 	let isRequesting = $state<boolean>(false);
+	let receivedAt = $state<number>(0);
+	let now = $state<number>(0);
+	let clock: ReturnType<typeof setInterval> | null = null;
 
 	const isActive = $derived(snapshot?.state === 'running' || snapshot?.state === 'paused');
 	const passedCount = $derived(snapshot?.results.filter((result) => result.passed).length ?? 0);
 	const doneCount = $derived(
 		snapshot?.results.filter((result) => result.cell !== snapshot?.current).length ?? 0
+	);
+	// No snapshot arrives while a robot command runs, so the elapsed time ticks locally from the last one.
+	const elapsedS = $derived(
+		snapshot === null ? 0 : snapshot.elapsed_s + (isActive ? Math.max(0, now - receivedAt) / 1000 : 0)
 	);
 	const failedResult = $derived(snapshot?.results.find((result) => result.passed === false && result.cell !== snapshot?.current) ?? null);
 
@@ -53,7 +60,10 @@
 		restoreConfig();
 		void didLoad();
 
-		return closeStream;
+		return function () {
+			closeStream();
+			stopClock();
+		};
 	});
 
 	async function didLoad(): Promise<void> {
@@ -68,6 +78,8 @@
 		const wasActive = snapshot?.state === 'running' || snapshot?.state === 'paused';
 
 		snapshot = next;
+		receivedAt = Date.now();
+		now = receivedAt;
 
 		if (wasActive === true && next.state === 'failed') {
 			postToast('error', describeFailure(next));
@@ -75,9 +87,38 @@
 
 		if (next.state === 'running' || next.state === 'paused') {
 			openStream();
+			startClock();
 		} else {
 			closeStream();
+			stopClock();
 		}
+	}
+
+	function startClock(): void {
+		if (clock !== null) {
+			return;
+		}
+
+		clock = setInterval(function () {
+			now = Date.now();
+		}, 1000);
+	}
+
+	function stopClock(): void {
+		if (clock !== null) {
+			clearInterval(clock);
+		}
+
+		clock = null;
+	}
+
+	function formatDuration(seconds: number): string {
+		const total = Math.floor(seconds);
+		const hours = Math.floor(total / 3600);
+		const minutes = Math.floor((total % 3600) / 60);
+		const rest = String(total % 60).padStart(2, '0');
+
+		return hours > 0 ? `${hours}:${String(minutes).padStart(2, '0')}:${rest}` : `${minutes}:${rest}`;
 	}
 
 	function describeFailure(run: CycleTestSnapshot): string {
@@ -395,6 +436,42 @@
 					<tr>
 						<td>error</td>
 						<td class="fail">{snapshot.error}</td>
+					</tr>
+				{/if}
+			</tbody>
+		</table>
+	</div>
+{/if}
+
+{#if snapshot !== null && snapshot.run_id !== null}
+	<div class="scroll-x cycle-test">
+		<table>
+			<thead>
+				<tr>
+					<th colspan="2">test statistics</th>
+				</tr>
+			</thead>
+			<tbody>
+				<tr>
+					<td>loops completed</td>
+					<td>{snapshot.loops_passed}</td>
+				</tr>
+				<tr>
+					<td>cycles completed</td>
+					<td>{snapshot.cycles}</td>
+				</tr>
+				<tr>
+					<td>failures</td>
+					<td class:fail={snapshot.failures > 0}>{snapshot.failures}</td>
+				</tr>
+				<tr>
+					<td>elapsed</td>
+					<td>{formatDuration(elapsedS)}</td>
+				</tr>
+				{#if snapshot.cycle_avg_s !== null}
+					<tr>
+						<td>avg cycle</td>
+						<td>{snapshot.cycle_avg_s.toFixed(1)} s</td>
 					</tr>
 				{/if}
 			</tbody>
