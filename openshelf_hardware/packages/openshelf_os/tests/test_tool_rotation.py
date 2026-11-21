@@ -439,6 +439,8 @@ def _tool_for_place(
     tool.move = AsyncMock(side_effect=move)
     tool.extend = AsyncMock()
     tool.release = AsyncMock()
+    tool.is_grip_detection_enabled = False
+    tool._gs = SimpleNamespace(read_state=AsyncMock())
     return tool, events
 
 
