@@ -421,37 +421,6 @@
 						<td>{snapshot.total - doneCount}</td>
 					</tr>
 				{/if}
-				{#if failedResult !== null}
-					<tr>
-						<td>failed</td>
-						<td class="fail">{failedResult.cell}{failedResult.error !== null ? `: ${failedResult.error}` : ''}</td>
-					</tr>
-				{/if}
-				{#if snapshot.hardware_fault !== null}
-					<tr>
-						<td>hardware fault</td>
-						<td class="fail">{snapshot.hardware_fault}</td>
-					</tr>
-				{:else if snapshot.error !== null}
-					<tr>
-						<td>error</td>
-						<td class="fail">{snapshot.error}</td>
-					</tr>
-				{/if}
-			</tbody>
-		</table>
-	</div>
-{/if}
-
-{#if snapshot !== null && snapshot.run_id !== null}
-	<div class="scroll-x cycle-test">
-		<table>
-			<thead>
-				<tr>
-					<th colspan="2">test statistics</th>
-				</tr>
-			</thead>
-			<tbody>
 				<tr>
 					<td>loops completed</td>
 					<td>{snapshot.loops_passed}</td>
@@ -472,6 +441,23 @@
 					<tr>
 						<td>avg cycle</td>
 						<td>{snapshot.cycle_avg_s.toFixed(1)} s</td>
+					</tr>
+				{/if}
+				{#if failedResult !== null}
+					<tr>
+						<td>failed</td>
+						<td class="fail">{failedResult.cell}{failedResult.error !== null ? `: ${failedResult.error}` : ''}</td>
+					</tr>
+				{/if}
+				{#if snapshot.hardware_fault !== null}
+					<tr>
+						<td>hardware fault</td>
+						<td class="fail">{snapshot.hardware_fault}</td>
+					</tr>
+				{:else if snapshot.error !== null}
+					<tr>
+						<td>error</td>
+						<td class="fail">{snapshot.error}</td>
 					</tr>
 				{/if}
 			</tbody>
