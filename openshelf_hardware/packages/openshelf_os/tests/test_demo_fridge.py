@@ -660,6 +660,8 @@ async def test_tool_place_opens_door_before_rotation_and_extension() -> None:
     tool.extend = AsyncMock(side_effect=lambda *_args, **_kwargs: events.append("extend"))
     tool.retract_empty = AsyncMock(side_effect=lambda: events.append("retract"))
     tool._handle_fault = AsyncMock()
+    tool.is_grip_detection_enabled = True
+    tool._gs = SimpleNamespace(read_state=AsyncMock(return_value=GripState(0x71, 0, 0x90, 0x40)))
 
     async def before_approach() -> None:
         events.append("open_door")

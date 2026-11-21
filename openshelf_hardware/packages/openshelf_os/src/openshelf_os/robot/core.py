@@ -1470,6 +1470,9 @@ class Robot:
         # for the whole step: the light curtain blocks motion during an opening door.
         self.set_operation_context(phase="io_place.open_door")
         await run_together(self._tool.move(AxisCoordinate(ppl[0], ppl[1])), self._io.open_door())
+        # A tray lost between shelf and IO box would otherwise surface only after the transfer,
+        # reported as left in the IO box.
+        await self._require_tray_held("io place arrival", GRIP_DROPPED_CODE)
         self.set_operation_context(phase="io_place.extend_into_io", nudge_override=nudge_override)
         await self._tool.extend_IO(nudge_override=nudge_override, loaded=True)
         self.set_operation_context(phase="io_place.y_axis_transfer")
