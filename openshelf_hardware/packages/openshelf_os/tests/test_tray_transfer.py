@@ -282,3 +282,42 @@ async def test_io_cycles_stage_z_only_while_a_tray_may_carry_an_item(cycle, flag
     await getattr(robot, cycle)(AxisCoordinate(10, 20))
     for step, loaded in flags.items():
         assert getattr(robot._tool, step).await_args.kwargs["loaded"] is loaded, step
+
+
+@pytest.mark.asyncio
+async def test_grip_watch_samples_only_while_a_held_tray_is_out_and_never_interrupts(monkeypatch, caplog):
+    # Shadow mode: it reports a lost grip but must not raise into motion, and must stop polling
+    # the shared motor bus once Z is back in.
+    import logging
+    import openshelf_os.tool as tool_module
+    from openshelf_os.tool import Tool
+
+    monkeypatch.setattr(tool_module, 'GRIP_WATCH_INTERVAL_S', 0.01)
+    tool = Tool.__new__(Tool)
+    tool.is_grip_detection_enabled = True
+    tool._logger = logging.getLogger('test_grip_watch')
+    reads = iter([TOUCHING, OSError('bus timeout'), EMPTY, EMPTY])
+
+    def next_read():
+        read = next(reads, EMPTY)
+        if isinstance(read, Exception):
+            raise read
+        return read
+
+    tool._gs = SimpleNamespace(holding=False, read_state=AsyncMock(side_effect=next_read))
+
+    with caplog.at_level(logging.INFO, logger='test_grip_watch'):
+        tool._mark_z_out(True)
+        await asyncio.sleep(0.05)
+        tool._gs.read_state.assert_not_awaited()  # Z out but nothing held yet
+        tool._gs.holding = True
+        await asyncio.sleep(0.08)
+        tool._mark_z_out(False)
+        await asyncio.wait_for(tool._grip_watch_task, 1)
+
+    reads_at_retract = tool._gs.read_state.await_count
+    await asyncio.sleep(0.05)
+    assert tool._gs.read_state.await_count == reads_at_retract
+    assert any(r.getMessage() == 'grip_watch_would_trip' for r in caplog.records)
+    window = next(r for r in caplog.records if r.getMessage() == 'grip_watch_window')
+    assert window.read_errors == 1 and window.not_gripped >= 2

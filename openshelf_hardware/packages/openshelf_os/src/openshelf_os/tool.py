@@ -24,6 +24,11 @@ GANTRY_WAIT_TIMEOUT = MOTOR_WAIT_TIMEOUT * 2
 TOOL_WAIT_TIMEOUT = MOTOR_WAIT_TIMEOUT * 2
 GANTRY_OUTER_TIMEOUT = 120.0
 TOOL_OUTER_TIMEOUT = 60.0
+# Shadow mode: while Z is out with a tray gripped, sample the gripper and log what a drop watch
+# would see (non-gripped samples, read latency) without stopping motion. Enforcement waits for
+# false-trip and bus-load numbers from a cycle-test run on hardware.
+GRIP_WATCH_INTERVAL_S = 0.1
+GRIP_WATCH_TRIP_SAMPLES = 2
 ROTATION_SAFE_X_MARGIN_MM = 200.0
 # The clearance move lands on the window edge; encoder reads settle a few hundredths either side.
 ROTATION_SAFE_X_TOLERANCE_MM = 1.0
@@ -1408,6 +1413,7 @@ class Tool:
     ) -> None:
         """Extend stage and Z. A tray that may carry an item reaches its stage pose before Z
         pushes it in, so no gap opens under the item; an empty tool or tray moves both at once."""
+        self._mark_z_out(True)
         if loaded:
             await self._ms.move_to_position(slide_ext)
             await self._mg.move_to_position(grip_ext, rpm=grip_rpm, accel=grip_accel)
@@ -1533,6 +1539,7 @@ class Tool:
             grip_ext = self._with_gripper_offset(grip_ext, coordinate)
 
             await self._ms.ready()
+            self._mark_z_out(True)
             await self._ms.move_to_position_no_wait(slide_ext)
             await self._mg.move_to_position_no_wait(grip_ext, rpm=grip_rpm, accel=grip_accel)
             await self.tool_wait(homing=False)
@@ -1610,6 +1617,58 @@ class Tool:
             await z_retract()
             await stage_retract()
         await self._ms.idle()
+        self._mark_z_out(False)
+
+    def _mark_z_out(self, z_out: bool) -> None:
+        self._z_out = z_out
+        if z_out is False or getattr(self, "is_grip_detection_enabled", False) is not True:
+            return
+        task = getattr(self, "_grip_watch_task", None)
+        if task is None or task.done():
+            self._grip_watch_task = asyncio.get_running_loop().create_task(self._grip_watch(), name="grip-watch")
+
+    async def _grip_watch(self) -> None:
+        """Sample the grip while Z is out and a tray is held; one summary line per window."""
+        samples = not_gripped = read_errors = streak = 0
+        latencies: list[float] = []
+        first_not_gripped: Optional[str] = None
+        would_trip = False
+        try:
+            while getattr(self, "_z_out", False) is True:
+                if self._gs.holding is True:
+                    started = time.monotonic()
+                    try:
+                        state = await self._gs.read_state()
+                    except Exception:
+                        # A missing sample, never a trip.
+                        read_errors += 1
+                    else:
+                        latencies.append(time.monotonic() - started)
+                        samples += 1
+                        if state.gripped:
+                            streak = 0
+                        else:
+                            not_gripped += 1
+                            streak += 1
+                            first_not_gripped = first_not_gripped or str(state)
+                            if streak >= GRIP_WATCH_TRIP_SAMPLES and would_trip is False:
+                                would_trip = True
+                                self._logger.warning("grip_watch_would_trip", extra={"grip_state": str(state)})
+                await asyncio.sleep(GRIP_WATCH_INTERVAL_S)
+        finally:
+            if samples > 0 or read_errors > 0:
+                self._logger.info(
+                    "grip_watch_window",
+                    extra={
+                        "samples": samples,
+                        "not_gripped": not_gripped,
+                        "read_errors": read_errors,
+                        "would_trip": would_trip,
+                        "first_not_gripped": first_not_gripped,
+                        "latency_ms_avg": round(1000 * sum(latencies) / len(latencies), 1) if latencies else None,
+                        "latency_ms_max": round(1000 * max(latencies), 1) if latencies else None,
+                    },
+                )
 
     async def is_fully_retracted(self, *, tolerance_mm: float = 1.0) -> bool:
         """Return whether stage and Z are at their configured retract targets."""
@@ -1953,6 +2012,8 @@ class Tool:
         y_pre_home_clearance_mm: Optional[float] = None,
         axes: Optional[Sequence[str]] = None,
     ) -> None:
+        # Homing retracts Z; a watch left running by a failed retract ends here.
+        self._mark_z_out(False)
         if isolate is False:
             try:
                 await self._home_sequence(
