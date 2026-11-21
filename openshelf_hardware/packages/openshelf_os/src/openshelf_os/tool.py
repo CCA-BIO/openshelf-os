@@ -801,6 +801,8 @@ class Tool:
             if before_approach is not None:
                 await before_approach()
             await self.rotate_to_position(target_position)
+            # A tray lost on the way would pass the release check and read as placed.
+            require_grip(await self._gs.read_state(), "place arrival", is_enabled=self.is_grip_detection_enabled)
             await self.extend(coordinate, loaded=loaded, stage_extension_mm=stage_extension_mm)
             await self.release("place release")
             await self.retract_empty()

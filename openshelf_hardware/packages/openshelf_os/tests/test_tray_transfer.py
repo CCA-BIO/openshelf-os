@@ -89,7 +89,7 @@ async def test_place_does_not_withdraw_while_the_gripper_still_touches_the_tray(
 
     tool = Tool.__new__(Tool)
     tool.is_grip_detection_enabled = True
-    tool._gs = SimpleNamespace(close=AsyncMock(return_value=TOUCHING))
+    tool._gs = SimpleNamespace(close=AsyncMock(return_value=TOUCHING), read_state=AsyncMock(return_value=TOUCHING))
     for name in ('move', 'rotate_to_position', 'extend', 'retract_empty', '_handle_fault'):
         setattr(tool, name, AsyncMock())
 
@@ -155,7 +155,8 @@ async def test_io_cycle_left_without_its_tray_stops_before_the_door_closes(cycle
     robot, ops = build_robot()
     robot._tool._my = SimpleNamespace(move_to_position=AsyncMock())
     robot._tool.extend_IO = robot._tool.extend = AsyncMock()
-    robot._tool._gs.read_state.return_value = EMPTY
+    # io_place checks the tray on arrival at the IO box too; it is still held there.
+    robot._tool._gs.read_state.side_effect = [TOUCHING, EMPTY] if cycle == 'io_place' else [EMPTY]
 
     with pytest.raises(GripperError) as raised:
         await getattr(robot, cycle)(AxisCoordinate(10, 20))
@@ -164,6 +165,62 @@ async def test_io_cycle_left_without_its_tray_stops_before_the_door_closes(cycle
     assert raised.value.failure_code == GRIP_IO_BOX_FAILED_CODE
     assert call.close_door() not in ops.mock_calls
     robot._tool.place.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_place_stops_before_extending_when_the_tray_was_lost_on_the_way():
+    # The release check alone passes with nothing in the fingers, so a store whose tray fell on
+    # the way back from the IO box would be recorded in a cell it never reached.
+    from openshelf_os.exceptions import GRIP_DROPPED_CODE
+    from openshelf_os.tool import Tool
+
+    tool = Tool.__new__(Tool)
+    tool.is_grip_detection_enabled = True
+    tool._gs = SimpleNamespace(read_state=AsyncMock(return_value=EMPTY), close=AsyncMock(return_value=EMPTY))
+    for name in ('move', 'rotate_to_position', 'extend', 'retract_empty', '_handle_fault'):
+        setattr(tool, name, AsyncMock())
+
+    with pytest.raises(GripVerificationError) as raised:
+        await tool.place(AxisCoordinate(10, 20))
+
+    assert raised.value.failure_code == GRIP_DROPPED_CODE
+    tool.extend.assert_not_awaited()
+    tool._gs.close.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_io_place_tray_lost_on_the_way_stops_before_extending_into_the_io_box():
+    from openshelf_os.exceptions import GRIP_DROPPED_CODE
+
+    robot, ops = build_robot()
+    robot._tool._my = SimpleNamespace(move_to_position=AsyncMock())
+    robot._tool.extend_IO = AsyncMock()
+    robot._tool._gs.read_state.return_value = EMPTY
+
+    with pytest.raises(GripperError) as raised:
+        await robot.io_place(AxisCoordinate(10, 20))
+
+    # Lost between shelf and IO box, not left in the IO box by a failed transfer.
+    assert raised.value.failure_code == GRIP_DROPPED_CODE
+    robot._tool.extend_IO.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_retrieve_with_its_tray_dropped_on_the_way_back_keeps_the_item_in_its_cell():
+    # The crash dialog asks for the tray back on its shelf, and the item goes back with it.
+    robot = Robot.__new__(Robot)
+    robot._operation_context = {}
+    robot._state = SimpleNamespace()
+    robot._grid = Mock()
+    robot._demo_cell_map = None
+    robot._fridge = None
+    robot._capture_fault_context = Mock()
+    robot.io_place = AsyncMock(side_effect=GripVerificationError("No grip on place arrival"))
+
+    with pytest.raises(GripVerificationError):
+        await robot.retrieve_by_location({"side": "front_module", "shelf_idx": 1, "cell_idx": 2}, "880000000001")
+
+    robot._grid.clear_item.assert_not_called()
 
 
 def build_retract_tool(events):
