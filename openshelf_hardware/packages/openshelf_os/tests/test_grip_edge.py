@@ -50,6 +50,10 @@ class FakeGripTool:
 	async def rotate_to_position(self, position) -> None:
 		pass
 
+	async def move_facing(self, coordinate, position) -> None:
+		await self.move(coordinate)
+		await self.rotate_to_position(position)
+
 
 @pytest.mark.asyncio
 async def test_grip_edge_ignores_a_stray_grip_and_refines_to_the_first_steady_one() -> None:

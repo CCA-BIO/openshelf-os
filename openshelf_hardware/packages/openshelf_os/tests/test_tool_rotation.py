@@ -484,3 +484,72 @@ async def test_place_skips_rotation_and_its_x_clearance_moves_when_already_turne
     await tool.place(AxisCoordinate(x=550.0, y=100.0, s=1))
 
     assert events == ["move:550.0", "retract"]
+
+
+@pytest.mark.asyncio
+async def test_gripper_probe_turns_in_the_window_before_moving_to_a_low_x_cell(monkeypatch) -> None:
+    # Gripper open calibration: from a front cell inside the window to a back cell at low X.
+    from openshelf_os.laser_calibration import grip_edge
+
+    tool, events = _tool_for_place(x_mm=300.0)
+    tool._gs.safe_open = AsyncMock()
+    monkeypatch.setattr(grip_edge, "probe_grip_at", AsyncMock(return_value="gripped"))
+
+    await grip_edge.probe_cell(tool, AxisCoordinate(x=50.0, y=100.0, s=1, z_offset=12.0))
+
+    assert events == ["rotate:184.0", "move:50.0"]
+    tool._handle_fault.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_gripper_probe_turns_at_the_window_edge_nearest_a_low_x_start(monkeypatch) -> None:
+    from openshelf_os.laser_calibration import grip_edge
+
+    tool, events = _tool_for_place(x_mm=60.0)
+    tool._gs.safe_open = AsyncMock()
+    monkeypatch.setattr(grip_edge, "probe_grip_at", AsyncMock(return_value="gripped"))
+
+    await grip_edge.probe_cell(tool, AxisCoordinate(x=50.0, y=100.0, s=1, z_offset=12.0))
+
+    assert events == ["x:200.0", "rotate:184.0", "move:50.0"]
+
+
+@pytest.mark.asyncio
+async def test_back_scan_entry_turns_at_the_scan_x_instead_of_a_fixed_mid_rail_stop(monkeypatch) -> None:
+    from openshelf_os.laser_calibration import motion
+    from openshelf_os.storage import StorageModuleSide
+
+    tool, events = _tool_for_place(x_mm=100.0)
+    params = {"ROTATION_FRONT": 4.0, "ROTATION_BACK": 184.0, "Z_MOVE_RPM": 100, "Z_MOVE_ACCEL": 1000}
+    tool.get_param = AsyncMock(side_effect=lambda name: params.get(name))
+    tool.retract = AsyncMock()
+    monkeypatch.setattr(motion, "ensure_scan_tool_ready", AsyncMock())
+    monkeypatch.setattr(motion, "get_scan_position", AsyncMock(return_value=(300.0, 50.0)))
+    monkeypatch.setattr(motion, "get_laser_scan_pose_stage_mm", lambda _config: 0.0)
+    monkeypatch.setattr(motion, "get_laser_scan_z_extension_mm", AsyncMock(return_value=0.0))
+
+    await motion.enter_scan_mode(tool, StorageModuleSide.BACK, scan_config=None)
+
+    assert events == ["move:300.0", "rotate:184.0"]
+
+
+@pytest.mark.asyncio
+async def test_angle_sweep_turns_in_place_when_the_capture_x_is_inside_the_rotation_window() -> None:
+    from openshelf_os.laser_calibration.angle.capture import prepare_capture_pose
+
+    tool, events = _tool_for_place(x_mm=300.0, rotate_deg=184.0)
+
+    async def gantry_x(mm: float, **_: object) -> None:
+        events.append(f"gantry:{mm}")
+
+    tool._mx.move_to_position_no_wait = AsyncMock(side_effect=gantry_x)
+    tool._my = AsyncMock()
+    tool.gantry_wait = AsyncMock()
+
+    await prepare_capture_pose(
+        tool, side_name="back", side_number=1, x_mm=300.0, y_mm=50.0, absolute_rotation_deg=186.0,
+        stage_extension_mm=0.0, z_mm=0.0, z_move_rpm=100.0, z_move_accel=1000.0,
+        should_rotate=True, should_use_safe_back_rotation_path=True, should_move_z=False,
+    )
+
+    assert events == ["rotate:186.0", "gantry:300.0"]
