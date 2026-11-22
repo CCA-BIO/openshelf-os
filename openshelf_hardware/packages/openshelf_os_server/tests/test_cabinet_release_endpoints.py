@@ -75,14 +75,15 @@ def _mock_worker():
 
 
 @pytest.mark.anyio
-async def test_release_cabinet_latches_rejects_safety_interruption(client: AsyncClient) -> None:
+async def test_release_cabinet_latches_during_safety_interruption(client: AsyncClient) -> None:
+	# Stop recovery opens the doors again after the interruption latched; the interlock still holds motion.
 	worker = _mock_worker()
 	worker._safety_motion_blocked = True
+	worker._awaiting_safety_ack = True
 
 	with patch("openshelf_os_server.routers.cabinet.get_settings", return_value=_mock_settings()):
 		with patch("openshelf_os_server.routers.cabinet.get_robot_worker", return_value=worker):
 			response = await client.post("/api/cabinet/release?action=release")
 
-	assert response.status_code == 409
-	assert response.json()["detail"]["reason"] == "safety_interruption"
-	worker._robot._cabinet.release.assert_not_awaited()
+	assert response.status_code == 200
+	worker._robot._cabinet.release.assert_awaited_once()

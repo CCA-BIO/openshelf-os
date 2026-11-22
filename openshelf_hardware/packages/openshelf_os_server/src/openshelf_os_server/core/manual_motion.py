@@ -48,7 +48,12 @@ def _has_pending_commands(worker_state: dict[str, Any]) -> bool:
 	return any(operation is not current_operation for operation in queued_commands)
 
 
-def ensure_robot_available_for_manual_motion(worker, *, allow_safety_interruption: bool = False) -> None:
+def ensure_robot_available_for_manual_motion(
+	worker,
+	*,
+	allow_safety_interruption: bool = False,
+	allow_doors_interruption: bool = False,
+) -> None:
 	worker_state = cast(dict[str, Any], getattr(worker, "__dict__", {}))
 	current_command = worker_state.get("_current_command")
 	is_demo_cycling = worker_state.get("_demo_cycling", False)
@@ -62,7 +67,14 @@ def ensure_robot_available_for_manual_motion(worker, *, allow_safety_interruptio
 		)
 	)
 
-	if is_safety_blocking is True and allow_safety_interruption is False:
+	is_doors_only = all(
+		source == "cabinet_doors" for source in worker_state.get("_safety_active_sources") or []
+	)
+	if (
+		is_safety_blocking is True
+		and allow_safety_interruption is False
+		and (allow_doors_interruption is False or is_doors_only is False)
+	):
 		raise HTTPException(
 			status_code=status.HTTP_409_CONFLICT,
 			detail=_conflict_detail(
@@ -121,14 +133,22 @@ async def manual_motion_guard(
 	worker=None,
 	*,
 	allow_tray_on_tool: bool = False,
+	allow_doors_interruption: bool = False,
 ) -> AsyncIterator[None]:
 	"""allow_tray_on_tool admits the actions that recover a held tray: single-motor moves and the IO door
 	from the debug motor controls, release, homing, clearing alarms, power cycling, probing and unlocking
-	the cabinet. Calibration moves and jogs and automated sequences stay blocked."""
+	the cabinet. Calibration moves and jogs and automated sequences stay blocked.
+
+	allow_doors_interruption admits actions that move no gantry axis while the open cabinet doors
+	hold the interlock: the stop recovery unlocks the cabinet and opens the gripper fingers with the
+	doors open, so the operator can support the tray. Any other active source, or a running or
+	queued command, still refuses them."""
 	global _current_operation
 
 	if worker is not None:
-		ensure_robot_available_for_manual_motion(worker)
+		ensure_robot_available_for_manual_motion(
+			worker, allow_doors_interruption=allow_doors_interruption
+		)
 
 	if _motion_lock.locked() is True and _should_wait_for_probe(operation) is not True:
 		raise HTTPException(
@@ -143,7 +163,9 @@ async def manual_motion_guard(
 
 	try:
 		if worker is not None:
-			ensure_robot_available_for_manual_motion(worker)
+			ensure_robot_available_for_manual_motion(
+				worker, allow_doors_interruption=allow_doors_interruption
+			)
 			if allow_tray_on_tool is False:
 				await ensure_no_tray_on_tool(worker)
 

@@ -1283,7 +1283,12 @@ async def control_gripper(
     """
     await _ensure_laser_auto_calibration_not_running()
 
-    async with manual_motion_guard(f"gripper:{state}", worker=worker, allow_tray_on_tool=True):
+    async with manual_motion_guard(
+        f"gripper:{state}",
+        worker=worker,
+        allow_tray_on_tool=True,
+        allow_doors_interruption=state == "release",
+    ):
         if state == "release":
             await worker.release_gripper()
         else:
