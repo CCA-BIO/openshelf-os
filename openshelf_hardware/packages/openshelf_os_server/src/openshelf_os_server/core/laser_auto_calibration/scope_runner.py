@@ -367,16 +367,10 @@ class ScopeRunnerMixin:
         worker: RobotWorker,
         requested_scope: LaserAutoCalibrationScope,
     ) -> None:
-        scan_config = get_root_config().robot.grid.scan
-        front_bounds = _build_bounds_for_side(scan_config, StorageModuleSide.FRONT)
-        back_bounds = _build_bounds_for_side(scan_config, StorageModuleSide.BACK)
-
         if requested_scope.mode in ("all", "both"):
             await self._run_all_sides(
                 worker,
                 include_gripper_calibration=requested_scope.include_gripper_calibration,
-                front_bounds=front_bounds,
-                back_bounds=back_bounds,
             )
 
             return
@@ -425,8 +419,6 @@ class ScopeRunnerMixin:
         worker: RobotWorker,
         *,
         include_gripper_calibration: bool = False,
-        front_bounds: ScanBounds | None = None,
-        back_bounds: ScanBounds | None = None,
     ) -> None:
         if include_gripper_calibration is True:
             # Before the grip-edge sweep: a wrong open position gives the datum no grip there,
@@ -436,8 +428,8 @@ class ScopeRunnerMixin:
             )
 
         completed_results = [
-            await self._run_side(worker, StorageModuleSide.BACK, back_bounds),
-            await self._run_side(worker, StorageModuleSide.FRONT, front_bounds),
+            await self._run_side(worker, StorageModuleSide.BACK),
+            await self._run_side(worker, StorageModuleSide.FRONT),
         ]
         await self._persist_completed_results(worker, completed_results)
 
@@ -597,10 +589,8 @@ class ScopeRunnerMixin:
         self,
         worker: RobotWorker,
         side: StorageModuleSide,
-        bounds: ScanBounds | None = None,
     ) -> _CompletedSideResult:
-        if bounds is None:
-            bounds = _build_bounds_for_side(get_root_config().robot.grid.scan, side)
+        bounds = _build_bounds_for_side(get_root_config().robot.grid.scan, side)
         analysis = await self._run_scan_analysis(worker, side, bounds)
 
-        return _CompletedSideResult(side=side, bounds=bounds, analysis=analysis)
+        return _CompletedSideResult(side=side, analysis=analysis)

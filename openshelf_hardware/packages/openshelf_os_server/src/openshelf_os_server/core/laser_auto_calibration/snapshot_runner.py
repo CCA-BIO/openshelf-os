@@ -50,9 +50,6 @@ class SnapshotRunnerMixin:
     def _read_json(self, path: Path) -> dict[str, Any]:
         return __import__("json").loads(path.read_text(encoding="utf-8"))
 
-    def _should_preserve_cancelling_snapshot(self) -> bool:
-        return self._abort_requested is True or self._snapshot.current_stage == "cancelling"
-
     def _should_abort_work(self) -> bool:
         return self._abort_requested is True or self._snapshot.current_stage == "cancelling"
 
@@ -65,7 +62,7 @@ class SnapshotRunnerMixin:
 
     def _build_scan_status_callback(self, side_name: StorageModuleSideName, recorder: Any, bounds: ScanBounds):
         async def did_receive_status(message: str) -> None:
-            if self._should_preserve_cancelling_snapshot() is True or self._should_ignore_status_update() is True:
+            if self._should_abort_work() is True or self._should_ignore_status_update() is True:
                 return
 
             current_stage = self._snapshot.current_stage
@@ -133,28 +130,22 @@ class SnapshotRunnerMixin:
         return did_receive_status
 
     @asynccontextmanager
-    async def _patch_status_callbacks(self, scan_callback=None):
+    async def _patch_status_callbacks(self, scan_callback):
         original_scan_print = laser_module.print_status
         pending_task: asyncio.Task[None] | None = None
 
-        def didSchedule(callback: Any, message: str) -> None:
+        def did_print_scan(message: str) -> None:
             nonlocal pending_task
-
+            original_scan_print(message)
             previous_task = pending_task
 
             async def didRunCallback() -> None:
                 if previous_task is not None:
                     await previous_task
 
-                await callback(message)
+                await scan_callback(message)
 
             pending_task = asyncio.create_task(didRunCallback())
-
-        def did_print_scan(message: str) -> None:
-            original_scan_print(message)
-
-            if scan_callback is not None:
-                didSchedule(scan_callback, message)
 
         laser_module.print_status = did_print_scan
 

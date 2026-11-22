@@ -1,15 +1,11 @@
 from __future__ import annotations
 
-import argparse
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import logging
-import math
-from pathlib import Path
 import re
 from typing import Any, Literal
-from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
@@ -20,7 +16,7 @@ from openshelf_os.storage import StorageModuleSide
 from openshelf_os.robot.worker import RobotWorker
 from openshelf_os.runtime_state import RuntimeStatePaths, paths_for_config_file
 
-from openshelf_os_server.settings import clear_config_cache, get_config_path, get_root_config, save_root_config
+from openshelf_os_server.settings import get_config_path, get_root_config, save_root_config
 from openshelf_os_server.core.storage_module import StorageModuleSideName
 
 logger = logging.getLogger(__name__)
@@ -195,7 +191,6 @@ class _SideState:
 @dataclass
 class _CompletedSideResult:
     side: StorageModuleSide
-    bounds: ScanBounds
     analysis: Any
 
 
@@ -343,7 +338,6 @@ __all__ = [
     "StorageModuleSide",
     "StorageModuleSideName",
     "RobotWorker",
-    "clear_config_cache",
     "get_config_path",
     "get_root_config",
     "save_root_config",

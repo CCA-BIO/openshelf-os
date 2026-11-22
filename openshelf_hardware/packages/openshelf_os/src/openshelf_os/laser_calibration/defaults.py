@@ -59,13 +59,12 @@ Z_STALL_PROBE_TIMEOUT_S = 60.0
 # are set by hand with the reference cells). The constants below stay only because released
 # migration v004 compares promoted config values against them.
 
-# Legacy beam-angle sweep: the x positions the angle calibration probes along.
+# Former beam-angle sweep x positions.
 ANGLE_SWEEP_X_MIN_MM = 0.0
 ANGLE_SWEEP_X_STEP_MM = 100.0
 ANGLE_SWEEP_X_COUNT = 5
 
-# Stage-stall angle calibration: rotate until the stage jams against the shelf, then
-# refine.
+# Former stage-stall angle calibration sweep, probe and validation tuning.
 STAGE_STALL_COARSE_MIN_DEG = 0.0
 STAGE_STALL_COARSE_MAX_DEG = 5.5
 STAGE_STALL_COARSE_STEP_DEG = 1.0

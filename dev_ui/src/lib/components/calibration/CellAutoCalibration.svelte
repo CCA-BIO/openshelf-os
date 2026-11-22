@@ -291,8 +291,8 @@
 		}
 	}
 
-	// Gripper calibration only applies to all-, both- and side-scoped runs.
-	function applyCalibrationOptionSelection(): void {
+	// The gripper open position is only measured by all-, both- and side-scoped runs.
+	function clearGripperForShelfOrCellScope(): void {
 		if (selectedShelf !== '' || selectedCell !== '') {
 			isGripperCalibrationSelected = false;
 		}
@@ -432,7 +432,7 @@
 			selectedCell = '';
 		}
 
-		applyCalibrationOptionSelection();
+		clearGripperForShelfOrCellScope();
 
 		error = '';
 		message = '';
@@ -443,7 +443,7 @@
 
 		selectedSide = target.value as '' | 'front_module' | 'back_module';
 		syncSelection();
-		applyCalibrationOptionSelection();
+		clearGripperForShelfOrCellScope();
 		error = '';
 		message = '';
 	}
@@ -452,7 +452,7 @@
 		const target = event.target as HTMLSelectElement;
 
 		syncSelection(target.value);
-		applyCalibrationOptionSelection();
+		clearGripperForShelfOrCellScope();
 		error = '';
 		message = '';
 	}
@@ -461,7 +461,7 @@
 		const target = event.target as HTMLSelectElement;
 
 		selectedCell = target.value;
-		applyCalibrationOptionSelection();
+		clearGripperForShelfOrCellScope();
 		error = '';
 		message = '';
 	}

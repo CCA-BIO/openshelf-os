@@ -23,7 +23,6 @@ _PATCHED_NAMES = [
     "get_config_path",
     "get_root_config",
     "save_root_config",
-    "clear_config_cache",
     "resolve_grid_path",
     "_build_bounds_for_side",
     "laser_module",
