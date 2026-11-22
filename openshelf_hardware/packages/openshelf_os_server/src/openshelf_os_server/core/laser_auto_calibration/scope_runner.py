@@ -10,6 +10,10 @@ from .models import *
 
 
 
+# Mid-travel X the abort parks at before homing, clear of the gantry uprights for the rotate home.
+ABORT_HOME_X_MM = 475.0
+
+
 def _get_shelf_calibration_center_y(shelf: Any) -> float | None:
     y_values = [
         float(cell.calibration_point.y)
@@ -573,7 +577,7 @@ class ScopeRunnerMixin:
         await worker._robot._tool.retract_empty()
 
         if worker._robot._tool._mx is not None:
-            await worker._robot._tool._mx.move_to_position(laser_module.BACK_MODULE_ROTATION_SAFE_X_MM)
+            await worker._robot._tool._mx.move_to_position(ABORT_HOME_X_MM)
 
         await worker._robot._tool.home()
 

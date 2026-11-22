@@ -104,8 +104,7 @@ class HoleStopMeasurement:
 async def probe_cell(tool: Any, coordinate: Any) -> Any:
 	"""probe_grip_at the coordinate's own z, moving there with the fingers in from wherever the tool is."""
 	await tool._gs.safe_open()
-	await tool.move(coordinate)
-	await tool.rotate_to_position("front" if coordinate.s == 0 else "back")
+	await tool.move_facing(coordinate, "front" if coordinate.s == 0 else "back")
 	return await probe_grip_at(tool, coordinate, float(coordinate.z_offset))
 
 
@@ -304,8 +303,7 @@ async def run_grip_edge_sweep(
 			grab_y_mm = float(cell.tool_y_mm) + offset_y_mm
 			coordinate = AxisCoordinate(x=grab_x_mm, y=grab_y_mm, s=s_value, z_offset=0.0)
 			laser_z_mm = wall_mm + float(intercept_mm) + float(slope_per_mm) * grab_x_mm
-			await tool.move(coordinate)
-			await tool.rotate_to_position(target_position)
+			await tool.move_facing(coordinate, target_position)
 			edge_mm = None
 
 			if shelf_intercept_mm is not None:

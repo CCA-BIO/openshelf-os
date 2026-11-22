@@ -56,7 +56,6 @@ FLYING_COARSE_SCAN_RPM = 30
 # Fine line probes are short, so their speed is set in mm/s (converted to rpm per axis). 40mm/s
 # keeps the delay correction sub-0.5mm while halving the per-line travel time.
 FINE_SCAN_FEED_MM_S = 40.0
-BACK_MODULE_ROTATION_SAFE_X_MM = 475.0
 SHELF_SWEEP_X_STEP_MM = 4.0
 # Coarse sweep widths quantize to the 4mm step. Across two full hardware runs (43 confirmed
 # cells) real holes never measured below 24mm, while false gaps bottomed out at 20mm -- so 22

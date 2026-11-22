@@ -759,9 +759,7 @@ class Tool:
             target_position: Literal["front", "back"] = "front" if coordinate.s == 0 else "back"
 
             await self._gs.safe_open()
-            await self._rotate_before_move(coordinate, target_position)
-            await self.move(coordinate)
-            await self.rotate_to_position(target_position)
+            await self.move_facing(coordinate, target_position)
             await self.extend_empty(coordinate)
             require_grip(
                 await self._gs.open(),
@@ -1160,6 +1158,12 @@ class Tool:
 
         await self._ensure_retracted()
         await self.rotate_to_position(position, restore_x=False)
+
+    async def move_facing(self, coordinate: c.AxisCoordinate, position: Literal["front", "back"]) -> None:
+        """Move to `coordinate` turned to `position`, turning first where that saves an X detour."""
+        await self._rotate_before_move(coordinate, position)
+        await self.move(coordinate)
+        await self.rotate_to_position(position)
 
     async def rotate_to_home_orientation(
         self,

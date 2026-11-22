@@ -8,6 +8,15 @@ from openshelf_os.exceptions import MotorError, MovementError
 from openshelf_os_server.routers import calibration
 
 
+def _with_move_facing(tool):
+	async def move_facing(coordinate, position):
+		await tool.move(coordinate)
+		await tool.rotate_to_position(position)
+
+	tool.move_facing = move_facing
+	return tool
+
+
 def _mock_worker_for_move(stage_position: float = 0.0):
 	order: list[str] = []
 
@@ -36,6 +45,7 @@ def _mock_worker_for_move(stage_position: float = 0.0):
 	tool = MagicMock()
 	tool.move = AsyncMock(side_effect=did_move)
 	tool.rotate_to_position = AsyncMock(side_effect=did_rotate)
+	_with_move_facing(tool)
 	tool.get_param = AsyncMock(side_effect=did_get_param)
 	tool._mg = MagicMock()
 	tool._mg.move_to_position = AsyncMock(side_effect=did_move_z)

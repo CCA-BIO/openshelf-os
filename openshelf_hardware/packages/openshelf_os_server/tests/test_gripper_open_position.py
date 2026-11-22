@@ -83,6 +83,10 @@ class FakeTool:
 	async def rotate_to_position(self, _position) -> None:
 		pass
 
+	async def move_facing(self, coordinate, position) -> None:
+		await self.move(coordinate)
+		await self.rotate_to_position(position)
+
 	async def extend_empty(self, _coordinate) -> None:
 		pass
 
