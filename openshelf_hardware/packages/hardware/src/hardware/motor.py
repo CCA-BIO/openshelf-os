@@ -7,7 +7,7 @@ import logging
 import json
 from collections import deque
 from contextlib import asynccontextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from enum import Enum
@@ -44,6 +44,11 @@ Y_HOME_SETTLE_LIFT_MM = 5.0
 # Only homing takes Y below this.
 Y_MIN_TARGET_MM = 2.0
 ALARM_DETECT_FOLLOWING_ERROR_BIT = 2
+# Live following error, then profile and feedback position: three signed 32-bit values, high
+# word first (CL57RS manual p.25). Unconfirmed on every fielded Y drive, so they are read only
+# while a trace is open, with one bounded attempt, and never again after a read fails.
+FOLLOWING_ERROR_TRACE_REGISTER = 0x1010
+FOLLOWING_ERROR_TRACE_READ_TIMEOUT_S = 0.1
 # Control word 0x1122 resets the alarm history, an EEPROM write that leaves the drive
 # deaf for ~0.5 s (the next frame is answered late or dropped). Homing keeps it;
 # per-move alarm clears do not.
@@ -203,6 +208,25 @@ class MotionRecordEntry:
     correlation_id: str | None
     # Pr4.29 on axes with a drive-controlled brake: whether SO2 held the brake released.
     digital_output_state: int | None = None
+    following_error: int | None = None
+
+
+@dataclass(frozen=True)
+class FollowingErrorSample:
+    elapsed_s: float
+    position_mm: float | None
+    # 0x602C/D in command pulses, against which the trace's own unit is worked out.
+    raw_position: int | None
+    # Raw drive values; the unit (command pulses or encoder counts) is settled on the machine.
+    following_error: int
+    profile_position: int
+    feedback_position: int
+
+
+@dataclass
+class FollowingErrorTrace:
+    samples: list[FollowingErrorSample] = field(default_factory=list)
+    read_failed: bool = False
 
 
 MOTION_FLIGHT_RECORDER_SIZE = 256
@@ -323,6 +347,9 @@ class Motor():
         self._last_position_read_latency_s: float | None = None
         self._disabled_at: float | None = None
         self._hold_enabled = False
+        self._following_error_trace: FollowingErrorTrace | None = None
+        # Set when trial settings could not be restored; refuses the next trial.
+        self._trial_restore_failed = False
         configured_brake_output = getattr(self._params, "brake_output_function", None)
         self._configured_brake_output_function = (
             None if configured_brake_output is None else int(configured_brake_output)
@@ -397,6 +424,8 @@ class Motor():
 
             # Configure movement parameters
             await self.move_config()
+            # Ip and the following-error limit were just written again.
+            self._trial_restore_failed = False
         except Exception as e:
             self._emit_init("failed", detail="configure", reason="The motor could not be configured. Check its drive and cable.")
             self._logger.error(
@@ -536,6 +565,7 @@ class Motor():
         state: MotionWaitState,
         position_delta: float | None,
         digital_output_state: int | None = None,
+        following_error: int | None = None,
     ) -> None:
         now = time.monotonic()
 
@@ -563,6 +593,7 @@ class Motor():
                 run_id=self._diagnostic_run_id,
                 correlation_id=self._diagnostic_correlation_id,
                 digital_output_state=digital_output_state,
+                following_error=following_error,
             )
         )
 
@@ -1641,6 +1672,7 @@ class Motor():
                     state,
                     position_delta,
                     await self._read_brake_output_for_recorder(),
+                    await self._read_following_error_for_trace(state),
                 )
 
                 if self._is_homing_limit_stop(homing, alarm_state, state):
@@ -2432,10 +2464,14 @@ class Motor():
                 f"configured={peak_current}, read={actual_peak_current}"
             )
 
-    async def _arm_following_error_trip(self) -> None:
-        """Pr4.22 bit2 on, Pr0.05 = HOME_FOLLOWING_ERROR_MM in encoder counts."""
+    def following_error_counts(self, limit_mm: float) -> int:
+        """Pr0.05 value for a following-error limit in mm: encoder counts, per the manual."""
         cpr = int(getattr(self._params, "encoder_resolution_cpr", 4000))
-        counts = round(HOME_FOLLOWING_ERROR_MM / self._params.mpr * cpr)
+        return round(limit_mm / self._params.mpr * cpr)
+
+    async def _arm_following_error_trip(self, limit_mm: float = HOME_FOLLOWING_ERROR_MM) -> None:
+        """Pr4.22 bit2 on, Pr0.05 = limit_mm in encoder counts."""
+        counts = self.following_error_counts(limit_mm)
         if not 0 < counts <= 0xFFFF:
             raise MotorConfigError(f"Following-error limit out of range: {counts} counts")
 
@@ -2455,6 +2491,110 @@ class Motor():
                     f"Motor {self._motor_id} {name} readback mismatch: "
                     f"configured={value}, read={actual}"
                 )
+
+    # ------------------------------------------------------------------ #
+    #  Drive tests (development only)
+    # ------------------------------------------------------------------ #
+
+    @asynccontextmanager
+    async def trace_following_error(self):
+        """Record the drive's live following error on every wait-loop sample until exit.
+
+        Costs one extra bounded read per sample while open and none otherwise. A failed read
+        (at most one 0.1 s timeout) marks the trace and ends the sampling; it never fails the move.
+        """
+        trace = FollowingErrorTrace()
+        self._following_error_trace = trace
+        try:
+            yield trace
+        finally:
+            self._following_error_trace = None
+
+    async def _read_following_error_for_trace(self, state: MotionWaitState) -> int | None:
+        trace = self._following_error_trace
+        if trace is None or trace.read_failed is True:
+            return None
+
+        try:
+            registers = await self._controller.read_holding_register_block(
+                self._motor_id,
+                FOLLOWING_ERROR_TRACE_REGISTER,
+                count=6,
+                attempts=1,
+                modbus_retries=0,
+                modbus_timeout_s=FOLLOWING_ERROR_TRACE_READ_TIMEOUT_S,
+            )
+            following_error, profile_position, feedback_position = (
+                self._decode_raw_position(registers[index], registers[index + 1])
+                for index in (0, 2, 4)
+            )
+        except Exception as exc:
+            trace.read_failed = True
+            self._logger.warning(
+                "Following-error trace read failed; tracing stopped for this trial",
+                extra={"motor_id": self._motor_id},
+                exc_info=exc,
+            )
+            return None
+
+        trace.samples.append(
+            FollowingErrorSample(
+                elapsed_s=time.monotonic() - state.start_time,
+                position_mm=self._cur_pos,
+                raw_position=self._last_raw_position,
+                following_error=following_error,
+                profile_position=profile_position,
+                feedback_position=feedback_position,
+            )
+        )
+        return following_error
+
+    @asynccontextmanager
+    async def trial_drive_settings(self, *, peak_current: int, following_error_mm: float):
+        """Move at a reduced Pr5.00 behind a tight following-error trip, for current tests.
+
+        Only on an axis that parks between moves, so every write lands with the load on the
+        brake. Nothing is saved to EEPROM: a power cycle also restores the stored values. On
+        exit, whatever happened inside, the axis parks first (a faulted move leaves it
+        energised, and below holding current that is not holding), then the configured Ip and
+        max_following_error come back with readback. A failed restore raises and refuses every
+        later trial until the motor is configured again.
+        """
+        if self._park_when_idle is False:
+            raise MotorConfigError(f"Motor {self._motor_id} does not park; trial settings refused")
+        if self._trial_restore_failed is True:
+            raise MotorConfigError(
+                f"Motor {self._motor_id} trial settings were not restored; reconfigure before another trial"
+            )
+        if not 0 < int(peak_current) <= int(self._params.Ip):
+            raise MotorConfigError(
+                f"Trial peak current {peak_current} outside 1..{int(self._params.Ip)} (0.1 A)"
+            )
+        if not following_error_mm > 0:
+            raise MotorConfigError("Trial following-error limit must be positive")
+
+        # Set before any write, so a failure part-way through applying still restores.
+        self._trial_restore_failed = True
+        try:
+            await self.disable()
+            await self._set_and_verify_peak_current(int(peak_current))
+            await self._arm_following_error_trip(float(following_error_mm))
+            yield
+        finally:
+            await self._park_after_trial()
+            await self._set_and_verify_peak_current(int(self._params.Ip))
+            await self._restore_following_error_limit()
+            self._trial_restore_failed = False
+
+    async def _park_after_trial(self) -> None:
+        try:
+            await self.disable()
+        except Exception as e:
+            self._logger.warning(
+                "Failed to park motor after a trial; restoring settings anyway",
+                extra={"motor_id": self._motor_id},
+                exc_info=e,
+            )
 
     def _get_home_approach_target_mm(self) -> float:
         backoff_mm = DEFAULT_HOME_APPROACH_BACKOFF_MM

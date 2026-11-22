@@ -215,6 +215,7 @@ CODE_MESSAGES: dict[str, str] = {
 	"motor_home_failed": "The robot could not be reset. Check the robot status before resetting it again.",
 	"motor_move_failed": "The robot could not move. Check the robot status before moving it again.",
 	"motor_not_configured": "That motor is not configured on this machine.",
+	"motor_trial_settings_failed": "The Y test settings could not be applied or restored. Restart the robot before moving it again.",
 	"movement_in_progress": "The robot is already moving. Wait for it to finish.",
 	"no_compatible_bin": "No bin can take that item right now.",
 	"not_found": "The machine could not find what you asked for. Reload and try again.",

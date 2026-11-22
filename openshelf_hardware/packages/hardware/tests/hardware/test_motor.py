@@ -1162,3 +1162,31 @@ async def test_absolute_move_keeps_y_at_least_2mm_off_home(
 
     assert await motor._start_absolute_move(requested) is True
     assert motor._target_pos == expected
+
+
+@pytest.mark.asyncio
+async def test_trial_settings_park_then_restore_ip_and_trip_after_a_faulted_move(mock_controller):
+    motor = y_home_motor(mock_controller, Ip=60, max_following_error=4000)
+    registers = echo_registers(mock_controller, {0x0159: 0x24, 0x0191: 60, 0x000B: 4000, 0x000F: 1, 0x1003: 1 << 1})
+
+    with pytest.raises(MotorError):
+        async with motor.trial_drive_settings(peak_current=15, following_error_mm=10.0):
+            # Applied with the load on the brake: Pr0.07 off before the current drops.
+            assert registers[0x000F] == 0
+            assert registers[0x0191] == 15
+            assert registers[0x000B] == 500
+            registers[0x000F] = 1  # the faulted move left the axis energised
+            registers[0x1003] |= 1 << 1
+            raise MotorError("Movement failed for motor 1 (status=FAULT)")
+
+    writes = [c.args[1:] for c in mock_controller.write_single_register.await_args_list]
+    assert registers[0x0191] == 60
+    assert registers[0x000B] == 4000
+    assert registers[0x000F] == 0
+    # Parked before the configured current returns, so the restore never lands on a load
+    # hanging off a drive below holding current.
+    assert writes.index((0x0191, 60)) > max(i for i, w in enumerate(writes) if w == (0x000F, 0))
+
+    with pytest.raises(MotorConfigError):
+        async with motor.trial_drive_settings(peak_current=61, following_error_mm=10.0):
+            pass

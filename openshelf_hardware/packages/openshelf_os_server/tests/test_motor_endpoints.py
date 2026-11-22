@@ -391,3 +391,32 @@ async def test_home_fridge_door_safety_rejection_is_non_fault_conflict(
 	assert response.json()["detail"]["code"] == "tool_not_retracted"
 	mock_worker.set_needs_home.assert_not_called()
 	mock_worker.clear_needs_home_axes.assert_not_called()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+	("mode", "descent_peak_current", "expected_status"),
+	[("production", 30, 403), ("development", 61, 400)],
+)
+async def test_y_descent_trial_refuses_production_and_currents_above_ip_before_motion(
+	client: AsyncClient, mode: str, descent_peak_current: int, expected_status: int
+) -> None:
+	from types import SimpleNamespace
+	from openshelf_os.operating_mode import OperatingMode
+
+	y_axis = _mock_motor(200.0)
+	y_axis._params = SimpleNamespace(Ip=60, lim=1165.0, lower_lim=0.0, mpr=40.0, ppr=10000)
+	y_axis.is_homed = MagicMock(return_value=True)
+	mock_worker = _mock_worker({"y_axis": y_axis})
+
+	with patch("openshelf_os_server.routers.robot.get_settings", return_value=_mock_settings()), \
+		patch("openshelf_os_server.routers.robot.get_robot_worker", return_value=mock_worker), \
+		patch("openshelf_os_server.routers.robot.get_operating_mode", return_value=OperatingMode(mode)):
+		response = await client.post(
+			"/api/robot/debug/motors/y_axis/descent-trial",
+			json={"start_mm": 600.0, "end_mm": 300.0, "descent_peak_current": descent_peak_current},
+		)
+
+	assert response.status_code == expected_status
+	y_axis.move_to_position.assert_not_awaited()
+	y_axis.trial_drive_settings.assert_not_called()
