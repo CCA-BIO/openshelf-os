@@ -729,10 +729,7 @@ async def _move_tool_to_coordinate(
 	try:
 		async with manual_motion_guard("calibration_move", worker=worker):
 			await _clear_motors_for_move(tool, gantry=True, gripper=True, stage=True, rotation=True)
-			await tool.move(coord)
-
-			target_position: Literal["front", "back"] = "front" if coord.s == 0 else "back"
-			await tool.rotate_to_position(target_position)
+			await tool.move_facing(coord, "front" if coord.s == 0 else "back")
 
 			if tool._mg is not None:
 				grip_ext = await tool.get_param("Z_EXTENSION_PLACE")
@@ -1379,8 +1376,7 @@ async def grip_probe(request: GripProbeRequest) -> list[GripProbePoint]:
 			await _clear_motors_for_move(tool, gantry=True, gripper=True, stage=True, rotation=True)
 			await tool.retract()
 			await tool._gs.safe_open()
-			await tool.move(coordinate)
-			await tool.rotate_to_position(target_position)
+			await tool.move_facing(coordinate, target_position)
 
 			for z_offset in request.z_offsets:
 				state = await probe_grip_at(tool, coordinate, z_offset)
@@ -2184,7 +2180,7 @@ async def move_to_iobox_position(position: IOBoxPositionName) -> IOBoxPositionRe
 		try:
 			await _clear_motors_for_move(tool, gantry=True, gripper=True, stage=True, rotation=True)
 			await _retract_tool_for_move(tool, worker)
-			await tool.rotate_to_position("front")
+			await tool.rotate_to_position("front", restore_x=False)
 		except (MotorError, HardwareMotorError) as e:
 			await _raise_motor_error(worker, "The robot could not move to the IO box position.", e, axes=["rotate"])
 
@@ -2310,7 +2306,7 @@ async def test_iobox_sequence(with_gripper: bool = False):
 		try:
 			await _clear_motors_for_move(tool, gantry=True, gripper=True, stage=True, rotation=True)
 			await _retract_tool_for_move(tool, worker)
-			await tool.rotate_to_position("front")
+			await tool.rotate_to_position("front", restore_x=False)
 		except (MotorError, HardwareMotorError) as e:
 			await _raise_motor_error(worker, "The IO box test failed.", e)
 
@@ -2400,7 +2396,7 @@ async def test_iobox_multi_item_cycle():
 		try:
 			await _clear_motors_for_move(tool, gantry=True, gripper=True, stage=True, rotation=True)
 			await _retract_tool_for_move(tool, worker)
-			await tool.rotate_to_position("front")
+			await tool.rotate_to_position("front", restore_x=False)
 		except (MotorError, HardwareMotorError) as e:
 			await _raise_motor_error(worker, "The IO box multi-item test failed.", e)
 

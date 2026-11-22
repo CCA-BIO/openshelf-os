@@ -95,11 +95,9 @@ async def enter_scan_mode(tool: Any, side: StorageModuleSide, scan_config: Any) 
 		print_status(f"rotation_after={rotation_after}")
 		await tool.move(AxisCoordinate(x=scan_x_mm, y=scan_y_mm, s=side_number))
 	else:
-		await tool.move(AxisCoordinate(x=scan_x_mm, y=scan_y_mm, s=side_number))
-
 		rotation_before = await tool._mr.get_position()
 		print_status(f"rotation_before={rotation_before}")
-		await tool.rotate_to_position(target_position)
+		await tool.move_facing(AxisCoordinate(x=scan_x_mm, y=scan_y_mm, s=side_number), target_position)
 		rotation_after = await tool._mr.get_position()
 		print_status(f"rotation_after={rotation_after}")
 	await tool._ms.ready()

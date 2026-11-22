@@ -484,3 +484,31 @@ async def test_place_skips_rotation_and_its_x_clearance_moves_when_already_turne
     await tool.place(AxisCoordinate(x=550.0, y=100.0, s=1))
 
     assert events == ["move:550.0", "retract"]
+
+
+@pytest.mark.asyncio
+async def test_gripper_probe_turns_in_the_window_before_moving_to_a_low_x_cell(monkeypatch) -> None:
+    # Gripper open calibration: from a front cell inside the window to a back cell at low X.
+    from openshelf_os.laser_calibration import grip_edge
+
+    tool, events = _tool_for_place(x_mm=300.0)
+    tool._gs.safe_open = AsyncMock()
+    monkeypatch.setattr(grip_edge, "probe_grip_at", AsyncMock(return_value="gripped"))
+
+    await grip_edge.probe_cell(tool, AxisCoordinate(x=50.0, y=100.0, s=1, z_offset=12.0))
+
+    assert events == ["rotate:184.0", "move:50.0"]
+    tool._handle_fault.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_gripper_probe_turns_at_the_window_edge_nearest_a_low_x_start(monkeypatch) -> None:
+    from openshelf_os.laser_calibration import grip_edge
+
+    tool, events = _tool_for_place(x_mm=60.0)
+    tool._gs.safe_open = AsyncMock()
+    monkeypatch.setattr(grip_edge, "probe_grip_at", AsyncMock(return_value="gripped"))
+
+    await grip_edge.probe_cell(tool, AxisCoordinate(x=50.0, y=100.0, s=1, z_offset=12.0))
+
+    assert events == ["x:200.0", "rotate:184.0", "move:50.0"]
