@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from . import angle_runner as _angle_runner
 from . import apply_runner as _apply_runner
 from . import gripper_runner as _gripper_runner
 from . import manager as _manager
@@ -8,7 +7,6 @@ from . import models as _models
 from . import scan_runner as _scan_runner
 from . import scope_runner as _scope_runner
 from . import snapshot_runner as _snapshot_runner
-from . import stage_runner as _stage_runner
 from .manager import LaserAutoCalibrationManager as _LaserAutoCalibrationManagerImpl
 from .models import *
 
@@ -17,8 +15,6 @@ _PATCH_TARGETS = [
     _manager,
     _scope_runner,
     _scan_runner,
-    _angle_runner,
-    _stage_runner,
     _apply_runner,
     _gripper_runner,
     _snapshot_runner,
@@ -30,9 +26,7 @@ _PATCHED_NAMES = [
     "clear_config_cache",
     "resolve_grid_path",
     "_build_bounds_for_side",
-    "_build_angle_x_positions",
     "laser_module",
-    "angle_module",
 ]
 
 
@@ -87,18 +81,6 @@ class LaserAutoCalibrationManager(_LaserAutoCalibrationManagerImpl):
     async def _run_scan_analysis(self, *args, **kwargs):
         _sync_patch_targets()
         return await super()._run_scan_analysis(*args, **kwargs)
-
-    async def _run_angle_calibration_for_side(self, *args, **kwargs):
-        _sync_patch_targets()
-        return await super()._run_angle_calibration_for_side(*args, **kwargs)
-
-    async def _run_stage_extension_calibration_for_side(self, *args, **kwargs):
-        _sync_patch_targets()
-        return await super()._run_stage_extension_calibration_for_side(*args, **kwargs)
-
-    async def _resolve_stage_extension_probe_y_mm(self, *args, **kwargs):
-        _sync_patch_targets()
-        return await super()._resolve_stage_extension_probe_y_mm(*args, **kwargs)
 
     async def _persist_completed_results(self, *args, **kwargs):
         _sync_patch_targets()

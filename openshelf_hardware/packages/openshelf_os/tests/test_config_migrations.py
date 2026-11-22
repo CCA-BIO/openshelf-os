@@ -34,6 +34,9 @@ from openshelf_os.config_migrations.v007_remove_z_stall_probe_keys import (
 from openshelf_os.config_migrations.v008_remove_scan_style_keys import (
     REMOVED_SCAN_KEYS as SCAN_STYLE_KEYS,
 )
+from openshelf_os.config_migrations.v010_remove_angle_calibration_keys import (
+    REMOVED_SCAN_KEYS as ANGLE_CALIBRATION_SCAN_KEYS,
+)
 from openshelf_os.laser_calibration.core import (
     get_gripper_xy_correction,
     get_laser_scan_pose_stage_mm,
@@ -108,6 +111,8 @@ def legacy_config():
                     "z_stall_probe_x_shift_mm": 20.0,
                     "coarse_scan_style": "stepped",
                     "shelf_brim_max_height_mm": 13.0,
+                    "angle_calibration_x_max_mm": 950.0,
+                    "angle_calibration_stage_stall_no_progress_timeout_s": 0.25,
                     "unknown_scan_setting": {"preserve": True},
                 },
             },
@@ -121,7 +126,7 @@ def test_migration_preserves_pose_geometry_and_unrelated_values(legacy_config):
     original = copy.deepcopy(legacy_config)
     migrated, changes = runner.migrate_config(legacy_config)
     assert legacy_config == original
-    assert migrated["schema_version"] == 9
+    assert migrated["schema_version"] == 10
     assert migrated["version"] == original["version"]
     assert migrated["auth"] == original["auth"]
     assert migrated["unknown_root_setting"] == original["unknown_root_setting"]
@@ -131,7 +136,8 @@ def test_migration_preserves_pose_geometry_and_unrelated_values(legacy_config):
     assert not set(UNUSED_SCAN_KEYS) & migrated["robot"]["grid"]["scan"].keys()
     assert not set(Z_STALL_PROBE_SCAN_KEYS) & migrated["robot"]["grid"]["scan"].keys()
     assert not set(SCAN_STYLE_KEYS) & migrated["robot"]["grid"]["scan"].keys()
-    assert changes[-1] == "schema_version: 8 -> 9"
+    assert not set(ANGLE_CALIBRATION_SCAN_KEYS) & migrated["robot"]["grid"]["scan"].keys()
+    assert changes[-1] == "schema_version: 9 -> 10"
     config = RootConfig.model_validate(migrated)
     scan = config.robot.grid.scan
 
@@ -279,7 +285,7 @@ def v4_side_config():
 
 def test_v5_renames_module_side_scan_keys_and_bin_sides(v4_side_config):
     migrated, changes = runner.migrate_config(v4_side_config)
-    assert migrated["schema_version"] == 9
+    assert migrated["schema_version"] == 10
     scan = migrated["robot"]["grid"]["scan"]
     assert scan["front_shelf_scout_x_mm"] == 120.0
     assert scan["back_shelf_scout_x_mm"] == 45.0
@@ -347,7 +353,7 @@ def test_startup_rejects_unmigrated_config_without_writing(tmp_path, legacy_conf
     path = tmp_path / "config.json"
     raw = json.dumps(legacy_config).encode()
     path.write_bytes(raw)
-    with pytest.raises(ConfigValidationError, match="requires migration to 9"):
+    with pytest.raises(ConfigValidationError, match="requires migration to 10"):
         load_config_file(path)
     assert path.read_bytes() == raw
     assert list(tmp_path.iterdir()) == [path]
@@ -361,7 +367,8 @@ def test_startup_rejects_unmigrated_config_without_writing(tmp_path, legacy_conf
     + list(PROMOTED_SCAN_KEYS)
     + list(v005.SCAN_KEY_RENAMES)
     + list(Z_STALL_PROBE_SCAN_KEYS)
-    + list(SCAN_STYLE_KEYS),
+    + list(SCAN_STYLE_KEYS)
+    + list(ANGLE_CALIBRATION_SCAN_KEYS),
 )
 def test_marking_old_fields_current_does_not_silently_drop_them(legacy_config, old):
     migrated, _ = runner.migrate_config(legacy_config)

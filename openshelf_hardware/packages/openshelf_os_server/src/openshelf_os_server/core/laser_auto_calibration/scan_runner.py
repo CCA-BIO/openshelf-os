@@ -162,7 +162,6 @@ class ScanRunnerMixin:
         try:
             async with self._patch_status_callbacks(
                 scan_callback=self._build_scan_status_callback(side_name, recorder, bounds),
-                angle_callback=None,
             ):
                 analysis = await laser_module.run_staged_scan(
                     robot=worker._robot,

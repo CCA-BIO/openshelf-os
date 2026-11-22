@@ -132,23 +132,9 @@ class SnapshotRunnerMixin:
 
         return did_receive_status
 
-    def _build_angle_status_callback(self, side_name: str):
-        async def did_receive_status(message: str) -> None:
-            if self._should_preserve_cancelling_snapshot() is True or self._should_ignore_status_update() is True:
-                return
-
-            await self._update_snapshot(
-                current_side=side_name,
-                current_stage="angle-calibration",
-                state="running",
-            )
-
-        return did_receive_status
-
     @asynccontextmanager
-    async def _patch_status_callbacks(self, scan_callback=None, angle_callback=None):
+    async def _patch_status_callbacks(self, scan_callback=None):
         original_scan_print = laser_module.print_status
-        previous_angle_printer: Any = angle_module.print_status
         pending_task: asyncio.Task[None] | None = None
 
         def didSchedule(callback: Any, message: str) -> None:
@@ -170,20 +156,12 @@ class SnapshotRunnerMixin:
             if scan_callback is not None:
                 didSchedule(scan_callback, message)
 
-        def did_print_angle(message: str) -> None:
-            previous_angle_printer(message)
-
-            if angle_callback is not None:
-                didSchedule(angle_callback, message)
-
         laser_module.print_status = did_print_scan
-        previous_angle_printer = angle_module.set_status_printer(did_print_angle)
 
         try:
             yield
         finally:
             laser_module.print_status = original_scan_print
-            angle_module.set_status_printer(previous_angle_printer)
 
             if pending_task is not None:
                 current_task = asyncio.current_task()
@@ -226,15 +204,11 @@ class SnapshotRunnerMixin:
             shelf_edges: list[LaserAutoCalibrationShelfEdge] = []
             candidates: list[LaserAutoCalibrationCandidate] = []
             cells: list[LaserAutoCalibrationCell] = []
-            angle_results: list[LaserAutoCalibrationAngleResult] = []
 
             for side_state in self._side_states.values():
                 shelf_edges.extend(side_state.shelf_edges)
                 candidates.extend(side_state.candidates)
                 cells.extend(side_state.cells)
-
-                if side_state.angle_result is not None:
-                    angle_results.append(side_state.angle_result)
 
             self._snapshot.shelf_edges = sorted(
                 shelf_edges,
@@ -248,7 +222,6 @@ class SnapshotRunnerMixin:
                 cells,
                 key=lambda cell: (cell.side.value, cell.shelf_idx, cell.cell_idx),
             )
-            self._snapshot.angle_results = sorted(angle_results, key=lambda result: result.side.value)
             front_side_state = self._side_states.get("front_module", _SideState())
             back_side_state = self._side_states.get("back_module", _SideState())
             self._snapshot.front_scouted_shelf_count = max(
@@ -275,8 +248,6 @@ class SnapshotRunnerMixin:
                 len([cell for cell in self._snapshot.detected_cells if cell.side == "back_module"]),
                 back_side_state.live_detected_cell_count,
             )
-            self._snapshot.front_stage_extension_mm = front_side_state.stage_extension_mm
-            self._snapshot.back_stage_extension_mm = back_side_state.stage_extension_mm
             self._snapshot.scouted_shelf_count = max(
                 len(self._snapshot.shelf_edges),
                 self._snapshot.front_scouted_shelf_count + self._snapshot.back_scouted_shelf_count,

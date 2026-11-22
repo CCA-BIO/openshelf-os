@@ -8,7 +8,6 @@ from openshelf_os.config.laser_scan import (
     LaserScanXYOffsetConfig,
     LaserScanZOffsetModelConfig,
 )
-from openshelf_os.laser_calibration.angle.capture import enter_capture_mode
 from openshelf_os.laser_calibration.defaults import Z_OFFSET_MODEL_PARAM_TOLERANCE_MM
 
 from openshelf_os_server.core.storage import StorageService
@@ -664,22 +663,8 @@ class ApplyRunnerMixin:
 
         config = get_root_config()
         next_config = config.model_copy(deep=True)
-        params_dict = next_config.robot.tool.parameters.model_dump()
         reference_results: dict[StorageModuleSide, laser_module.ReferenceOffsetResult] = {}
         reference_persisted: dict[StorageModuleSide, bool] = {}
-
-        for completed_result in completed_results:
-            rotation_param = _side_to_rotation_param_name(completed_result.side)
-            stage_extension_param = _side_to_stage_extension_param_name(completed_result.side)
-            side_state = self._side_states.get(_side_to_module_name(completed_result.side))
-
-            if completed_result.angle_result is not None:
-                params_dict[rotation_param] = completed_result.angle_result.updated_rotation_deg
-
-            if side_state is not None and side_state.stage_extension_mm is not None:
-                params_dict[stage_extension_param] = float(side_state.stage_extension_mm)
-
-        next_config.robot.tool.parameters = Parameters.model_validate(params_dict)
 
         scan_config = next_config.robot.grid.scan
         grid_path = Path(resolve_grid_path(next_config))
@@ -934,58 +919,3 @@ class ApplyRunnerMixin:
                 await self._publish_reference_offset_applied(reference_result, persisted=True)
 
         await _install_applied_grid(worker, grid_path)
-
-    async def _get_current_calibration_params(self, worker: RobotWorker) -> dict[str, float]:
-        front = await worker._robot._tool.get_param("ROTATION_FRONT")
-        back = await worker._robot._tool.get_param("ROTATION_BACK")
-        front_stage_extension = await worker._robot._tool.get_param("STAGE_EXTENSION_SHELF_FRONT")
-        back_stage_extension = await worker._robot._tool.get_param("STAGE_EXTENSION_SHELF_BACK")
-
-        if front is None or back is None or front_stage_extension is None or back_stage_extension is None:
-            raise ValueError("Current calibration parameters are not fully configured")
-
-        return {
-            "ROTATION_FRONT": float(front),
-            "ROTATION_BACK": float(back),
-            "STAGE_EXTENSION_SHELF_FRONT": float(front_stage_extension),
-            "STAGE_EXTENSION_SHELF_BACK": float(back_stage_extension),
-        }
-
-
-    def _persist_tool_parameter(self, worker: RobotWorker, param_name: str, value: Any) -> None:
-        """Commit one calibrated tool parameter to disk as soon as it is measured.
-
-        Angle and stage extension are self-contained results. Keeping them in memory until the
-        whole run succeeds means any later failure (a scan, or the z stall anchor) discards them
-        and silently leaves the tool on a stale value.
-        """
-        config = get_root_config()
-        next_config = config.model_copy(deep=True)
-        params_dict = next_config.robot.tool.parameters.model_dump()
-        params_dict[param_name] = value
-        next_config.robot.tool.parameters = Parameters.model_validate(params_dict)
-
-        save_root_config(next_config)
-        worker._robot.reload_parameters()
-
-
-    def _restore_in_memory_calibration_params(self, worker: RobotWorker, params: dict[str, float]) -> None:
-        """Drop uncommitted in-memory parameter edits by reloading what is on disk.
-
-        Calibrated parameters are persisted the moment they are measured, so disk already holds
-        everything this run legitimately produced. Re-applying the pre-run snapshot would throw
-        those away; only fall back to it if the reload itself fails.
-        """
-        try:
-            clear_config_cache()
-            worker._robot.reload_parameters()
-            return
-        except Exception:
-            logger.error("laser_auto_calibration_param_reload_failed", exc_info=True)
-
-        params_dict = worker._robot._tool._params.parameters.model_dump()
-        params_dict["ROTATION_FRONT"] = float(params["ROTATION_FRONT"])
-        params_dict["ROTATION_BACK"] = float(params["ROTATION_BACK"])
-        params_dict["STAGE_EXTENSION_SHELF_FRONT"] = float(params["STAGE_EXTENSION_SHELF_FRONT"])
-        params_dict["STAGE_EXTENSION_SHELF_BACK"] = float(params["STAGE_EXTENSION_SHELF_BACK"])
-        worker._robot._tool._params.parameters = Parameters.model_validate(params_dict)

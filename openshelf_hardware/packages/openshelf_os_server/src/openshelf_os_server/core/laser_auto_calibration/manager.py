@@ -9,8 +9,6 @@ from .models import *
 from .models import LaserAutoCalibrationError, LaserAutoCalibrationErrorRef
 from .scope_runner import ScopeRunnerMixin
 from .scan_runner import ScanRunnerMixin
-from .angle_runner import AngleRunnerMixin
-from .stage_runner import StageRunnerMixin
 from .apply_runner import ApplyRunnerMixin
 from .gripper_runner import GripperRunnerMixin
 from openshelf_os_server.core.logging_config import get_correlation_id
@@ -23,8 +21,6 @@ from openshelf_os.robot.worker import fault_needs_home_axes
 class LaserAutoCalibrationManager(
     ScopeRunnerMixin,
     ScanRunnerMixin,
-    AngleRunnerMixin,
-    StageRunnerMixin,
     ApplyRunnerMixin,
     GripperRunnerMixin,
     SnapshotRunnerMixin,
@@ -161,7 +157,6 @@ class LaserAutoCalibrationManager(
         if requested_scope is None:
             requested_scope = LaserAutoCalibrationScope()
 
-        original_params: Any = None
         session_correlation_id = get_correlation_id()
         self._motion_diagnostic_session_id = session_id
         self._motion_diagnostic_correlation_id = session_correlation_id
@@ -173,7 +168,6 @@ class LaserAutoCalibrationManager(
         )
 
         try:
-            original_params = await self._get_current_calibration_params(worker)
             # The abort's stop and home run inside the guard, so no manual move can start
             # between the cancelled step and the home.
             async with manual_motion_guard("laser_auto_calibration", worker=worker):
@@ -181,7 +175,7 @@ class LaserAutoCalibrationManager(
                     async with self._hold_y_enabled(worker, requested_scope):
                         await self._run_requested_scope(worker, requested_scope)
                 except asyncio.CancelledError:
-                    await self._finish_abort(worker, original_params)
+                    await self._finish_abort(worker)
                     return
                 except Exception:
                     if self._abort_requested is False:
@@ -189,18 +183,16 @@ class LaserAutoCalibrationManager(
                     # A step interrupted by the abort can fail with a hardware error instead of
                     # the cancellation; it still has to end in the abort's home.
                     logger.warning("laser_auto_calibration_abort_interrupted_step", exc_info=True)
-                    await self._finish_abort(worker, original_params)
+                    await self._finish_abort(worker)
                     return
             await self._set_terminal_state("completed", None)
         except asyncio.CancelledError:
             # Cancelled before the scope ran or after it finished: none of its motion is in flight.
             await _absorb_cancellation()
-            if original_params is not None:
-                self._restore_in_memory_calibration_params(worker, original_params)
             await self._set_terminal_state("cancelled", None)
         except Exception as exc:
             try:
-                await self._fail_session(worker, exc, original_params)
+                await self._fail_session(worker, exc)
             except asyncio.CancelledError:
                 # An abort landed during the failure bookkeeping. The real failure came first and
                 # no motion is in flight on this path, so end failed rather than stuck cancelling.
@@ -220,9 +212,7 @@ class LaserAutoCalibrationManager(
                     self._abort_stop_done = None
 
 
-    async def _fail_session(self, worker: RobotWorker, exc: Exception, original_params: Any) -> None:
-        if original_params is not None:
-            self._restore_in_memory_calibration_params(worker, original_params)
+    async def _fail_session(self, worker: RobotWorker, exc: Exception) -> None:
         error_detail = await self._build_error_detail(worker, exc)
         logger.error(
             "laser_auto_calibration_failed",
@@ -239,12 +229,11 @@ class LaserAutoCalibrationManager(
             ),
         )
 
-    async def _finish_abort(self, worker: RobotWorker, original_params: Any) -> None:
+    async def _finish_abort(self, worker: RobotWorker) -> None:
         await _absorb_cancellation()
         stop_done = self._abort_stop_done
         if stop_done is not None:
             await stop_done.wait()
-        self._restore_in_memory_calibration_params(worker, original_params)
 
         try:
             await worker._robot.stop_motion()

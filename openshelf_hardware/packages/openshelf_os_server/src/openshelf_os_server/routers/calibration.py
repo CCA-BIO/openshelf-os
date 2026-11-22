@@ -204,8 +204,6 @@ def _build_laser_auto_calibration_scope(
 	shelf_idx: int | None,
 	cell_idx: int | None,
 	mode: Literal["all", "both"] | None,
-	include_angle_calibration: bool | None,
-	include_extension_calibration: bool | None,
 	include_gripper_calibration: bool | None = None,
 ) -> LaserAutoCalibrationScope:
 	if shelf_idx is not None and shelf_idx < 0:
@@ -220,8 +218,6 @@ def _build_laser_auto_calibration_scope(
 
 		return LaserAutoCalibrationScope(
 			mode="both",
-			include_angle_calibration=include_angle_calibration is not False,
-			include_extension_calibration=include_extension_calibration is not False,
 			include_gripper_calibration=include_gripper_calibration is True,
 		)
 
@@ -231,8 +227,6 @@ def _build_laser_auto_calibration_scope(
 
 		return LaserAutoCalibrationScope(
 			mode="all",
-			include_angle_calibration=include_angle_calibration is not False,
-			include_extension_calibration=include_extension_calibration is not False,
 			include_gripper_calibration=include_gripper_calibration is True,
 		)
 
@@ -243,8 +237,6 @@ def _build_laser_auto_calibration_scope(
 		return LaserAutoCalibrationScope(
 			mode="side",
 			side=side,
-			include_angle_calibration=include_angle_calibration is not False,
-			include_extension_calibration=include_extension_calibration is not False,
 			include_gripper_calibration=include_gripper_calibration is True,
 		)
 
@@ -253,8 +245,6 @@ def _build_laser_auto_calibration_scope(
 			mode="shelf",
 			side=side,
 			shelf_idx=shelf_idx,
-			include_angle_calibration=False,
-			include_extension_calibration=False,
 		)
 
 	return LaserAutoCalibrationScope(
@@ -262,8 +252,6 @@ def _build_laser_auto_calibration_scope(
 		side=side,
 		shelf_idx=shelf_idx,
 		cell_idx=cell_idx,
-		include_angle_calibration=False,
-		include_extension_calibration=False,
 	)
 
 
@@ -978,8 +966,6 @@ async def stream_laser_auto_calibration(
 	shelf_idx: int | None = None,
 	cell_idx: int | None = None,
 	mode: Literal["all", "both"] | None = None,
-	include_angle_calibration: bool | None = None,
-	include_extension_calibration: bool | None = None,
 	include_gripper_calibration: bool | None = None,
 	hold_y_enabled: bool | None = None,
 	subscribe_only: bool = False,
@@ -993,8 +979,8 @@ async def stream_laser_auto_calibration(
 
 	Returns Server-Sent Events with JSON calibration snapshots. A client disconnect
 	unsubscribes that client; use the abort endpoint to stop the session. Do not infer
-	cancellation from a closed connection. Optional scope parameters select cells,
-	both sides, or the angle/extension calibration phases. `include_gripper_calibration=true`
+	cancellation from a closed connection. Optional scope parameters select cells or
+	both sides. `include_gripper_calibration=true`
 	(side and module runs only) first sets the gripper open position from each side's reference
 	cell, before the grip-edge sweep that depends on it. `hold_y_enabled=false` parks
 	Y on its brake between moves instead of holding it energised for the session. Every run
@@ -1008,8 +994,6 @@ async def stream_laser_auto_calibration(
 		shelf_idx,
 		cell_idx,
 		mode,
-		include_angle_calibration,
-		include_extension_calibration,
 		include_gripper_calibration,
 	).model_copy(
 		update={

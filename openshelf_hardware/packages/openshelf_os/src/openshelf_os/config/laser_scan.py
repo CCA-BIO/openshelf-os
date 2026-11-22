@@ -23,11 +23,14 @@ from openshelf_os.config_migrations.v007_remove_z_stall_probe_keys import (
 from openshelf_os.config_migrations.v008_remove_scan_style_keys import (
     REMOVED_SCAN_KEYS as SCAN_STYLE_KEYS,
 )
+from openshelf_os.config_migrations.v010_remove_angle_calibration_keys import (
+    REMOVED_SCAN_KEYS as ANGLE_CALIBRATION_SCAN_KEYS,
+)
 
 # Keys removed by any schema step; a current-schema config must not carry them.
 REJECTED_SCAN_KEYS = (
     *REMOVED_SCAN_KEYS, *UNUSED_SCAN_KEYS, *PROMOTED_SCAN_KEYS, *SIDE_SCAN_KEY_RENAMES, *Z_STALL_PROBE_SCAN_KEYS,
-    *SCAN_STYLE_KEYS,
+    *SCAN_STYLE_KEYS, *ANGLE_CALIBRATION_SCAN_KEYS,
 )
 
 
@@ -129,10 +132,6 @@ class LaserScanConfig(BaseModel):
     back_bounds_x_max_mm: float = 950.0
     back_bounds_y_min_mm: float = 0.0
     back_bounds_y_max_mm: float = 1250.0
-
-    angle_calibration_x_max_mm: float = 950.0
-
-    angle_calibration_stage_stall_no_progress_timeout_s: float = Field(0.25, gt=0)
 
     @model_validator(mode="before")
     @classmethod

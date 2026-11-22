@@ -152,7 +152,7 @@ def _validate_laser_auto_calibration_config(
     # predicts the manual cells' detected positions from it, and refuses without one because at a
     # ~105mm opening pitch predicting from zero matches the neighbouring opening. Checking it here
     # turns a request that can never succeed into a refusal before any motion, instead of a failure
-    # after the angle/stage calibration and a full side scan.
+    # after a full side scan.
     if requested_scope.mode == "all" or requested_scope.mode == "both":
         laser_module.validate_scan_bounds(front_bounds, "front scan bounds")
         laser_module.validate_scan_bounds(back_bounds, "back scan bounds")
@@ -374,8 +374,6 @@ class ScopeRunnerMixin:
         if requested_scope.mode in ("all", "both"):
             await self._run_all_sides(
                 worker,
-                requested_scope.include_angle_calibration,
-                requested_scope.include_extension_calibration,
                 include_gripper_calibration=requested_scope.include_gripper_calibration,
                 front_bounds=front_bounds,
                 back_bounds=back_bounds,
@@ -392,8 +390,6 @@ class ScopeRunnerMixin:
             await self._run_single_side(
                 worker,
                 side,
-                requested_scope.include_angle_calibration,
-                requested_scope.include_extension_calibration,
                 include_gripper_calibration=requested_scope.include_gripper_calibration,
             )
 
@@ -427,66 +423,11 @@ class ScopeRunnerMixin:
     async def _run_all_sides(
         self,
         worker: RobotWorker,
-        include_angle_calibration: bool = True,
-        include_extension_calibration: bool = True,
         *,
         include_gripper_calibration: bool = False,
         front_bounds: ScanBounds | None = None,
         back_bounds: ScanBounds | None = None,
     ) -> None:
-        completed_results: list[_CompletedSideResult] = []
-        scan_config = get_root_config().robot.grid.scan
-        if front_bounds is None:
-            front_bounds = _build_bounds_for_side(scan_config, StorageModuleSide.FRONT)
-        if back_bounds is None:
-            back_bounds = _build_bounds_for_side(scan_config, StorageModuleSide.BACK)
-        back_angle_result: LaserAutoCalibrationAngleResult | None = None
-        front_angle_result: LaserAutoCalibrationAngleResult | None = None
-
-        if include_angle_calibration is True:
-            back_angle_result = await self._run_angle_calibration_for_side(worker, StorageModuleSide.BACK, back_bounds)
-            await self._apply_angle_calibration(worker, StorageModuleSide.BACK, back_angle_result)
-
-            front_angle_result = await self._run_angle_calibration_for_side(worker, StorageModuleSide.FRONT, front_bounds)
-            await self._apply_angle_calibration(worker, StorageModuleSide.FRONT, front_angle_result)
-
-        if include_extension_calibration is True:
-            back_probe_y_mm = await self._resolve_stage_extension_probe_y_mm(
-                worker,
-                StorageModuleSide.BACK,
-                back_bounds,
-                top_shelf_y_mm=None if back_angle_result is None else float(back_angle_result.capture_y_mm),
-            )
-            back_stage_extension_mm = await self._run_stage_extension_calibration_for_side(
-                worker,
-                StorageModuleSide.BACK,
-                back_bounds,
-                probe_y_mm=back_probe_y_mm,
-            )
-            await self._apply_stage_extension_calibration(
-                worker,
-                StorageModuleSide.BACK,
-                back_stage_extension_mm,
-            )
-
-            front_probe_y_mm = await self._resolve_stage_extension_probe_y_mm(
-                worker,
-                StorageModuleSide.FRONT,
-                front_bounds,
-                top_shelf_y_mm=None if front_angle_result is None else float(front_angle_result.capture_y_mm),
-            )
-            front_stage_extension_mm = await self._run_stage_extension_calibration_for_side(
-                worker,
-                StorageModuleSide.FRONT,
-                front_bounds,
-                probe_y_mm=front_probe_y_mm,
-            )
-            await self._apply_stage_extension_calibration(
-                worker,
-                StorageModuleSide.FRONT,
-                front_stage_extension_mm,
-            )
-
         if include_gripper_calibration is True:
             # Before the grip-edge sweep: a wrong open position gives the datum no grip there,
             # which refuses the whole run.
@@ -494,50 +435,23 @@ class ScopeRunnerMixin:
                 worker, [StorageModuleSide.BACK, StorageModuleSide.FRONT]
             )
 
-        completed_results.append(await self._run_side(worker, StorageModuleSide.BACK, back_angle_result))
-        completed_results.append(await self._run_side(worker, StorageModuleSide.FRONT, front_angle_result))
-
+        completed_results = [
+            await self._run_side(worker, StorageModuleSide.BACK, back_bounds),
+            await self._run_side(worker, StorageModuleSide.FRONT, front_bounds),
+        ]
         await self._persist_completed_results(worker, completed_results)
-
 
     async def _run_single_side(
         self,
         worker: RobotWorker,
         side: StorageModuleSide,
-        include_angle_calibration: bool = True,
-        include_extension_calibration: bool = True,
         *,
         include_gripper_calibration: bool = False,
     ) -> None:
-        completed_results: list[_CompletedSideResult] = []
-        scan_config = get_root_config().robot.grid.scan
-        bounds = _build_bounds_for_side(scan_config, side)
-        angle_result: LaserAutoCalibrationAngleResult | None = None
-
-        if include_angle_calibration is True:
-            angle_result = await self._run_angle_calibration_for_side(worker, side, bounds)
-            await self._apply_angle_calibration(worker, side, angle_result)
-
-        if include_extension_calibration is True:
-            probe_y_mm = await self._resolve_stage_extension_probe_y_mm(
-                worker,
-                side,
-                bounds,
-                top_shelf_y_mm=None if angle_result is None else float(angle_result.capture_y_mm),
-            )
-            stage_extension_mm = await self._run_stage_extension_calibration_for_side(
-                worker,
-                side,
-                bounds,
-                probe_y_mm=probe_y_mm,
-            )
-            await self._apply_stage_extension_calibration(worker, side, stage_extension_mm)
-
         if include_gripper_calibration is True:
             await self._run_gripper_open_position_calibration(worker, [side])
 
-        completed_results.append(await self._run_side(worker, side, angle_result))
-        await self._persist_completed_results(worker, completed_results)
+        await self._persist_completed_results(worker, [await self._run_side(worker, side)])
 
     async def _run_single_cell_scan(
         self,
@@ -667,7 +581,7 @@ class ScopeRunnerMixin:
         await worker._robot._tool.retract_empty()
 
         if worker._robot._tool._mx is not None:
-            await worker._robot._tool._mx.move_to_position(angle_module.BACK_MODULE_ROTATION_SAFE_X_MM)
+            await worker._robot._tool._mx.move_to_position(laser_module.BACK_MODULE_ROTATION_SAFE_X_MM)
 
         await worker._robot._tool.home()
 
@@ -683,20 +597,10 @@ class ScopeRunnerMixin:
         self,
         worker: RobotWorker,
         side: StorageModuleSide,
-        angle_result: LaserAutoCalibrationAngleResult | None,
+        bounds: ScanBounds | None = None,
     ) -> _CompletedSideResult:
-        config = get_root_config()
-        scan_config = config.robot.grid.scan
-        bounds = _build_bounds_for_side(scan_config, side)
-
-        if angle_result is not None:
-            await self._apply_angle_calibration(worker, side, angle_result)
+        if bounds is None:
+            bounds = _build_bounds_for_side(get_root_config().robot.grid.scan, side)
         analysis = await self._run_scan_analysis(worker, side, bounds)
 
-        return _CompletedSideResult(
-            side=side,
-            bounds=bounds,
-            analysis=analysis,
-            angle_result=angle_result,
-        )
-
+        return _CompletedSideResult(side=side, bounds=bounds, analysis=analysis)

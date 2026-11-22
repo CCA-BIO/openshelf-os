@@ -192,7 +192,6 @@ def _build_minimal_config(data: dict) -> dict:
                         "back_bounds_x_max_mm": 950.0,
                         "back_bounds_y_min_mm": 0.0,
                         "back_bounds_y_max_mm": 1250.0,
-                        "angle_calibration_x_max_mm": 950.0,
                     },
                 },
             "io": {
