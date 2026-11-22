@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 def _write_gripper_debug_document(result: LaserAutoCalibrationGripperResult) -> None:
     timestamp = _get_timestamp().replace(":", "").replace("+0000", "Z").replace("+00:00", "Z")
-    output_path = Path(_build_default_scans_dir()) / ANGLE_DEBUG_DIR_NAME / f"gripper-open-position-{timestamp}.json"
+    output_path = Path(_build_default_scans_dir()) / DEBUG_DIR_NAME / f"gripper-open-position-{timestamp}.json"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(result.model_dump(mode="json"), indent="\t"), encoding="utf-8")
 

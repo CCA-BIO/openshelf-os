@@ -692,19 +692,6 @@ export interface LaserAutoCalibrationCell {
 	wall_depth_mm: number | null;
 }
 
-export interface LaserAutoCalibrationAngleResult {
-		// The side arrives in the device vocabulary; compare via sideIndex().
-		side: string;
-	alpha_deg: number;
-	sample_count: number;
-	capture_y_mm: number;
-	rms_residual_mm: number;
-	max_abs_residual_mm: number;
-	line_angle_deg: number;
-	previous_rotation_deg: number;
-	updated_rotation_deg: number;
-}
-
 export interface LaserAutoCalibrationReferenceOffsetSample {
 	shelf_idx: number;
 	cell_idx: number;
@@ -770,8 +757,6 @@ export interface LaserAutoCalibrationRequest {
 	side?: StorageModuleSide;
 	shelf_idx?: number;
 	cell_idx?: number;
-	include_angle_calibration?: boolean;
-	include_extension_calibration?: boolean;
 	include_gripper_calibration?: boolean;
 }
 
@@ -784,9 +769,7 @@ const LEGACY_SNAPSHOT_SIDE_FIELDS: Record<string, string> = {
 	left_candidate_count: 'front_candidate_count',
 	right_candidate_count: 'back_candidate_count',
 	left_detected_cell_count: 'front_detected_cell_count',
-	right_detected_cell_count: 'back_detected_cell_count',
-	left_stage_extension_mm: 'front_stage_extension_mm',
-	right_stage_extension_mm: 'back_stage_extension_mm'
+	right_detected_cell_count: 'back_detected_cell_count'
 };
 
 export function normalizeLaserAutoCalibrationSnapshot(raw: Record<string, unknown>): LaserAutoCalibrationSnapshot {
@@ -819,12 +802,9 @@ export interface LaserAutoCalibrationSnapshot {
 	detected_cell_count: number;
 	front_detected_cell_count: number;
 	back_detected_cell_count: number;
-	front_stage_extension_mm: number | null;
-	back_stage_extension_mm: number | null;
 	shelf_edges: LaserAutoCalibrationShelfEdge[];
 	shelf_candidates: LaserAutoCalibrationCandidate[];
 	detected_cells: LaserAutoCalibrationCell[];
-	angle_results: LaserAutoCalibrationAngleResult[];
 	reference_offset_results: LaserAutoCalibrationReferenceOffset[];
 	gripper_open_position?: GripperOpenPositionResult | null;
 	error: string | null;
@@ -835,24 +815,12 @@ export interface LaserAutoCalibrationSnapshot {
 }
 
 export function buildLaserAutoCalibrationStreamUrl(
-	request: LaserAutoCalibrationRequest = {
-		mode: 'all',
-		include_angle_calibration: true,
-		include_extension_calibration: true
-	},
+	request: LaserAutoCalibrationRequest = { mode: 'all' },
 	options: { subscribeOnly?: boolean } = {}
 ): string {
 	const url = new URL(buildAuthenticatedUrl('/calibration/laser/stream'));
 	if (options.subscribeOnly === true) {
 		url.searchParams.set('subscribe_only', 'true');
-	}
-
-	if (request.include_angle_calibration !== undefined) {
-		url.searchParams.set('include_angle_calibration', String(request.include_angle_calibration));
-	}
-
-	if (request.include_extension_calibration !== undefined) {
-		url.searchParams.set('include_extension_calibration', String(request.include_extension_calibration));
 	}
 
 	if (request.include_gripper_calibration === true) {

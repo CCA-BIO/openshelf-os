@@ -11,7 +11,6 @@
 		getStorageGrid,
 		saveLaserZStallEnabled,
 		type GripperOpenPositionResult,
-		type LaserAutoCalibrationAngleResult,
 		type LaserAutoCalibrationRequest,
 		type LaserAutoCalibrationSnapshot,
 		type StorageGrid
@@ -38,10 +37,6 @@
 	let isStreamOpen = $state<boolean>(false);
 	let isAborting = $state<boolean>(false);
 	let isAllSelected = $state<boolean>(true);
-	let isAngleCalibrationSelected = $state<boolean>(true);
-	let isExtensionCalibrationSelected = $state<boolean>(true);
-	let preferredAngleCalibration = $state<boolean>(true);
-	let preferredExtensionCalibration = $state<boolean>(true);
 	let isGripperCalibrationSelected = $state<boolean>(false);
 	let isMeasuringGripper = $state<boolean>(false);
 	// A measure-now result is newer than the run snapshot's until the next run starts.
@@ -85,14 +80,6 @@
 		);
 	});
 
-	const isAngleCalibrationDisabled = $derived.by(() => {
-		return selectedShelf !== '' || isSelectionDisabled === true;
-	});
-
-	const isExtensionCalibrationDisabled = $derived.by(() => {
-		return selectedShelf !== '' || isSelectionDisabled === true;
-	});
-
 	const isGripperCalibrationDisabled = $derived.by(() => {
 		return selectedShelf !== '' || isSelectionDisabled === true;
 	});
@@ -112,11 +99,7 @@
 	});
 
 	const startButtonLabel = 'calibrate';
-	const defaultRequestedScope: LaserAutoCalibrationRequest = {
-		mode: 'all',
-		include_angle_calibration: true,
-		include_extension_calibration: true
-	};
+	const defaultRequestedScope: LaserAutoCalibrationRequest = { mode: 'all' };
 
 	onMount(function () {
 		if (browser === false) {
@@ -274,16 +257,7 @@
 	}
 
 	function syncScopeSelection(requestedScope: LaserAutoCalibrationRequest): void {
-		isAngleCalibrationSelected = requestedScope.include_angle_calibration !== false;
-		isExtensionCalibrationSelected = requestedScope.include_extension_calibration !== false;
 		isGripperCalibrationSelected = requestedScope.include_gripper_calibration === true;
-
-		// Shelf and cell scopes always drop both options, so only a scope that honours them
-		// may replace the remembered user choice.
-		if (requestedScope.mode !== 'shelf' && requestedScope.mode !== 'cell') {
-			preferredAngleCalibration = isAngleCalibrationSelected;
-			preferredExtensionCalibration = isExtensionCalibrationSelected;
-		}
 
 		if (requestedScope.mode === 'all') {
 			isAllSelected = true;
@@ -313,35 +287,21 @@
 		syncSelection(nextShelf, nextCell);
 
 		if (requestedScope.mode === 'shelf' || requestedScope.mode === 'cell') {
-			isAngleCalibrationSelected = false;
-			isExtensionCalibrationSelected = false;
 			isGripperCalibrationSelected = false;
 		}
 	}
 
-	/**
-	 * Angle and extension calibration only apply to all-, both- and side-scoped runs, so a
-	 * shelf or cell selection forces both off and remembering the last user choice keeps a
-	 * later scope change from silently re-enabling what was just unchecked.
-	 */
-	function applyCalibrationOptionSelection(): void {
+	// The gripper open position is only measured by all-, both- and side-scoped runs.
+	function clearGripperForShelfOrCellScope(): void {
 		if (selectedShelf !== '' || selectedCell !== '') {
-			isAngleCalibrationSelected = false;
-			isExtensionCalibrationSelected = false;
 			isGripperCalibrationSelected = false;
-			return;
 		}
-
-		isAngleCalibrationSelected = preferredAngleCalibration;
-		isExtensionCalibrationSelected = preferredExtensionCalibration;
 	}
 
 	function getRequestedScope(): LaserAutoCalibrationRequest {
 		if (isAllSelected === true) {
 			return {
 				mode: 'all',
-				include_angle_calibration: isAngleCalibrationSelected,
-				include_extension_calibration: isExtensionCalibrationSelected,
 				include_gripper_calibration: isGripperCalibrationSelected
 			};
 		}
@@ -349,8 +309,6 @@
 		if (selectedSide === '') {
 			return {
 				mode: 'both',
-				include_angle_calibration: isAngleCalibrationSelected,
-				include_extension_calibration: isExtensionCalibrationSelected,
 				include_gripper_calibration: isGripperCalibrationSelected
 			};
 		}
@@ -359,8 +317,6 @@
 			return {
 				mode: 'side',
 				side: selectedSide,
-				include_angle_calibration: isAngleCalibrationSelected,
-				include_extension_calibration: isExtensionCalibrationSelected,
 				include_gripper_calibration: isGripperCalibrationSelected
 			};
 		}
@@ -369,9 +325,7 @@
 			return {
 				mode: 'shelf',
 				side: selectedSide,
-				shelf_idx: Number(selectedShelf),
-				include_angle_calibration: false,
-				include_extension_calibration: false
+				shelf_idx: Number(selectedShelf)
 			};
 		}
 
@@ -379,9 +333,7 @@
 			mode: 'cell',
 			side: selectedSide,
 			shelf_idx: Number(selectedShelf),
-			cell_idx: Number(selectedCell),
-			include_angle_calibration: false,
-			include_extension_calibration: false
+			cell_idx: Number(selectedCell)
 		};
 	}
 
@@ -480,7 +432,7 @@
 			selectedCell = '';
 		}
 
-		applyCalibrationOptionSelection();
+		clearGripperForShelfOrCellScope();
 
 		error = '';
 		message = '';
@@ -491,7 +443,7 @@
 
 		selectedSide = target.value as '' | 'front_module' | 'back_module';
 		syncSelection();
-		applyCalibrationOptionSelection();
+		clearGripperForShelfOrCellScope();
 		error = '';
 		message = '';
 	}
@@ -500,7 +452,7 @@
 		const target = event.target as HTMLSelectElement;
 
 		syncSelection(target.value);
-		applyCalibrationOptionSelection();
+		clearGripperForShelfOrCellScope();
 		error = '';
 		message = '';
 	}
@@ -509,25 +461,7 @@
 		const target = event.target as HTMLSelectElement;
 
 		selectedCell = target.value;
-		applyCalibrationOptionSelection();
-		error = '';
-		message = '';
-	}
-
-	function didChangeAngleCalibration(event: Event): void {
-		const target = event.target as HTMLInputElement;
-
-		isAngleCalibrationSelected = target.checked;
-		preferredAngleCalibration = target.checked;
-		error = '';
-		message = '';
-	}
-
-	function didChangeExtensionCalibration(event: Event): void {
-		const target = event.target as HTMLInputElement;
-
-		isExtensionCalibrationSelected = target.checked;
-		preferredExtensionCalibration = target.checked;
+		clearGripperForShelfOrCellScope();
 		error = '';
 		message = '';
 	}
@@ -723,38 +657,6 @@
 			isAborting = false;
 		}
 	}
-
-	function formatNumber(value: number | null | undefined, digits = 2): string {
-		if (value === null || value === undefined) {
-			return '-';
-		}
-
-		return value.toFixed(digits);
-	}
-
-	function getAngleResults(): LaserAutoCalibrationAngleResult[] {
-		return snapshot?.angle_results ?? [];
-	}
-
-	function getRotationValue(side: 'front_module' | 'back_module'): string {
-		const angleResult = getAngleResults().find(function (result) {
-			return sideIndex(result.side) === sideIndex(side);
-		});
-
-		if (angleResult === undefined) {
-			return '-';
-		}
-
-		return formatNumber(angleResult.updated_rotation_deg, 4);
-	}
-
-	function getStageExtensionValue(side: 'front_module' | 'back_module'): string {
-		if (side === 'front_module') {
-			return formatNumber(snapshot?.front_stage_extension_mm);
-		}
-
-		return formatNumber(snapshot?.back_stage_extension_mm);
-	}
 </script>
 
 {#if isLoading === true}
@@ -831,32 +733,6 @@
 								{/each}
 							</select>
 						</div>
-					</td>
-				</tr>
-				<tr>
-					<td colspan="3">
-						<label class="all-toggle">
-							<input
-								type="checkbox"
-								checked={isAngleCalibrationSelected}
-								onchange={didChangeAngleCalibration}
-								disabled={isAngleCalibrationDisabled}
-							/>
-							<span>angle calibration</span>
-						</label>
-					</td>
-				</tr>
-				<tr>
-					<td colspan="3">
-						<label class="all-toggle">
-							<input
-								type="checkbox"
-								checked={isExtensionCalibrationSelected}
-								onchange={didChangeExtensionCalibration}
-								disabled={isExtensionCalibrationDisabled}
-							/>
-							<span>extension calibration</span>
-						</label>
 					</td>
 				</tr>
 				<tr>
@@ -951,16 +827,6 @@
 						<td>confirmed cells</td>
 						<td>{snapshot?.front_detected_cell_count ?? 0}</td>
 						<td>{snapshot?.back_detected_cell_count ?? 0}</td>
-					</tr>
-					<tr>
-						<td>rotation angle</td>
-						<td>{getRotationValue('front_module')}</td>
-						<td>{getRotationValue('back_module')}</td>
-					</tr>
-					<tr>
-						<td>stage extension</td>
-						<td>{getStageExtensionValue('front_module')}</td>
-						<td>{getStageExtensionValue('back_module')}</td>
 					</tr>
 					{#if gripperResult !== null}
 						<tr>

@@ -15,6 +15,7 @@ from openshelf_os.config_migrations import (
     v007_remove_z_stall_probe_keys,
     v008_remove_scan_style_keys,
     v009_fold_legacy_enabled_keys,
+    v010_remove_angle_calibration_keys,
 )
 
 Migration = Callable[[dict[str, Any]], tuple[dict[str, Any], list[str]]]
@@ -28,6 +29,7 @@ MIGRATIONS: dict[int, Migration] = {
     7: v007_remove_z_stall_probe_keys.migrate,
     8: v008_remove_scan_style_keys.migrate,
     9: v009_fold_legacy_enabled_keys.migrate,
+    10: v010_remove_angle_calibration_keys.migrate,
 }
 
 

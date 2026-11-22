@@ -531,25 +531,3 @@ async def test_back_scan_entry_turns_at_the_scan_x_instead_of_a_fixed_mid_rail_s
     await motion.enter_scan_mode(tool, StorageModuleSide.BACK, scan_config=None)
 
     assert events == ["move:300.0", "rotate:184.0"]
-
-
-@pytest.mark.asyncio
-async def test_angle_sweep_turns_in_place_when_the_capture_x_is_inside_the_rotation_window() -> None:
-    from openshelf_os.laser_calibration.angle.capture import prepare_capture_pose
-
-    tool, events = _tool_for_place(x_mm=300.0, rotate_deg=184.0)
-
-    async def gantry_x(mm: float, **_: object) -> None:
-        events.append(f"gantry:{mm}")
-
-    tool._mx.move_to_position_no_wait = AsyncMock(side_effect=gantry_x)
-    tool._my = AsyncMock()
-    tool.gantry_wait = AsyncMock()
-
-    await prepare_capture_pose(
-        tool, side_name="back", side_number=1, x_mm=300.0, y_mm=50.0, absolute_rotation_deg=186.0,
-        stage_extension_mm=0.0, z_mm=0.0, z_move_rpm=100.0, z_move_accel=1000.0,
-        should_rotate=True, should_use_safe_back_rotation_path=True, should_move_z=False,
-    )
-
-    assert events == ["rotate:186.0", "gantry:300.0"]

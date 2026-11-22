@@ -271,16 +271,13 @@ async def test_cell_scoped_run_on_the_datum_derives_and_persists_the_offset(seed
 							"openshelf_os_server.core.laser_auto_calibration.save_root_config",
 							side_effect=lambda next_config, version_id=None: saved_configs.append(next_config),
 						):
-							with patch(
-								"openshelf_os_server.core.laser_auto_calibration.clear_config_cache"
-							):
-								await manager._persist_single_cell_result(
-									worker,
-									StorageModuleSide.FRONT,
-									analysis,
-									target,
-									MagicMock(),
-								)
+							await manager._persist_single_cell_result(
+								worker,
+								StorageModuleSide.FRONT,
+								analysis,
+								target,
+								MagicMock(),
+							)
 
 	apply_rescan.assert_not_called()
 	assert len(saved_configs) == 1

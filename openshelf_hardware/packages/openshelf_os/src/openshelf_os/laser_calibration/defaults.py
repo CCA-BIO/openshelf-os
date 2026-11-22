@@ -55,15 +55,16 @@ Z_STALL_PROBE_RPM = 20
 Z_STALL_PROBE_NO_PROGRESS_S = 0.25
 Z_STALL_PROBE_TIMEOUT_S = 60.0
 
-# Legacy beam-angle sweep: the x positions the angle calibration probes along.
+# The automatic angle and stage-extension calibrations are removed (rotation and shelf extension
+# are set by hand with the reference cells). The constants below stay only because released
+# migration v004 compares promoted config values against them.
+
+# Former beam-angle sweep x positions.
 ANGLE_SWEEP_X_MIN_MM = 0.0
 ANGLE_SWEEP_X_STEP_MM = 100.0
 ANGLE_SWEEP_X_COUNT = 5
 
-# Stage-stall angle calibration: rotate until the stage jams against the shelf, then
-# refine. The sweep window is uniform, so it lives here; per-machine rotation centres
-# come from the tool parameters, and `angle_calibration_stage_stall_no_progress_timeout_s`
-# stays in `robot.grid.scan` because machines disagree on it.
+# Former stage-stall angle calibration sweep, probe and validation tuning.
 STAGE_STALL_COARSE_MIN_DEG = 0.0
 STAGE_STALL_COARSE_MAX_DEG = 5.5
 STAGE_STALL_COARSE_STEP_DEG = 1.0
