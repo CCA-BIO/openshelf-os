@@ -83,23 +83,11 @@ async def enter_scan_mode(tool: Any, side: StorageModuleSide, scan_config: Any) 
 
 	await tool.retract()
 
-	if side == StorageModuleSide.BACK:
-		await tool.move(
-			AxisCoordinate(x=BACK_MODULE_ROTATION_SAFE_X_MM, y=scan_y_mm, s=side_number)
-		)
-
-		rotation_before = await tool._mr.get_position()
-		print_status(f"rotation_before={rotation_before}")
-		await tool.rotate_to_position(target_position)
-		rotation_after = await tool._mr.get_position()
-		print_status(f"rotation_after={rotation_after}")
-		await tool.move(AxisCoordinate(x=scan_x_mm, y=scan_y_mm, s=side_number))
-	else:
-		rotation_before = await tool._mr.get_position()
-		print_status(f"rotation_before={rotation_before}")
-		await tool.move_facing(AxisCoordinate(x=scan_x_mm, y=scan_y_mm, s=side_number), target_position)
-		rotation_after = await tool._mr.get_position()
-		print_status(f"rotation_after={rotation_after}")
+	rotation_before = await tool._mr.get_position()
+	print_status(f"rotation_before={rotation_before}")
+	await tool.move_facing(AxisCoordinate(x=scan_x_mm, y=scan_y_mm, s=side_number), target_position)
+	rotation_after = await tool._mr.get_position()
+	print_status(f"rotation_after={rotation_after}")
 	await tool._ms.ready()
 	await tool._ms.move_to_position(stage_extension_mm)
 	await tool._mg.move_to_position(z_extension_mm, rpm=z_move_rpm, accel=z_move_accel)

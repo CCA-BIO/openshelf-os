@@ -5,10 +5,7 @@ from typing import Any, Callable
 
 import openshelf_os.laser_calibration.angle as angle_module
 from openshelf_os.laser_calibration.shelf_scout import filter_shelf_edges as filter_shared_shelf_edges
-from .constants import (
-	ROTATION_SAFE_X_MM,
-	SHELF_SCOUT_STEP_MM,
-)
+from .constants import SHELF_SCOUT_STEP_MM
 from .models import ShelfSurfaceEdge
 from .robot_ops import move_gantry_direct
 from .status import print_status, raise_if_cancelled
@@ -146,32 +143,18 @@ async def prepare_capture_pose(
 	should_abort: Callable[[], bool] | None = None,
 ) -> None:
 	if should_rotate is True and should_use_safe_back_rotation_path is True:
-		if await tool.is_rotation_at_position(absolute_rotation_deg):
-			await move_gantry_direct(
-				tool,
-				x_mm=x_mm,
-				y_mm=y_mm,
-				should_abort=should_abort,
-			)
-		else:
-			await move_gantry_direct(
-				tool,
-				x_mm=ROTATION_SAFE_X_MM,
-				y_mm=y_mm,
-				should_abort=should_abort,
-			)
-			original_x = await tool.ensure_safe_rotation_x_position()
-			try:
-				await tool.ensure_safe_rotation_stage_extension()
-				await tool._mr.move_to_position(absolute_rotation_deg)
-			finally:
-				await tool.restore_safe_rotation_x_position(original_x)
-			await move_gantry_direct(
-				tool,
-				x_mm=x_mm,
-				y_mm=y_mm,
-				should_abort=should_abort,
-			)
+		if await tool.is_rotation_at_position(absolute_rotation_deg) is False:
+			# Turn at the rotation-window point nearest X (in place when X is inside it); the
+			# gantry move below then goes straight to the capture X.
+			await tool.ensure_safe_rotation_x_position()
+			await tool.ensure_safe_rotation_stage_extension()
+			await tool._mr.move_to_position(absolute_rotation_deg)
+		await move_gantry_direct(
+			tool,
+			x_mm=x_mm,
+			y_mm=y_mm,
+			should_abort=should_abort,
+		)
 	else:
 		await move_gantry_direct(
 			tool,
