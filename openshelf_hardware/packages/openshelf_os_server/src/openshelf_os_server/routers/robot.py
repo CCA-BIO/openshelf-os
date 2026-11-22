@@ -2325,10 +2325,14 @@ async def stream_sse() -> EventSourceResponse:
                         yield {"data": inject_mode_field(overlay_db_occupancy(data, occupied_cells))}
                 waiters = {}
         finally:
-            await cancel_waiters(waiters.keys())
+            # A disconnect cancels sse-starlette's anyio task group, which re-cancels every
+            # suspending await here; unsubscribe before any of them, or the dead queues keep
+            # every later status payload alive (lb4a-9 OOM after a 12 h cycle test).
             await tracker.unsubscribe(tracker_queue)
             if worker is not None and status_queue is not None:
                 await worker.unsubscribe_status(status_queue)
+            for task in waiters:
+                task.cancel()
 
     return EventSourceResponse(
         event_generator(),
