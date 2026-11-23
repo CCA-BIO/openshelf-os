@@ -402,6 +402,8 @@ class YDescentTrialLeg(BaseModel):
     max_following_error_at_mm: float | None
     trace_failed: bool = Field(description="The drive stopped answering the trace registers; the server log has why")
     paused_at_mm: float | None = Field(description="Where the requested pause stopped the leg; null when it did not pause")
+    hold_start_mm: float | None = Field(description="Position once the paused drive had stopped")
+    hold_end_mm: float | None = Field(description="Position at the end of the hold, just before the resume")
     samples: List[FollowingErrorSampleModel]
 
 

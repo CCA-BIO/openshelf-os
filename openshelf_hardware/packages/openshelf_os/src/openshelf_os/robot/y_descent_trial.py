@@ -28,6 +28,8 @@ logger = logging.getLogger(__name__)
 
 # The brake sets within Pr4.20 (250 ms) of the park; the sag reading waits a little longer.
 SETTLE_AFTER_PARK_S = 0.5
+# Motor.stop() returns once the stop is written; the drive takes up to Pr5.10 (100 ms) to halt.
+SETTLE_AFTER_PAUSE_STOP_S = 0.3
 
 LegOutcome = Literal["completed", "drive_alarm", "stalled", "timeout", "error"]
 
@@ -46,6 +48,8 @@ class TrialLeg:
     max_following_error_at_mm: float | None = None
     trace_failed: bool = False
     paused_at_mm: float | None = None
+    hold_start_mm: float | None = None
+    hold_end_mm: float | None = None
     samples: list[FollowingErrorSample] = field(default_factory=list)
 
 
@@ -159,7 +163,8 @@ async def _run_leg(
         leg.end_mm = motor.position_mm()
         leg.samples = list(trace.samples)
         leg.trace_failed = trace.read_failed
-        leg.paused_at_mm = None if pause is None else pause.paused_at_mm
+        if pause is not None:
+            leg.paused_at_mm, leg.hold_start_mm, leg.hold_end_mm = pause.paused_at_mm, pause.hold_start_mm, pause.hold_end_mm
     # Leaving the stack parked the axis and restored its settings; let the brake set.
 
     await asyncio.sleep(SETTLE_AFTER_PARK_S)
@@ -192,6 +197,10 @@ class _PauseAt:
         self._real: Any = None
         self._pending = False
         self.paused_at_mm: float | None = None
+        # Read once the stop has finished and again just before the resume: their difference
+        # is how far the load slid while held on the descent current.
+        self.hold_start_mm: float | None = None
+        self.hold_end_mm: float | None = None
 
     @property
     def blocked(self) -> bool:
@@ -204,7 +213,10 @@ class _PauseAt:
 
     async def wait_clear(self) -> None:
         if self._pending:
-            await asyncio.sleep(self._pause_s)
+            await asyncio.sleep(min(SETTLE_AFTER_PAUSE_STOP_S, self._pause_s))
+            self.hold_start_mm = await self._motor.get_position()
+            await asyncio.sleep(max(0.0, self._pause_s - SETTLE_AFTER_PAUSE_STOP_S))
+            self.hold_end_mm = await self._motor.get_position()
             self._pending = False
         if self._real is not None:
             await self._real.wait_clear()

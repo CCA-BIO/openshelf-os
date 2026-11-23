@@ -180,6 +180,8 @@ class Run:
             "at_mm": fe_at_mm,
             "sag_mm": sag_mm,
             "paused_at_mm": None if leg is None else leg.get("paused_at_mm"),
+            "hold_start_mm": None if leg is None else leg.get("hold_start_mm"),
+            "hold_end_mm": None if leg is None else leg.get("hold_end_mm"),
             "trace_failed": None if leg is None else leg.get("trace_failed"),
         }
         self.rows.append(row)
@@ -286,6 +288,11 @@ def _format_row(row: dict) -> str:
     share = "-" if row["share_of_trip"] is None else f"{row['share_of_trip']:.0%}"
     sag = "-" if row["sag_mm"] is None else f"{row['sag_mm']:.2f}"
     paused = "" if row["paused_at_mm"] is None else f"  paused at {row['paused_at_mm']:.1f} mm"
+    if row.get("hold_start_mm") is not None and row.get("hold_end_mm") is not None:
+        paused += (
+            f", stopped {row['paused_at_mm'] - row['hold_start_mm']:.2f} mm later,"
+            f" slid {row['hold_start_mm'] - row['hold_end_mm']:.3f} mm in the hold"
+        )
     return (
         f"{row['current_a']:>4.1f} A  #{row['repeat']:<2} {row['outcome']:<11} fe {fe:>6} mm "
         f"({share} of {row['trip_mm']} mm trip) at {row['at_mm']} mm  sag {sag} mm{paused}"

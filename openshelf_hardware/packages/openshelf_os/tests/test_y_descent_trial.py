@@ -69,6 +69,9 @@ class _FakeMotor:
     def position_mm(self):
         return self.position
 
+    async def get_position(self):
+        return self.position
+
 
 class _FakeGuard:
     def __init__(self, blocked=False):
@@ -91,7 +94,9 @@ async def test_pause_blocks_once_as_the_descent_reaches_its_height_then_clears()
         motor.position = 499.2
         assert pause.blocked is True
         assert pause.paused_at_mm == 499.2
+        motor.position = 495.0
         await pause.wait_clear()
+        assert pause.hold_start_mm == 495.0 and pause.hold_end_mm == 495.0
         assert pause.blocked is False
         motor.position = 300.0
         assert pause.blocked is False
