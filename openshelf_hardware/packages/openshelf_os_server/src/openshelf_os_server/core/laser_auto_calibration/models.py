@@ -99,6 +99,10 @@ class LaserAutoCalibrationReferenceOffset(BaseModel):
     persisted: bool = False
     samples: list[LaserAutoCalibrationReferenceOffsetSample] = Field(default_factory=list)
     skipped: list[str] = Field(default_factory=list)
+    # "consensus": the xy offset is the median over the stored grid; "manual": the hand-set cells.
+    method: str = "manual"
+    consensus_sample_count: int = 0
+    movers: list[str] = Field(default_factory=list)
 
 
 class LaserAutoCalibrationGripperSample(BaseModel):

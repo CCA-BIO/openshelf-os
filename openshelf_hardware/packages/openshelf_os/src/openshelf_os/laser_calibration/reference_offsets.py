@@ -32,7 +32,7 @@ import math
 from statistics import median
 from typing import Any
 
-from openshelf_os.storage import Cell, StorageGrid, StorageModuleSide
+from openshelf_os.storage import Cell, CellStatus, StorageGrid, StorageModuleSide
 from .core import get_gripper_xy_correction, get_wall_depth_to_gripper_z_model, z_offset_at_stage
 from .recording import load_candidates_from_metadata, load_json_file
 from .scan import ScanDetectedCell
@@ -63,6 +63,18 @@ REFERENCE_Z_MAX_STAGE_CARRY_MM = 1.0
 REFERENCE_DATUM_SHELF_IDX = 0
 REFERENCE_DATUM_CELL_IDX = 0
 
+# The grid in service is the better reference once a side has one: every cell in it is where the
+# gripper works, so the offset is the median of (stored point - detection) over all of them, and a
+# single tray that sits differently moves only itself. lb4a-4 (2026-11-22): the bottom-left datum's
+# hole read 2.3mm off the other 40 front openings, and anchoring on it alone shifted every front
+# cell by that much; the median over the grid reproduced the 10-day-proven grid within 0.4mm.
+CONSENSUS_MIN_SAMPLES = 6
+# Healthy grids put the per-cell deltas within ~0.3mm of their median; a wider spread means the
+# stored grid no longer describes this side (cells moved or renumbered), so it is not a reference.
+CONSENSUS_MAX_MAD_MM = 0.75
+# A cell this far off the consensus moved, or its tray sits differently, or its hole was misread.
+CONSENSUS_MOVER_MM = 1.0
+
 
 @dataclass
 class ReferenceOffsetSample:
@@ -77,6 +89,9 @@ class ReferenceOffsetSample:
 	wall_depth_mm: float | None = None
 	derived_intercept_mm: float | None = None
 	z_captured_stage_mm: float | None = None
+	# An item over the hole hides it: the laser reads the item, not the opening (lb4a-4 F0:0,
+	# 2026-11-23: a plate read 10.8mm across the whole cross), so the sample frames no xy.
+	covered: bool = False
 
 
 @dataclass
@@ -96,10 +111,115 @@ class ReferenceOffsetResult:
 	# was given, in which case the intercepts are as captured.
 	z_stage_extension_mm: float | None = None
 	skipped: list[str] = field(default_factory=list)
+	# "consensus" when the xy offset is the grid-wide median, "manual" when the hand-set cells frame it.
+	method: str = "manual"
+	consensus_sample_count: int = 0
+	consensus_mad_x_mm: float | None = None
+	consensus_mad_y_mm: float | None = None
+	# Cells and reference cells more than CONSENSUS_MOVER_MM off the consensus, for the operator.
+	movers: list[str] = field(default_factory=list)
 
 	@property
 	def sample_count(self) -> int:
 		return len(self.samples)
+
+
+@dataclass
+class ConsensusOffset:
+	offset_x_mm: float
+	offset_y_mm: float
+	mad_x_mm: float
+	mad_y_mm: float
+	sample_count: int
+	movers: list[str] = field(default_factory=list)
+
+	@property
+	def is_consistent(self) -> bool:
+		return self.mad_x_mm <= CONSENSUS_MAX_MAD_MM and self.mad_y_mm <= CONSENSUS_MAX_MAD_MM
+
+
+def _is_covered(shelf_idx: int, cell: Cell, occupied_cells: frozenset[tuple[int, int]]) -> bool:
+	return (
+		cell.status == CellStatus.OCCUPIED
+		or cell.item is not None
+		or (int(shelf_idx), int(cell.cell_idx)) in occupied_cells
+	)
+
+
+def derive_consensus_offset(
+	*,
+	grid: StorageGrid,
+	side: StorageModuleSide,
+	detected_cells: list[ScanDetectedCell],
+	configured_offset_x_mm: float,
+	configured_offset_y_mm: float,
+	shelf_idx: int | None = None,
+	cell_idx: int | None = None,
+	occupied_cells: frozenset[tuple[int, int]] = frozenset(),
+) -> ConsensusOffset | None:
+	"""Median offset that keeps the stored grid where it is, or None with too few cells to judge.
+
+	Each calibrated, empty, in-service cell is matched to the opening the scan found near it and
+	contributes (stored point - detection). Disabled and maintenance cells are left out (they may be
+	out of service for a reason), and so are occupied ones, whose holes the items hide.
+	"""
+	samples: list[tuple[str, float, float, bool]] = []
+	used_keys: set[tuple[int, int]] = set()
+	prefix = "F" if side == StorageModuleSide.FRONT else "B"
+
+	for shelf in grid.get_side(side):
+		if shelf_idx is not None and int(shelf.shelf_idx) != int(shelf_idx):
+			continue
+
+		for cell in shelf.cells:
+			if cell_idx is not None and int(cell.cell_idx) != int(cell_idx):
+				continue
+
+			point = cell.calibration_point
+
+			if point is None or cell.status in (CellStatus.DISABLED, CellStatus.MAINTENANCE):
+				continue
+
+			if _is_covered(int(shelf.shelf_idx), cell, occupied_cells):
+				continue
+
+			matched = _match_detected_cell(
+				predicted_x_mm=float(point.x) - configured_offset_x_mm,
+				predicted_y_mm=float(point.y) - configured_offset_y_mm,
+				detected_cells=detected_cells,
+				used_keys=used_keys,
+			)
+
+			if matched is None:
+				continue
+
+			used_keys.add((int(matched.shelf_idx), int(matched.cell_idx)))
+			samples.append((
+				f"{prefix}{int(shelf.shelf_idx)}:{int(cell.cell_idx)}",
+				float(point.x) - float(matched.tool_x_mm),
+				float(point.y) - float(matched.tool_y_mm),
+				cell.is_manual is True,
+			))
+
+	if len(samples) < CONSENSUS_MIN_SAMPLES:
+		return None
+
+	offset_x_mm = float(median(sample[1] for sample in samples))
+	offset_y_mm = float(median(sample[2] for sample in samples))
+
+	return ConsensusOffset(
+		offset_x_mm=offset_x_mm,
+		offset_y_mm=offset_y_mm,
+		mad_x_mm=float(median(abs(sample[1] - offset_x_mm) for sample in samples)),
+		mad_y_mm=float(median(abs(sample[2] - offset_y_mm) for sample in samples)),
+		sample_count=len(samples),
+		movers=[
+			f"{'reference ' if is_manual else ''}{label}: ({dx - offset_x_mm:+.2f}, {dy - offset_y_mm:+.2f})mm "
+			f"off the side's consensus{'; re-check its hand-set point' if is_manual else ''}"
+			for label, dx, dy, is_manual in samples
+			if max(abs(dx - offset_x_mm), abs(dy - offset_y_mm)) > CONSENSUS_MOVER_MM
+		],
+	)
 
 
 def check_datum_stage_carry(result: ReferenceOffsetResult | None) -> None:
@@ -410,8 +530,13 @@ def derive_reference_offsets(
 	cell_idx: int | None = None,
 	candidates: list[Any] | None = None,
 	stage_extension_mm: float | None = None,
+	occupied_cells: frozenset[tuple[int, int]] = frozenset(),
 ) -> ReferenceOffsetResult:
-	"""Laser-to-gripper offset implied by the hand-calibrated cells in scope.
+	"""Laser-to-gripper offset for the side, from the stored grid or the hand-calibrated cells.
+
+	When the stored grid holds enough consistent cells in scope, the xy offset is their consensus
+	(`derive_consensus_offset`) and the hand-set cells only report whether they agree; otherwise
+	the hand-set cells frame it as below. The z intercept always comes from the hand-set cells.
 
 	The run-start guard is what makes the bottom-left datum a prerequisite; this reads whatever
 	manual cells the scope holds, so a full-side run medians the datum with any other hand-set
@@ -502,6 +627,7 @@ def derive_reference_offsets(
 
 		samples.append(
 			ReferenceOffsetSample(
+				covered=_is_covered(shelf_id, manual_cell, occupied_cells),
 				shelf_idx=shelf_id,
 				cell_idx=int(manual_cell.cell_idx),
 				manual_x_mm=manual_x_mm,
@@ -522,32 +648,76 @@ def derive_reference_offsets(
 			f"opening on the {side.value}: {'; '.join(skipped)}"
 		)
 
-	if len(samples) == 1:
-		# One datum is only as precise as the operator's jogging, so say so rather than let a
-		# single-cell derivation read as a measurement of the tool geometry.
-		logger.warning(
-			"reference_offset_single_sample",
-			extra={
-				"side": side.value,
-				"shelf_idx": samples[0].shelf_idx,
-				"cell_idx": samples[0].cell_idx,
-			},
-		)
+	consensus = derive_consensus_offset(
+		grid=grid,
+		side=side,
+		detected_cells=detected_cells,
+		configured_offset_x_mm=configured_offset_x_mm,
+		configured_offset_y_mm=configured_offset_y_mm,
+		shelf_idx=shelf_idx,
+		cell_idx=cell_idx,
+		occupied_cells=occupied_cells,
+	)
+	framing_samples = [sample for sample in samples if sample.covered is False]
+	for sample in samples:
+		if sample.covered:
+			skipped.append(
+				f"{side.value} {sample.shelf_idx}:{sample.cell_idx}: an item covers its hole, so it "
+				"frames no xy (its z still counts)"
+			)
 
-	deltas_x_mm = [sample.delta_x_mm for sample in samples]
-	deltas_y_mm = [sample.delta_y_mm for sample in samples]
-	offset_x_mm = float(median(deltas_x_mm))
-	offset_y_mm = float(median(deltas_y_mm))
-	spread_x_mm = max(deltas_x_mm) - min(deltas_x_mm)
-	spread_y_mm = max(deltas_y_mm) - min(deltas_y_mm)
+	method = "manual"
+	movers: list[str] = []
 
-	if spread_x_mm > REFERENCE_MAX_SPREAD_MM or spread_y_mm > REFERENCE_MAX_SPREAD_MM:
-		raise ValueError(
-			f"reference offsets: the manual reference cells on the {side.value} "
-			f"disagree by ({spread_x_mm:.2f}, {spread_y_mm:.2f})mm, above the "
-			f"{REFERENCE_MAX_SPREAD_MM:.2f}mm one fixed tool geometry can explain; re-check which "
-			"cells are marked manual before calibrating against them"
-		)
+	if consensus is not None and consensus.is_consistent:
+		method = "consensus"
+		offset_x_mm = consensus.offset_x_mm
+		offset_y_mm = consensus.offset_y_mm
+		movers = list(consensus.movers)
+		deltas_x_mm = [sample.delta_x_mm for sample in framing_samples] or [offset_x_mm]
+		deltas_y_mm = [sample.delta_y_mm for sample in framing_samples] or [offset_y_mm]
+		spread_x_mm = max(deltas_x_mm) - min(deltas_x_mm)
+		spread_y_mm = max(deltas_y_mm) - min(deltas_y_mm)
+	else:
+		if consensus is not None:
+			skipped.append(
+				f"{side.value} consensus: the stored grid's cells disagree with this scan by a median "
+				f"({consensus.mad_x_mm:.2f}, {consensus.mad_y_mm:.2f})mm over {consensus.sample_count} cells, "
+				f"above {CONSENSUS_MAX_MAD_MM:.2f}mm, so the hand-set cells frame the run"
+			)
+
+		if len(framing_samples) == 0:
+			raise ValueError(
+				f"reference offsets: every manual reference cell on the {side.value} is covered by an "
+				"item, so its hole cannot be measured; empty a reference cell's tray and run again"
+			)
+
+		if len(framing_samples) == 1:
+			# One datum is only as precise as the operator's jogging, so say so rather than let a
+			# single-cell derivation read as a measurement of the tool geometry.
+			logger.warning(
+				"reference_offset_single_sample",
+				extra={
+					"side": side.value,
+					"shelf_idx": framing_samples[0].shelf_idx,
+					"cell_idx": framing_samples[0].cell_idx,
+				},
+			)
+
+		deltas_x_mm = [sample.delta_x_mm for sample in framing_samples]
+		deltas_y_mm = [sample.delta_y_mm for sample in framing_samples]
+		offset_x_mm = float(median(deltas_x_mm))
+		offset_y_mm = float(median(deltas_y_mm))
+		spread_x_mm = max(deltas_x_mm) - min(deltas_x_mm)
+		spread_y_mm = max(deltas_y_mm) - min(deltas_y_mm)
+
+		if spread_x_mm > REFERENCE_MAX_SPREAD_MM or spread_y_mm > REFERENCE_MAX_SPREAD_MM:
+			raise ValueError(
+				f"reference offsets: the manual reference cells on the {side.value} "
+				f"disagree by ({spread_x_mm:.2f}, {spread_y_mm:.2f})mm, above the "
+				f"{REFERENCE_MAX_SPREAD_MM:.2f}mm one fixed tool geometry can explain; re-check which "
+				"cells are marked manual before calibrating against them"
+			)
 
 	return ReferenceOffsetResult(
 		side=side,
@@ -563,4 +733,9 @@ def derive_reference_offsets(
 		z_captured_stage_mm=_median_of_present([sample.z_captured_stage_mm for sample in samples]),
 		z_stage_extension_mm=None if stage_extension_mm is None else float(stage_extension_mm),
 		skipped=skipped,
+		method=method,
+		consensus_sample_count=0 if consensus is None else consensus.sample_count,
+		consensus_mad_x_mm=None if consensus is None else consensus.mad_x_mm,
+		consensus_mad_y_mm=None if consensus is None else consensus.mad_y_mm,
+		movers=movers,
 	)
