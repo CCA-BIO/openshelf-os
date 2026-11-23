@@ -35,6 +35,44 @@ async def test_clear_run_is_refused_outside_development_and_mock(client, monkeyp
 
 
 @pytest.mark.asyncio
+async def test_quick_run_is_allowed_in_production(client, monkeypatch) -> None:
+	# Quick tests only pick and place trays, so a customer device can run them.
+	grid = build_grid()
+	pick = AsyncMock()
+	worker = build_worker(grid, pick)
+	worker.get_status_snapshot = AsyncMock(return_value=None)
+	monkeypatch.setattr(robot_core, "robot_worker", worker)
+	monkeypatch.setattr(cycle_test, "get_robot_worker", AsyncMock(return_value=worker))
+	monkeypatch.setattr(cycle_test, "get_operating_mode", lambda: OperatingMode.production)
+	manager = cycle_test.CycleTestManager()
+	monkeypatch.setattr(cycle_test, "_manager", manager)
+
+	with patch_worker(worker)[0], patch_worker(worker)[1]:
+		resp = await client.post("/api/calibration/cycle-test", json={"mode": "quick", "target": "F:0:0"})
+		assert resp.status_code == 200
+		await manager.wait()
+
+	snapshot = (await client.get("/api/calibration/cycle-test")).json()
+	assert snapshot["state"] == "completed"
+	assert [r["cell"] for r in snapshot["results"]] == ["F:0:0"]
+	assert pick.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_quick_run_refuses_to_clear_items(client) -> None:
+	# Quick tests leave inventory alone; clearing it would only destroy the customer's records.
+	async with AsyncSessionLocal() as db:
+		db.add(Item(barcode="KEEP-2", name="keep", dimensions={"width": 10, "height": 10, "length": 10}))
+		await db.commit()
+
+	resp = await client.post("/api/calibration/cycle-test", json={"mode": "quick", "clear": True})
+
+	assert resp.status_code == 422
+	async with AsyncSessionLocal() as db:
+		assert (await db.execute(select(Item).where(Item.barcode == "KEEP-2"))).scalar_one_or_none() is not None
+
+
+@pytest.mark.asyncio
 async def test_run_stops_moving_after_the_first_failing_cell(client, monkeypatch, caplog) -> None:
 	# A failed cell may leave the tool in an unknown state; the run must not go on to the next cell.
 	grid = build_grid()

@@ -25,7 +25,6 @@ from sqlalchemy import select
 
 from openshelf_os.operating_mode import OperatingMode
 from openshelf_os.robot.core import DEMO_MAP_MISSING_SUFFIX
-from openshelf_os.tool import MAX_PICK_LIFT_MM
 from openshelf_os_server.core.auth import AuthService
 from openshelf_os_server.core.robot import get_robot_worker
 from openshelf_os_server.database.models import Item, ItemLocation
@@ -46,7 +45,7 @@ LOG_LIMIT = 300
 TOKEN_REFRESH_S = 600.0
 CORRELATION_HEADER = "X-Correlation-ID"
 
-CycleMode = Literal["retrieve_store", "store_retrieve", "store_only", "retrieve_only", "quick", "quick_lift"]
+CycleMode = Literal["retrieve_store", "store_retrieve", "store_only", "retrieve_only", "quick"]
 RunState = Literal["idle", "running", "paused", "completed", "failed", "cancelled"]
 TERMINAL_STATES = {"idle", "completed", "failed", "cancelled"}
 SIDES = ("F", "B")
@@ -112,12 +111,11 @@ def _blank_to_none(value: Optional[str]) -> Optional[str]:
 
 class CycleTestConfig(BaseModel):
 	mode: CycleMode = Field("retrieve_store", description="Cycle variant; mirrors the script's mode flags")
-	lift_mm: Optional[float] = Field(None, gt=0, le=MAX_PICK_LIFT_MM, description="Lift height for quick_lift mode")
 	target: Optional[str] = Field(None, description="SIDE, SHELF, SIDE:SHELF, SHELF:CELL, or SIDE:SHELF:CELL")
 	start: Optional[str] = Field(None, description="First cell to test, SIDE:SHELF:CELL")
 	skip: Optional[str] = Field(None, description="Comma-separated SIDE:SHELF or SIDE:SHELF:CELL patterns")
 	shuffle: bool = False
-	clear: bool = Field(False, description="Delete every item and item location before the first loop")
+	clear: bool = Field(False, description="Delete every item and item location before the first loop; not allowed in quick mode")
 	loop: Optional[int] = Field(None, ge=0, description="Omit to run once, 0 to repeat until aborted, N to repeat N times")
 	step: bool = Field(False, description="Pause after every cell and continue past failures")
 
@@ -128,10 +126,8 @@ class CycleTestConfig(BaseModel):
 
 	@model_validator(mode="after")
 	def _validate(self) -> "CycleTestConfig":
-		if self.mode == "quick_lift" and self.lift_mm is None:
-			raise ValueError("quick_lift mode requires lift_mm")
-		if self.mode != "quick_lift":
-			self.lift_mm = None
+		if self.mode == "quick" and self.clear:
+			raise ValueError("quick mode leaves items in place, so it cannot clear them")
 		if self.target is not None:
 			_parse_target(self.target)
 		if self.start is not None:
@@ -488,11 +484,9 @@ class CycleTestRunner:
 		return None
 
 	async def quick(self, side: str, shelf: int, cell: int) -> Optional[Failure]:
-		params = {"lift": f"{self.config.lift_mm:g}"} if self.config.lift_mm is not None else None
 		started = time.monotonic()
 		resp = await self.client.post(
 			"/api/calibration/test",
-			params=params,
 			json={"side": side, "shelf_idx": shelf, "cell_idx": cell},
 		)
 		if resp.status_code != 200:
@@ -597,9 +591,8 @@ class CycleTestRunner:
 			self.log(f"  - {label}: OK")
 			return True
 
-		if mode in ("quick", "quick_lift"):
-			label = f"Quick lift ({self.config.lift_mm:g} mm)" if mode == "quick_lift" else "Quick pick/place"
-			result.passed = await step(mode, label, await self.quick(side, shelf, cell))
+		if mode == "quick":
+			result.passed = await step(mode, "Quick pick/place", await self.quick(side, shelf, cell))
 			return
 
 		barcode = await self.item_at(side, shelf, cell)
@@ -724,10 +717,7 @@ class CycleTestRunner:
 	async def run(self) -> None:
 		snapshot = self.snapshot
 		config = self.config
-		name = {
-			"quick": "Quick Pick/Place Test",
-			"quick_lift": f"Quick Lift Test ({config.lift_mm:g} mm)" if config.lift_mm else "",
-		}.get(config.mode, f"Cycle Test ({config.mode})")
+		name = "Quick Pick/Place Test" if config.mode == "quick" else f"Cycle Test ({config.mode})"
 		final: RunState = "completed"
 		try:
 			while True:
@@ -818,7 +808,8 @@ class CycleTestManager:
 		async with self._lock:
 			if self.is_active():
 				raise CycleTestStartError("cycle_test_running", "")
-			if get_operating_mode() not in ALLOWED_MODES:
+			# Quick tests only pick and place trays; the other modes create and delete items.
+			if config.mode != "quick" and get_operating_mode() not in ALLOWED_MODES:
 				raise CycleTestStartError(
 					"cycle_test_mode",
 					"",

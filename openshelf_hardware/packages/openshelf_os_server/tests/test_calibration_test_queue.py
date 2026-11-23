@@ -45,7 +45,6 @@ def build_grid(*, second_cell_status: CellStatus = CellStatus.AVAILABLE) -> Stor
 def build_worker(grid: StorageGrid, pick: AsyncMock):
 	tool = SimpleNamespace(
 		pick=pick,
-		pick_lift_place=AsyncMock(),
 		place=AsyncMock(),
 		retract=AsyncMock(),
 		_ms=SimpleNamespace(get_position=AsyncMock(return_value=0.0)),

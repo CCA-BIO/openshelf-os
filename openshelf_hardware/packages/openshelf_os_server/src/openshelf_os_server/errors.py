@@ -162,7 +162,7 @@ CODE_MESSAGES: dict[str, str] = {
 	"cycle_test_barcode_unavailable": "A test barcode could not be generated. Clear old test items, then run the test again.",
 	"cycle_test_clear_failed": "The items could not be cleared before the test.",
 	"cycle_test_location_mismatch": "The robot finished the move, but the database does not show the item where it should be.",
-	"cycle_test_mode": "Cycle tests run only in development or mock mode because they create and delete items.",
+	"cycle_test_mode": "Store and retrieve cycle tests run only in development or mock mode because they create and delete items. Quick tests run in any mode.",
 	"cycle_test_no_cells": "No cells match the test settings.",
 	"cycle_test_not_paused": "The cycle test is not paused.",
 	"cycle_test_not_running": "No cycle test is running.",

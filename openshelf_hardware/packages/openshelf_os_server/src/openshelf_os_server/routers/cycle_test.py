@@ -45,9 +45,10 @@ async def start_cycle_test(
 	Server-side equivalent of `provision/scripts/cycle_test.py`: walks the enabled storage
 	cells, creating test items and running real store/retrieve commands (or calibration
 	quick tests) through this API as the calling user, and stops at the first failure or
-	hardware fault. Runs only in development or mock mode because it creates and deletes
-	items; `clear` deletes every item first. Follow progress on `GET /stream`. Returns `409`
-	while another cycle test runs.
+	hardware fault. Store and retrieve modes run only in development or mock mode because they
+	create and delete items; `clear` deletes every item first. Quick mode only picks and places
+	trays, so it runs in any mode and rejects `clear`. Follow progress on `GET /stream`.
+	Returns `409` while another cycle test runs.
 	"""
 	try:
 		return await get_cycle_test_manager().start(request.app, current_user, config)

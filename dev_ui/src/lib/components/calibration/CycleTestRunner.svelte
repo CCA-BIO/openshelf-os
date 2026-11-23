@@ -19,12 +19,10 @@
 		{ value: 'store_retrieve', label: 'store → retrieve' },
 		{ value: 'store_only', label: 'store only' },
 		{ value: 'retrieve_only', label: 'retrieve only' },
-		{ value: 'quick', label: 'quick pick/place' },
-		{ value: 'quick_lift', label: 'quick lift' }
+		{ value: 'quick', label: 'quick pick/place' }
 	];
 
 	let mode = $state<CycleTestMode>('retrieve_store');
-	let liftMm = $state<number | null>(10);
 	let target = $state<string>('');
 	let start = $state<string>('');
 	let skip = $state<string>('');
@@ -41,7 +39,15 @@
 	let now = $state<number>(0);
 	let clock: ReturnType<typeof setInterval> | null = null;
 
+	// Quick tests only pick and place trays, so they never clear the device's items.
+	const isQuick = $derived(mode === 'quick');
 	const isActive = $derived(snapshot?.state === 'running' || snapshot?.state === 'paused');
+
+	$effect(function () {
+		if (isQuick === true) {
+			clear = false;
+		}
+	});
 	const passedCount = $derived(snapshot?.results.filter((result) => result.passed).length ?? 0);
 	const doneCount = $derived(
 		snapshot?.results.filter((result) => result.cell !== snapshot?.current).length ?? 0
@@ -177,7 +183,6 @@
 	function buildConfig(): CycleTestConfig {
 		return {
 			mode,
-			lift_mm: mode === 'quick_lift' ? Number(liftMm) : null,
 			target: target.trim() || null,
 			start: start.trim() || null,
 			skip: skip.trim() || null,
@@ -192,7 +197,7 @@
 		try {
 			window.localStorage.setItem(
 				CONFIG_STORAGE_KEY,
-				JSON.stringify({ mode, liftMm, target, start, skip, shuffle, step, loop, loopCount })
+				JSON.stringify({ mode, target, start, skip, shuffle, step, loop, loopCount })
 			);
 		} catch {
 			return;
@@ -208,7 +213,6 @@
 			}
 
 			mode = MODES.some((item) => item.value === stored.mode) ? stored.mode : mode;
-			liftMm = typeof stored.liftMm === 'number' ? stored.liftMm : liftMm;
 			target = typeof stored.target === 'string' ? stored.target : target;
 			start = typeof stored.start === 'string' ? stored.start : start;
 			skip = typeof stored.skip === 'string' ? stored.skip : skip;
@@ -297,18 +301,7 @@
 						{/each}
 					</select>
 				</td>
-				<td>
-					<span class="field-label">lift mm</span>
-					<input
-						type="number"
-						min="1"
-						max="30"
-						step="0.5"
-						bind:value={liftMm}
-						disabled={isActive || mode !== 'quick_lift'}
-					/>
-				</td>
-				<td>
+				<td colspan="2">
 					<span class="field-label">loop</span>
 					<div class="inline">
 						<select bind:value={loop} disabled={isActive}>
@@ -368,7 +361,7 @@
 			</tr>
 			<tr>
 				<td colspan="3">
-					<label class="toggle"><input type="checkbox" bind:checked={clear} disabled={isActive} /><span>clear all items first</span></label>
+					<label class="toggle"><input type="checkbox" bind:checked={clear} disabled={isActive || isQuick} /><span>clear all items first</span></label>
 				</td>
 			</tr>
 			<tr>

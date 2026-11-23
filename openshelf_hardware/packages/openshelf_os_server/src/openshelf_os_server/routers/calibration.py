@@ -9,7 +9,7 @@ import re
 from datetime import datetime, timezone
 from uuid import uuid4
 from collections.abc import Awaitable, Callable
-from typing import Annotated, Any, Literal, Optional, ParamSpec, TypeVar
+from typing import Any, Literal, Optional, ParamSpec, TypeVar
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field, FiniteFloat
 from openshelf_os_server.sse import EventSourceResponse
@@ -18,7 +18,7 @@ from openshelf_os.common import AxisCoordinate
 from openshelf_os.common import Parameters
 from openshelf_os.config.settings import DemoFridgeDoorPositionsSettings
 from openshelf_os.exceptions import FridgeSafetyError
-from openshelf_os.tool import MAX_PICK_LIFT_MM, require_grip
+from openshelf_os.tool import require_grip
 from openshelf_os.robot.worker import axis_named_in, fault_needs_home_axes, is_rotation_clearance_refusal
 from openshelf_os.storage import (
 	CalibrationCoordinate,
@@ -97,7 +97,6 @@ P = ParamSpec("P")
 T = TypeVar("T")
 
 _calibration_state_lock = asyncio.Lock()
-QUICK_LIFT_HOLD_SECONDS = 1.0
 
 
 def serialize_calibration_state(function: Callable[P, Awaitable[T]]) -> Callable[P, Awaitable[T]]:
@@ -1235,31 +1234,23 @@ async def jog_axis(request: JogRequest) -> PositionResponse:
     responses=response_docs(model=BooleanSuccess, errors=(400, 401, 403, 409, 503)),
 )
 @serialize_calibration_state
-async def test_gripper(
-	request: TestRequest,
-	lift: Annotated[float | None, Query(gt=0, le=MAX_PICK_LIFT_MM)] = None,
-):
+async def test_gripper(request: TestRequest):
 	"""Test a cell pick or place.
 
-	Runs the selected cell gripper test on physical hardware. Optional `lift` requests a
-	bounded pick/lift/place test. Tray homes are supported; disabled or maintenance cells
-	are rejected. This tests
-	motion without saving new calibration coordinates. To queue many cells without
+	Picks the tray at the selected cell and places it back on physical hardware. Tray homes
+	are supported; disabled or maintenance cells are rejected. This tests motion without
+	saving new calibration coordinates. To queue many cells without
 	depending on the browser tab staying active, use the cell test queue.
 	"""
 	await ensure_laser_auto_calibration_not_running()
 
 	worker = await get_robot_worker_or_503()
 
-	await _perform_quick_test(worker, _build_test_location(request), lift)
+	await _perform_quick_test(worker, _build_test_location(request))
 	return {"success": True}
 
 
-async def _perform_quick_test(
-	worker,
-	location: StorageModuleCellLocation,
-	lift: float | None,
-) -> None:
+async def _perform_quick_test(worker, location: StorageModuleCellLocation) -> None:
 	"""Run one cell gripper test; shared by the single-cell endpoint and the test queue."""
 	global _current_position
 
@@ -1289,11 +1280,8 @@ async def _perform_quick_test(
 		)
 
 		try:
-			if lift is None:
-				await tool.pick(coord)
-				await tool.place(coord)
-			else:
-				await tool.pick_lift_place(coord, lift, QUICK_LIFT_HOLD_SECONDS)
+			await tool.pick(coord)
+			await tool.place(coord)
 		except (MotorError, HardwareMotorError, ToolError) as e:
 			await _raise_motor_error(worker, "The cell test failed.", e)
 
@@ -1514,12 +1502,6 @@ class TestQueueRequest(BaseModel):
 	side: StorageModuleSide
 	mode: Literal["quick", "cycle"]
 	cells: list[TestQueueCell] = Field(min_length=1, max_length=MAX_TEST_QUEUE_CELLS)
-	lift: Optional[float] = Field(
-		None,
-		gt=0,
-		le=MAX_PICK_LIFT_MM,
-		description="Optional pick/lift/place height in millimeters for quick mode",
-	)
 
 
 class TestQueueSnapshot(BaseModel):
@@ -1595,7 +1577,6 @@ async def _run_cell_test_queue(
 	worker,
 	snapshot: TestQueueSnapshot,
 	locations: list[StorageModuleCellLocation],
-	lift: Optional[float],
 ) -> None:
 	for location in locations:
 		if _test_queue_abort_requested:
@@ -1611,7 +1592,7 @@ async def _run_cell_test_queue(
 			if snapshot.mode == "quick":
 				async with _calibration_state_lock:
 					await ensure_laser_auto_calibration_not_running()
-					await _perform_quick_test(worker, location, lift)
+					await _perform_quick_test(worker, location)
 			else:
 				await ensure_laser_auto_calibration_not_running()
 				await _perform_cycle_test(worker, location)
@@ -1688,7 +1669,7 @@ async def start_cell_test_queue(request: TestQueueRequest) -> TestQueueSnapshot:
 			for cell in request.cells
 		]
 		_test_queue_task = asyncio.create_task(
-			_run_cell_test_queue(worker, snapshot, locations, request.lift)
+			_run_cell_test_queue(worker, snapshot, locations)
 		)
 
 	return snapshot.model_copy(deep=True)

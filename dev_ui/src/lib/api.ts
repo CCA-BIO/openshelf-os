@@ -496,12 +496,10 @@ export type CycleTestMode =
 	| 'store_retrieve'
 	| 'store_only'
 	| 'retrieve_only'
-	| 'quick'
-	| 'quick_lift';
+	| 'quick';
 
 export type CycleTestConfig = {
 	mode: CycleTestMode;
-	lift_mm: number | null;
 	target: string | null;
 	start: string | null;
 	skip: string | null;

@@ -36,7 +36,6 @@ DEFAULT_STAGE_RETRACT_TARGET_MM = 3.0
 DEFAULT_Z_RETRACT_TARGET_MM = 1.0
 DEFAULT_ROTATION_STAGE_MAX_EXTENSION_MM = 5.0
 DEFAULT_ROTATION_Z_MAX_EXTENSION_MM = 5.0
-MAX_PICK_LIFT_MM = 30.0
 Y_STARTUP_HOME_CLEARANCE_MM = 10.0
 Y_STARTUP_HOME_PEAK_CURRENT = 30
 
@@ -737,46 +736,6 @@ class Tool:
             if isinstance(e, MovementError):
                 raise
             raise rewrap_gripper_fault(e, "Pick operation failed") from e
-
-    async def pick_lift_place(
-        self,
-        coordinate: c.AxisCoordinate,
-        lift_mm: float,
-        hold_seconds: float,
-    ) -> None:
-        if not 0 < lift_mm <= MAX_PICK_LIFT_MM:
-            raise GripperError(f"Lift must be greater than zero and at most {MAX_PICK_LIFT_MM:g} mm")
-
-        try:
-            if self._my is None or self._ms is None:
-                raise MotorError("Y and stage motors required for pick lift/place")
-
-            target_position: Literal["front", "back"] = "front" if coordinate.s == 0 else "back"
-
-            await self._gs.safe_open()
-            await self.move_facing(coordinate, target_position)
-            await self.extend_empty(coordinate)
-            require_grip(
-                await self._gs.open(),
-                "grip",
-                is_enabled=self.is_grip_detection_enabled,
-                failure_code=GRIP_PICK_FAILED_CODE,
-            )
-            original_stage_mm = await self._ms.get_position()
-            await self._ms.move_to_position(0.0)
-            await self._my.move_to_position(coordinate.y + lift_mm)
-            await asyncio.sleep(hold_seconds)
-            require_grip(await self._gs.read_state(), "lift hold", is_enabled=self.is_grip_detection_enabled)
-            await self._my.move_to_position(coordinate.y)
-            await self._ms.move_to_position(original_stage_mm)
-            await self.release("set-down release")
-            await self.retract_empty()
-
-        except Exception as e:
-            await self._handle_fault(e)
-            if isinstance(e, MovementError):
-                raise
-            raise rewrap_gripper_fault(e, "Pick lift/place operation failed") from e
 
     async def release(self, phase: str) -> None:
         """Open the fingers and confirm they hold nothing before the tool withdraws."""
