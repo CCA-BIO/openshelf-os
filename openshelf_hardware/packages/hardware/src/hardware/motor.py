@@ -1460,6 +1460,7 @@ class Motor():
                 "limit_mm": self._params.lim,
                 "rpm": self._move_rpm,
                 "accel": self._move_accel,
+                "peak_current": self._written_peak_current,
                 "run_id": self._diagnostic_run_id,
                 "correlation_id": self._diagnostic_correlation_id,
             }
