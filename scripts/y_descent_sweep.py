@@ -43,6 +43,11 @@ the carriage, home Y, and run one trial with --end-mm about 5 mm below the point
 stops on the trip; read the peak force from the gauge. Repeat at the configured current to get
 today's number. The trial fails by design, so step 6 applies after each run.
 
+--pause-at-mm stops each descent part-way through the machine's own safety-guard pause (what a
+light curtain break does), holds the load for --pause-s, then resumes. The stop brakes harder
+than the end of a move, and the hold runs on the descent current; both show in the following
+error and the row reports where it paused.
+
 --leg lift sweeps the climb current instead (descent at the configured current), to measure
 how much of the configured current lifting actually needs.
 
@@ -146,6 +151,9 @@ class Run:
         body: dict = {"start_mm": args.start_mm, "end_mm": args.end_mm, "following_error_trip_mm": trip_mm}
         if args.rpm is not None:
             body["rpm"] = args.rpm
+        if args.pause_at_mm is not None:
+            body["pause_at_mm"] = args.pause_at_mm
+            body["pause_s"] = args.pause_s
         if args.leg == "descent":
             body["descent_peak_current"] = current
         else:
@@ -171,6 +179,7 @@ class Run:
             "share_of_trip": max(shares) if shares else None,
             "at_mm": fe_at_mm,
             "sag_mm": sag_mm,
+            "paused_at_mm": None if leg is None else leg.get("paused_at_mm"),
             "trace_failed": None if leg is None else leg.get("trace_failed"),
         }
         self.rows.append(row)
@@ -276,9 +285,10 @@ def _format_row(row: dict) -> str:
     fe = "-" if row["max_following_error_mm"] is None else f"{row['max_following_error_mm']:.2f}"
     share = "-" if row["share_of_trip"] is None else f"{row['share_of_trip']:.0%}"
     sag = "-" if row["sag_mm"] is None else f"{row['sag_mm']:.2f}"
+    paused = "" if row["paused_at_mm"] is None else f"  paused at {row['paused_at_mm']:.1f} mm"
     return (
         f"{row['current_a']:>4.1f} A  #{row['repeat']:<2} {row['outcome']:<11} fe {fe:>6} mm "
-        f"({share} of {row['trip_mm']} mm trip) at {row['at_mm']} mm  sag {sag} mm"
+        f"({share} of {row['trip_mm']} mm trip) at {row['at_mm']} mm  sag {sag} mm{paused}"
     )
 
 
@@ -320,6 +330,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--margin", type=float, default=0.5, help="Stop once peak following error passes this share of the trip")
     parser.add_argument("--max-sag-mm", type=float, default=0.1, help="Fail a trial whose carriage drops more than this after parking")
     parser.add_argument("--rpm", type=int, default=None, help="Trial speed; default is the configured speed")
+    parser.add_argument("--pause-at-mm", type=float, default=None, help="Pause each descent here through the safety-guard stop")
+    parser.add_argument("--pause-s", type=float, default=5.0, help="How long each paused descent holds")
     parser.add_argument("--output", default="y-descent-sweep", help="Directory for trial JSON and summary.csv")
     parser.add_argument("--check-only", action="store_true", help="One baseline trial at the configured current, then stop")
     parser.add_argument("--yes", action="store_true", help="Skip the confirmation prompt")

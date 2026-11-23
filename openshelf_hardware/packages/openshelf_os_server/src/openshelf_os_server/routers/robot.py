@@ -371,6 +371,11 @@ class YDescentTrialRequest(BaseModel):
         default=40.0, gt=0, le=200, description="Drive following-error trip armed for every trial-current leg"
     )
     rpm: int | None = Field(default=None, ge=1, description="Speed for both legs; omit for the configured speed")
+    pause_at_mm: FiniteFloat | None = Field(
+        default=None,
+        description="Stop the descent through the safety-guard pause once it reaches this height, between `end_mm` and `start_mm`",
+    )
+    pause_s: float = Field(default=5.0, gt=0, le=60, description="How long the paused descent holds before it resumes")
 
 
 class FollowingErrorSampleModel(BaseModel):
@@ -396,6 +401,7 @@ class YDescentTrialLeg(BaseModel):
     )
     max_following_error_at_mm: float | None
     trace_failed: bool = Field(description="The drive stopped answering the trace registers; the server log has why")
+    paused_at_mm: float | None = Field(description="Where the requested pause stopped the leg; null when it did not pause")
     samples: List[FollowingErrorSampleModel]
 
 
@@ -2263,6 +2269,12 @@ async def run_y_descent_trial(
             "request_invalid",
             "The trial must descend between the Y travel limits.",
         )
+    if request.pause_at_mm is not None and not request.end_mm < request.pause_at_mm < request.start_mm:
+        raise api_error(
+            status.HTTP_400_BAD_REQUEST,
+            "request_invalid",
+            "The pause must fall between the end and the start of the descent.",
+        )
     if any(
         current is not None and current > configured_peak_current
         for current in (request.descent_peak_current, request.approach_peak_current)
@@ -2286,6 +2298,8 @@ async def run_y_descent_trial(
                     approach_peak_current=request.approach_peak_current,
                     following_error_trip_mm=request.following_error_trip_mm,
                     rpm=request.rpm,
+                    pause_at_mm=request.pause_at_mm,
+                    pause_s=request.pause_s,
                 )
             except MotorConfigError:
                 # A refusal touches nothing; a failed restore may leave a trial current behind.

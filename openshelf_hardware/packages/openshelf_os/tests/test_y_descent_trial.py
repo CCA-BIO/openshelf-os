@@ -3,12 +3,14 @@
 import pathlib
 import sys
 
+import pytest
+
 BASE = pathlib.Path(__file__).resolve()
 sys.path.insert(0, str(BASE.parents[1] / "src"))
 sys.path.insert(0, str(BASE.parents[3] / "packages" / "hardware" / "src"))
 
 from hardware.motor import FollowingErrorSample
-from openshelf_os.robot.y_descent_trial import peak_following_error
+from openshelf_os.robot.y_descent_trial import _PauseAt, peak_following_error
 
 # 10000 ppr command pulses and 4000 cpr encoder counts at 40 mm/rev.
 PROFILE_PER_MM = 250.0
@@ -57,3 +59,54 @@ def test_carriage_running_ahead_at_the_stop_is_the_peak():
 
 def test_no_samples_leaves_the_error_unknown():
     assert peak_following_error([], profile_per_mm=PROFILE_PER_MM, feedback_per_mm=FEEDBACK_PER_MM) == (None, None)
+
+
+class _FakeMotor:
+    def __init__(self, position_mm, safety):
+        self.position = position_mm
+        self._safety = safety
+
+    def position_mm(self):
+        return self.position
+
+
+class _FakeGuard:
+    def __init__(self, blocked=False):
+        self.blocked = blocked
+        self.waits = 0
+
+    async def wait_clear(self):
+        self.waits += 1
+
+
+@pytest.mark.asyncio
+async def test_pause_blocks_once_as_the_descent_reaches_its_height_then_clears():
+    real = _FakeGuard()
+    motor = _FakeMotor(700.0, real)
+    pause = _PauseAt(motor, at_mm=500.0, pause_s=0.0)
+
+    with pause.installed():
+        assert motor._safety is pause
+        assert pause.blocked is False
+        motor.position = 499.2
+        assert pause.blocked is True
+        assert pause.paused_at_mm == 499.2
+        await pause.wait_clear()
+        assert pause.blocked is False
+        motor.position = 300.0
+        assert pause.blocked is False
+
+    assert motor._safety is real
+    assert pause.paused_at_mm == 499.2
+    assert real.waits == 1
+
+
+@pytest.mark.asyncio
+async def test_pause_still_passes_the_real_guard_through():
+    real = _FakeGuard(blocked=True)
+    motor = _FakeMotor(700.0, real)
+    pause = _PauseAt(motor, at_mm=500.0, pause_s=0.0)
+
+    with pause.installed():
+        assert pause.blocked is True
+        assert pause.paused_at_mm is None

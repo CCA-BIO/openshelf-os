@@ -6,6 +6,10 @@ A trial climbs to `start_mm`, then descends to `end_mm` at the trial current beh
 following-error trip, tracing the drive's live following error on both legs. The drive holds the
 falling load hardest while it decelerates at the bottom of the descent, so the trace peaks there
 first as the current drops.
+
+`pause_at_mm` stops the descent part-way through the same safety-guard pause a light curtain
+break causes: the drive stops, holds the load energised at the descent current for `pause_s`,
+then the move resumes. That stop brakes harder than the end of a move.
 """
 
 from __future__ import annotations
@@ -13,7 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -41,6 +45,7 @@ class TrialLeg:
     max_following_error_mm: float | None = None
     max_following_error_at_mm: float | None = None
     trace_failed: bool = False
+    paused_at_mm: float | None = None
     samples: list[FollowingErrorSample] = field(default_factory=list)
 
 
@@ -75,6 +80,8 @@ async def run_descent_trial(
     following_error_trip_mm: float,
     approach_peak_current: int | None = None,
     rpm: int | None = None,
+    pause_at_mm: float | None = None,
+    pause_s: float = 5.0,
 ) -> TrialResult:
     """Run one trial; a leg that fails is reported in the result, not raised.
 
@@ -96,6 +103,7 @@ async def run_descent_trial(
             peak_current=descent_peak_current,
             following_error_trip_mm=following_error_trip_mm,
             rpm=rpm,
+            pause=None if pause_at_mm is None else _PauseAt(motor, pause_at_mm, pause_s),
         )
 
     params = motor._params
@@ -117,6 +125,7 @@ async def _run_leg(
     peak_current: int | None,
     following_error_trip_mm: float,
     rpm: int | None,
+    pause: "_PauseAt | None" = None,
 ) -> TrialLeg:
     leg = TrialLeg(peak_current=peak_current, start_mm=motor.position_mm(), target_mm=target_mm)
 
@@ -126,6 +135,8 @@ async def _run_leg(
                 motor.trial_drive_settings(peak_current=peak_current, following_error_mm=following_error_trip_mm)
             )
         trace = await stack.enter_async_context(motor.trace_following_error())
+        if pause is not None:
+            stack.enter_context(pause.installed())
         started_at = time.monotonic()
         try:
             await motor.move_to_position(target_mm, rpm=rpm)
@@ -148,6 +159,7 @@ async def _run_leg(
         leg.end_mm = motor.position_mm()
         leg.samples = list(trace.samples)
         leg.trace_failed = trace.read_failed
+        leg.paused_at_mm = None if pause is None else pause.paused_at_mm
     # Leaving the stack parked the axis and restored its settings; let the brake set.
 
     await asyncio.sleep(SETTLE_AFTER_PARK_S)
@@ -163,6 +175,48 @@ async def _run_leg(
         feedback_per_mm=int(getattr(params, "encoder_resolution_cpr", 4000)) / float(params.mpr),
     )
     return leg
+
+
+class _PauseAt:
+    """Stands in for the motor's safety guard during one leg and blocks it once.
+
+    Blocks as the descent first reaches `at_mm` and clears `pause_s` later, so the motor's own
+    safety pause stops the drive, holds the load, and resumes the move. The real guard still
+    applies throughout: its block and wait are passed through.
+    """
+
+    def __init__(self, motor: Any, at_mm: float, pause_s: float) -> None:
+        self._motor = motor
+        self._at_mm = at_mm
+        self._pause_s = pause_s
+        self._real: Any = None
+        self._pending = False
+        self.paused_at_mm: float | None = None
+
+    @property
+    def blocked(self) -> bool:
+        if self.paused_at_mm is None:
+            position = self._motor.position_mm()
+            if position is not None and position <= self._at_mm:
+                self.paused_at_mm = position
+                self._pending = True
+        return self._pending or bool(self._real is not None and self._real.blocked)
+
+    async def wait_clear(self) -> None:
+        if self._pending:
+            await asyncio.sleep(self._pause_s)
+            self._pending = False
+        if self._real is not None:
+            await self._real.wait_clear()
+
+    @contextmanager
+    def installed(self):
+        self._real = self._motor._safety
+        self._motor._safety = self
+        try:
+            yield self
+        finally:
+            self._motor._safety = self._real
 
 
 def peak_following_error(
