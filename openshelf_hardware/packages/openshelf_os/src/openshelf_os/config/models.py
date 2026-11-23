@@ -42,6 +42,10 @@ class Motor(BaseModel):
     rotation_safe_stage_extension_enabled: bool = Field(default=False)
     rotation_safe_stage_extension_mm: float = Field(default=8.5, ge=0)
     Ip: int = Field(..., ge=0)
+    # Y only: peak current (0.1 A) for moves that go down, including the homing seek. Lifting
+    # stays at Ip. None runs every move at Ip. 30 measured on lb4a-9 with 5 kg (2026-11-23):
+    # descent clean down to 2.0 A, lift stalled at 2.5 A.
+    descent_Ip: Optional[int] = Field(default=None, gt=0)
     rpm: int = Field(..., gt=0)
     dr: Literal[0, 1]
     mpr: float = Field(..., gt=0)
@@ -83,6 +87,18 @@ class Motor(BaseModel):
     @classmethod
     def _lim_positive(cls, v):
         return _positive(v, "lim")
+
+    @model_validator(mode="after")
+    def _validate_descent_current(self) -> "Motor":
+        if self.descent_Ip is None:
+            return self
+        if self.motor_name != "y_axis":
+            raise ValueError(f"Motor '{self.motor_name}': descent_Ip is only supported on y_axis")
+        if self.descent_Ip > self.Ip:
+            raise ValueError(
+                f"Motor '{self.motor_name}': descent_Ip ({self.descent_Ip}) cannot exceed Ip ({self.Ip})"
+            )
+        return self
 
     @model_validator(mode="after")
     def _validate_physical_endpoints(self) -> "Motor":

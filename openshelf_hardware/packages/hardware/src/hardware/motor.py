@@ -351,6 +351,10 @@ class Motor():
         self._following_error_trace: FollowingErrorTrace | None = None
         # Set when trial settings could not be restored; refuses the next trial.
         self._trial_restore_failed = False
+        # Pr5.00 a trial holds; per-move descent switching leaves it alone while set.
+        self._peak_current_override: int | None = None
+        # Last Pr5.00 written and read back; None when unknown (failed write, not configured).
+        self._written_peak_current: int | None = None
         configured_brake_output = getattr(self._params, "brake_output_function", None)
         self._configured_brake_output_function = (
             None if configured_brake_output is None else int(configured_brake_output)
@@ -413,6 +417,7 @@ class Motor():
                 # model-specific encoder and electronic-gearing data was not part
                 # of the Y-axis incident review.
                 await self.set_param("Peak current", self._params.Ip)
+                self._written_peak_current = int(self._params.Ip)
 
             if self._configured_brake_output_function is not None:
                 await self._configure_brake_control()
@@ -854,7 +859,10 @@ class Motor():
             "Encoder resolution": int(
                 getattr(self._params, "encoder_resolution_cpr", 4000)
             ),
-            "Peak current": int(self._params.Ip),
+            # Y switches Pr5.00 per move direction, so a check between moves expects the last write.
+            "Peak current": int(
+                self._params.Ip if self._written_peak_current is None else self._written_peak_current
+            ),
         }
 
     def _validate_y_axis_runtime_profile(self) -> None:
@@ -886,12 +894,14 @@ class Motor():
 
     async def _configure_motor_electrical_parameters(self) -> None:
         self._validate_y_axis_runtime_profile()
+        self._written_peak_current = None
         settings = self._expected_motor_electrical_settings()
 
         for parameter_name, value in settings.items():
             await self.set_param(parameter_name, value)
 
         await self._read_and_verify_motor_electrical_parameters()
+        self._written_peak_current = int(self._params.Ip)
 
     async def _read_and_verify_motor_electrical_parameters(self) -> dict[str, int]:
         settings = self._expected_motor_electrical_settings()
@@ -1234,6 +1244,10 @@ class Motor():
             yield
             return
 
+        if self._descent_peak_current is not None and self._peak_current_override is None:
+            # Held moves start energised and keep whatever current they find, so the hold
+            # runs at Ip throughout, written while still parked.
+            await self._set_and_verify_peak_current(int(self._params.Ip))
         self._hold_enabled = True
         try:
             await self.enable()
@@ -1396,6 +1410,7 @@ class Motor():
 
         await self.set_param("Position High", pulse[0])
         await self.set_param("Position Low", pulse[1])
+        await self._apply_move_peak_current(None if self._cur_pos is None else value - self._cur_pos)
 
         self._logger.debug(
             "Set position registers",
@@ -1565,6 +1580,7 @@ class Motor():
 
             self._safety_interrupted_move = False
             self._clear_pending_motion()
+            await self._apply_move_peak_current(dist)
             await self._verify_brake_output_before_motion_trigger()
             await self._enable_for_motion()
             await self._controller.write_single_register(
@@ -2457,6 +2473,7 @@ class Motor():
         if peak_current <= 0:
             raise MotorConfigError("Peak current must be greater than zero")
 
+        self._written_peak_current = None
         await self.set_param("Peak current", peak_current)
         actual_peak_current = await self.get_param("Peak current")
         if actual_peak_current != peak_current:
@@ -2464,6 +2481,31 @@ class Motor():
                 f"Motor {self._motor_id} peak current readback mismatch: "
                 f"configured={peak_current}, read={actual_peak_current}"
             )
+        self._written_peak_current = peak_current
+
+    @property
+    def _descent_peak_current(self) -> int | None:
+        """Pr5.00 for downward moves on a parked (gravity) axis; None runs every move at Ip."""
+        if self._park_when_idle is False:
+            return None
+        descent = getattr(self._params, "descent_Ip", None)
+        return None if descent is None else int(descent)
+
+    async def _apply_move_peak_current(self, delta_mm: float | None) -> None:
+        """Write and read back Pr5.00 for the next move: the descent current going down, Ip otherwise.
+
+        Lowering Y only has to brake the load, so it runs at the descent current to limit the
+        force on anything under the carriage; lifting needs Ip (lb4a-9 with 5 kg: descent clean
+        down to 2.0 A, lift stalled at 2.5 A). Unknown direction gets Ip. Written on every move,
+        not cached, because a drive power cycle reverts Pr5.00 to its EEPROM value. A failed
+        write raises before the axis is enabled, so the move never runs at the wrong current.
+        Trial overrides and held (energised) sequences keep the current they set.
+        """
+        descent = self._descent_peak_current
+        if descent is None or self._peak_current_override is not None or self._hold_enabled is True:
+            return
+        going_down = delta_mm is not None and delta_mm < 0
+        await self._set_and_verify_peak_current(descent if going_down else int(self._params.Ip))
 
     def following_error_counts(self, limit_mm: float) -> int:
         """Pr0.05 value for a following-error limit in mm: encoder counts, per the manual."""
@@ -2579,9 +2621,11 @@ class Motor():
         try:
             await self.disable()
             await self._set_and_verify_peak_current(int(peak_current))
+            self._peak_current_override = int(peak_current)
             await self._arm_following_error_trip(float(following_error_mm))
             yield
         finally:
+            self._peak_current_override = None
             await self._park_after_trial()
             await self._set_and_verify_peak_current(int(self._params.Ip))
             await self._restore_following_error_limit()
@@ -2676,7 +2720,7 @@ class Motor():
         if restore_peak_current is not None:
             try:
                 await self._set_and_verify_peak_current(restore_peak_current)
-                self._logger.warning(
+                self._logger.info(
                     "Restored peak current after temporary homing override",
                     extra={
                         "motor_id": self._motor_id,
@@ -2886,18 +2930,20 @@ class Motor():
             except Exception as e:
                 raise MotorConfigError(f"Failed to configure homing parameters: {str(e)}") from e
 
-            if homing_peak_current is not None:
+            # The seek runs down to the home stop, so a parked axis seeks at its descent current.
+            seek_peak_current = homing_peak_current if homing_peak_current is not None else self._descent_peak_current
+            if seek_peak_current is not None:
                 restore_peak_current = int(self._params.Ip)
-                self._logger.warning(
+                self._logger.info(
                     "Applying temporary homing peak current",
                     extra={
                         "motor_id": self._motor_id,
                         "motor_name": getattr(self._params, "motor_name", None),
-                        "homing_peak_current": int(homing_peak_current),
+                        "homing_peak_current": int(seek_peak_current),
                         "restore_peak_current": restore_peak_current,
                     },
                 )
-                await self._set_and_verify_peak_current(int(homing_peak_current))
+                await self._set_and_verify_peak_current(int(seek_peak_current))
 
             if self._safety:
                 await self._safety.wait_clear()
