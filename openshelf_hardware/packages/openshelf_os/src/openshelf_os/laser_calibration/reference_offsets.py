@@ -74,6 +74,9 @@ CONSENSUS_MIN_SAMPLES = 6
 CONSENSUS_MAX_MAD_MM = 0.75
 # A cell this far off the consensus moved, or its tray sits differently, or its hole was misread.
 CONSENSUS_MOVER_MM = 1.0
+# Beyond this the nearest opening is a different one (lb4a-9: cells re-laid between runs matched
+# openings ~14mm away), so the cell is reported as unmatched rather than as a 14mm move.
+CONSENSUS_UNMATCHED_MM = 5.0
 
 
 @dataclass
@@ -136,6 +139,18 @@ class ConsensusOffset:
 	@property
 	def is_consistent(self) -> bool:
 		return self.mad_x_mm <= CONSENSUS_MAX_MAD_MM and self.mad_y_mm <= CONSENSUS_MAX_MAD_MM
+
+
+def _describe_mover(label: str, off_x_mm: float, off_y_mm: float, is_manual: bool) -> str:
+	who = f"reference {label}" if is_manual else label
+
+	if max(abs(off_x_mm), abs(off_y_mm)) > CONSENSUS_UNMATCHED_MM:
+		return f"{who}: no opening near its stored point (nearest is ({off_x_mm:+.1f}, {off_y_mm:+.1f})mm off)"
+
+	return (
+		f"{who}: ({off_x_mm:+.2f}, {off_y_mm:+.2f})mm off the side's consensus"
+		f"{'; re-check its hand-set point' if is_manual else ''}"
+	)
 
 
 def _is_covered(shelf_idx: int, cell: Cell, occupied_cells: frozenset[tuple[int, int]]) -> bool:
@@ -214,8 +229,7 @@ def derive_consensus_offset(
 		mad_y_mm=float(median(abs(sample[2] - offset_y_mm) for sample in samples)),
 		sample_count=len(samples),
 		movers=[
-			f"{'reference ' if is_manual else ''}{label}: ({dx - offset_x_mm:+.2f}, {dy - offset_y_mm:+.2f})mm "
-			f"off the side's consensus{'; re-check its hand-set point' if is_manual else ''}"
+			_describe_mover(label, dx - offset_x_mm, dy - offset_y_mm, is_manual)
 			for label, dx, dy, is_manual in samples
 			if max(abs(dx - offset_x_mm), abs(dy - offset_y_mm)) > CONSENSUS_MOVER_MM
 		],
