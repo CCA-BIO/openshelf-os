@@ -2,8 +2,9 @@
 """Find the lowest Y peak current that still lowers the carriage and its payload under control.
 
 Runs Y descent trials (POST /api/robot/debug/motors/y_axis/descent-trial) on a machine in
-development mode, from the configured current down, and stops at the first trial that fails or
-whose peak following error passes --margin of the drive trip. Stdlib only; run it from a
+development mode, from the configured current down, and stops at the first trial that fails,
+whose peak following error passes --margin of the drive trip, or whose carriage sags more than
+--max-sag-mm after it parks. Stdlib only; run it from a
 laptop against the machine's API. Every trial response is saved in full under --output.
 
 Before running, on site:
@@ -24,7 +25,12 @@ The sweep:
   6. On a failed trial the script stops and leaves Y unhomed. Inspect the machine, remove the
      blocks (and any gauge) from under the carriage, clear the alarm from the dev UI, then home
      Y yourself. The script never homes: homing descends to the bottom at full current.
-  7. The floor is the lowest current where every trial completed inside the margin. The summary
+  7. Sag is how far Y drops between the end of the move and 0.5 s later, while the holding
+     current (a share of the trial current) waits for the brake. On lb4a-9 with 5 kg it was
+     <=0.04 mm down to 2.0 A, 0.9-2.3 mm at 1.6 A, and 1.3 A ran away during the stop, so a
+     sagging current is the last warning before a runaway and stops the sweep like a failure.
+     The floor is the lowest current where every trial completed inside the margin and the sag
+     limit. The summary
      prints 1.5x and 2x the floor as the candidate descent current.
   8. Confirm the candidate: rerun with --currents <candidate> --trip-mm <sweep trip> --repeats 20,
      at the cold start of a day and again after an hour of cycling, on each Y motor type (LB4
@@ -131,6 +137,8 @@ class Run:
         self.api = Api(args.base_url, args.token)
         self.rows: list[dict] = []
         self.units_per_mm: float | None = args.fe_units_per_mm
+        self.profile_per_mm: float | None = None
+        self.feedback_per_mm: float | None = None
         self.stop_reason: str | None = None
 
     def trial(self, current: int, repeat: int, trip_mm: float) -> dict:
@@ -147,17 +155,10 @@ class Run:
         result = self.api.post(TRIAL_PATH, body)
         (self.output / f"trial-{current:03d}-{repeat + 1:02d}.json").write_text(json.dumps(result, indent=1))
 
-        if self.units_per_mm is None:
-            self.units_per_mm = result.get("following_error_units_per_mm")
         leg = result["descent"] if args.leg == "descent" else result["approach"]
         raw = None if leg is None else leg.get("max_abs_following_error")
-        fe_mm = None if raw is None or not self.units_per_mm else raw / self.units_per_mm
-        # Both ways, take the worse: mm needs the resolved trace unit, raw counts need the trace
-        # and Pr0.05 to share a unit. Each is conservative where the other is not.
-        shares = [value for value in (
-            None if fe_mm is None else fe_mm / trip_mm,
-            None if raw is None else raw / result["following_error_trip_counts"],
-        ) if value is not None]
+        fe_mm, fe_at_mm = self.derived_following_error(leg)
+        shares = [] if fe_mm is None else [fe_mm / trip_mm]
         sag_mm = None
         if leg and leg.get("end_mm") is not None and leg.get("settled_mm") is not None:
             sag_mm = leg["end_mm"] - leg["settled_mm"]
@@ -170,7 +171,7 @@ class Run:
             "max_following_error_mm": fe_mm,
             "max_following_error_raw": raw,
             "share_of_trip": max(shares) if shares else None,
-            "at_mm": None if leg is None else leg.get("max_following_error_at_mm"),
+            "at_mm": fe_at_mm,
             "sag_mm": sag_mm,
             "trace_failed": None if leg is None else leg.get("trace_failed"),
         }
@@ -189,7 +190,39 @@ class Run:
             )
         elif row["share_of_trip"] > args.margin:
             self.stop_reason = f"Peak following error reached {row['share_of_trip']:.0%} of the trip; stopping."
+        elif sag_mm is None or abs(sag_mm) > args.max_sag_mm:
+            self.stop_reason = (
+                f"Y sagged {'an unknown amount' if sag_mm is None else f'{sag_mm:.2f} mm'} after parking "
+                f"(limit {args.max_sag_mm} mm); this current cannot hold the load until the brake sets. Stopping."
+            )
         return result
+
+    def derived_following_error(self, leg: dict | None) -> tuple[float | None, float | None]:
+        """Peak |profile - feedback| in mm and where it happened.
+
+        0x1010 on the CL57RS is not the following error in any unit the trip uses (on lb4a-3 it
+        tracked the real error at ~155k per mm), so the error is profile minus feedback. Both
+        restart at 0 each move; their units come from a leg's travel (250/mm command pulses and
+        100/mm encoder counts at 40 mm/rev), kept from the first leg long enough to measure.
+        """
+        samples = [] if leg is None else [
+            s for s in leg.get("samples") or []
+            if s.get("profile_position") is not None and s.get("feedback_position") is not None
+        ]
+        if len(samples) < 2:
+            return None, None
+        travel_mm = samples[-1]["position_mm"] - samples[0]["position_mm"]
+        if abs(travel_mm) >= 50 and self.profile_per_mm is None:
+            self.profile_per_mm = (samples[-1]["profile_position"] - samples[0]["profile_position"]) / travel_mm
+            self.feedback_per_mm = (samples[-1]["feedback_position"] - samples[0]["feedback_position"]) / travel_mm
+        if not self.profile_per_mm or not self.feedback_per_mm:
+            return None, None
+        peak = max(
+            samples,
+            key=lambda s: abs(s["profile_position"] / self.profile_per_mm - s["feedback_position"] / self.feedback_per_mm),
+        )
+        fe = abs(peak["profile_position"] / self.profile_per_mm - peak["feedback_position"] / self.feedback_per_mm)
+        return fe, peak["position_mm"]
 
     def report_check(self, result: dict) -> None:
         trip_units_per_mm = result["following_error_trip_counts"] / result["following_error_trip_mm"]
@@ -219,7 +252,11 @@ class Run:
             worst_fe = max((r["max_following_error_mm"] or 0.0 for r in level), default=0.0)
             worst_share = max((r["share_of_trip"] or 0.0 for r in level), default=0.0)
             worst_sag = max((abs(r["sag_mm"] or 0.0) for r in level), default=0.0)
-            if len(level) == repeats and completed == len(level) and worst_share <= args.margin:
+            sag_known = all(r["sag_mm"] is not None for r in level)
+            if (
+                len(level) == repeats and completed == len(level) and worst_share <= args.margin
+                and sag_known and worst_sag <= args.max_sag_mm
+            ):
                 passing.append(current)
             print(f"{current:>5.1f} A  {len(level):>6}  {completed:>9}  {worst_fe:>11.2f}  {worst_share:>11.0%}  {worst_sag:>12.2f}")
 
@@ -284,6 +321,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--leg", choices=("descent", "lift"), default="descent")
     parser.add_argument("--trip-mm", type=float, default=None, help="Fixed trip, no baseline; default derives it from the baseline")
     parser.add_argument("--margin", type=float, default=0.5, help="Stop once peak following error passes this share of the trip")
+    parser.add_argument("--max-sag-mm", type=float, default=0.1, help="Fail a trial whose carriage drops more than this after parking")
     parser.add_argument("--fe-units-per-mm", type=float, default=None, help="Trace unit, when the API cannot resolve it")
     parser.add_argument("--rpm", type=int, default=None, help="Trial speed; default is the configured speed")
     parser.add_argument("--output", default="y-descent-sweep", help="Directory for trial JSON and summary.csv")
