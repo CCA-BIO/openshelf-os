@@ -15,8 +15,9 @@ Before running, on site:
      least 150 mm of clear travel under --end-mm and put blocks under the carriage there.
   3. Keep a hand on the emergency stop. Closing this script does not stop a trial in progress.
   4. Run --check-only first: one trial at the configured current. It confirms the drive answers
-     the trace registers (trace_failed false), that the trace unit resolves (about 250 units/mm
-     for command pulses or 100 for encoder counts at 40 mm/rev), and the baseline error.
+     the trace registers (trace_failed false), that the profile and feedback positions scale as
+     expected (about 250 and 100 per mm at 10000 ppr, 4000 cpr, 40 mm/rev), and the baseline
+     error.
 
 The sweep:
   5. Run without --check-only. The configured current runs first as the baseline under a 40 mm
@@ -136,7 +137,6 @@ class Run:
         self.output = output
         self.api = Api(args.base_url, args.token)
         self.rows: list[dict] = []
-        self.units_per_mm: float | None = args.fe_units_per_mm
         self.profile_per_mm: float | None = None
         self.feedback_per_mm: float | None = None
         self.stop_reason: str | None = None
@@ -156,7 +156,6 @@ class Run:
         (self.output / f"trial-{current:03d}-{repeat + 1:02d}.json").write_text(json.dumps(result, indent=1))
 
         leg = result["descent"] if args.leg == "descent" else result["approach"]
-        raw = None if leg is None else leg.get("max_abs_following_error")
         fe_mm, fe_at_mm = self.derived_following_error(leg)
         shares = [] if fe_mm is None else [fe_mm / trip_mm]
         sag_mm = None
@@ -169,7 +168,6 @@ class Run:
             "alarm_code": None if leg is None else leg.get("alarm_code"),
             "trip_mm": trip_mm,
             "max_following_error_mm": fe_mm,
-            "max_following_error_raw": raw,
             "share_of_trip": max(shares) if shares else None,
             "at_mm": fe_at_mm,
             "sag_mm": sag_mm,
@@ -185,8 +183,8 @@ class Run:
             )
         elif fe_mm is None:
             self.stop_reason = (
-                f"The following-error trace is missing or its unit did not resolve (trace_failed="
-                f"{row['trace_failed']}). Fix that, or pass --fe-units-per-mm, before sweeping."
+                f"The following-error trace is missing or too short to scale (trace_failed="
+                f"{row['trace_failed']}). Fix that before sweeping."
             )
         elif row["share_of_trip"] > args.margin:
             self.stop_reason = f"Peak following error reached {row['share_of_trip']:.0%} of the trip; stopping."
@@ -227,11 +225,10 @@ class Run:
     def report_check(self, result: dict) -> None:
         trip_units_per_mm = result["following_error_trip_counts"] / result["following_error_trip_mm"]
         print(
-            f"Trace unit {self.units_per_mm} per mm; trip written at {trip_units_per_mm:.0f} counts per mm; "
-            f"holding {result['holding_current_percent']}%, standby {result['standby_current_percent']}%."
+            f"Profile {self.profile_per_mm} and feedback {self.feedback_per_mm} per mm; trip written at "
+            f"{trip_units_per_mm:.0f} counts per mm; holding {result['holding_current_percent']}%, "
+            f"standby {result['standby_current_percent']}%."
         )
-        if self.units_per_mm and abs(self.units_per_mm - trip_units_per_mm) > 0.02 * trip_units_per_mm:
-            print("The trace and the trip use different units; the margin takes the stricter reading of the two.")
 
     def finish(self) -> int:
         args = self.args
@@ -322,7 +319,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trip-mm", type=float, default=None, help="Fixed trip, no baseline; default derives it from the baseline")
     parser.add_argument("--margin", type=float, default=0.5, help="Stop once peak following error passes this share of the trip")
     parser.add_argument("--max-sag-mm", type=float, default=0.1, help="Fail a trial whose carriage drops more than this after parking")
-    parser.add_argument("--fe-units-per-mm", type=float, default=None, help="Trace unit, when the API cannot resolve it")
     parser.add_argument("--rpm", type=int, default=None, help="Trial speed; default is the configured speed")
     parser.add_argument("--output", default="y-descent-sweep", help="Directory for trial JSON and summary.csv")
     parser.add_argument("--check-only", action="store_true", help="One baseline trial at the configured current, then stop")

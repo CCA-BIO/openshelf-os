@@ -215,9 +215,10 @@ class MotionRecordEntry:
 class FollowingErrorSample:
     elapsed_s: float
     position_mm: float | None
-    # 0x602C/D in command pulses, against which the trace's own unit is worked out.
+    # 0x602C/D in command pulses.
     raw_position: int | None
-    # Raw drive values; the unit (command pulses or encoder counts) is settled on the machine.
+    # Raw drive values. On the CL57RS 0x1010 is not the following error; profile (command
+    # pulses) minus feedback (encoder counts), both zeroed per move, is.
     following_error: int
     profile_position: int
     feedback_position: int

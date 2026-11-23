@@ -377,7 +377,7 @@ class FollowingErrorSampleModel(BaseModel):
     elapsed_s: float
     position_mm: float | None
     raw_position: int | None = Field(description="0x602C/D position in command pulses")
-    following_error: int = Field(description="Raw drive value (0x1010/1011)")
+    following_error: int = Field(description="Raw drive value (0x1010/1011); not the following error on the CL57RS")
     profile_position: int = Field(description="Raw drive value (0x1012/1013)")
     feedback_position: int = Field(description="Raw drive value (0x1014/1015)")
 
@@ -391,9 +391,10 @@ class YDescentTrialLeg(BaseModel):
     duration_s: float | None
     end_mm: float | None = Field(description="Position the move finished on")
     settled_mm: float | None = Field(description="Position once the axis parked and its brake set")
-    max_abs_following_error: int | None
+    max_following_error_mm: float | None = Field(
+        description="Peak |profile - feedback| position over the leg; null without trace samples"
+    )
     max_following_error_at_mm: float | None
-    max_following_error_mm: float | None = Field(description="Null until the trace unit is resolved")
     trace_failed: bool = Field(description="The drive stopped answering the trace registers; the server log has why")
     samples: List[FollowingErrorSampleModel]
 
@@ -407,7 +408,6 @@ class YDescentTrialResponse(BaseModel):
     configured_peak_current: int
     holding_current_percent: int | None
     standby_current_percent: int | None
-    following_error_units_per_mm: float | None
 
 
 class SafetyGuardOverrideRequest(BaseModel):

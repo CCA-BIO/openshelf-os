@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import statistics
 import time
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
@@ -25,8 +24,6 @@ logger = logging.getLogger(__name__)
 
 # The brake sets within Pr4.20 (250 ms) of the park; the sag reading waits a little longer.
 SETTLE_AFTER_PARK_S = 0.5
-# A leg shorter than one motor revolution (in command pulses) says too little about the trace unit.
-UNIT_PROBE_MIN_RAW_TRAVEL = 10000
 
 LegOutcome = Literal["completed", "drive_alarm", "stalled", "timeout", "error"]
 
@@ -41,9 +38,8 @@ class TrialLeg:
     duration_s: float | None = None
     end_mm: float | None = None
     settled_mm: float | None = None
-    max_abs_following_error: int | None = None
-    max_following_error_at_mm: float | None = None
     max_following_error_mm: float | None = None
+    max_following_error_at_mm: float | None = None
     trace_failed: bool = False
     samples: list[FollowingErrorSample] = field(default_factory=list)
 
@@ -58,7 +54,6 @@ class TrialResult:
     configured_peak_current: int
     holding_current_percent: int | None
     standby_current_percent: int | None
-    following_error_units_per_mm: float | None
 
     @property
     def completed(self) -> bool:
@@ -104,15 +99,6 @@ async def run_descent_trial(
         )
 
     params = motor._params
-    units_per_mm = _following_error_units_per_mm(
-        [leg.samples for leg in (approach, descent) if leg is not None],
-        ppr=int(getattr(params, "ppr", 10000)),
-        mpr=float(params.mpr),
-    )
-    for leg in (approach, descent):
-        if leg is not None and leg.max_abs_following_error is not None and units_per_mm is not None:
-            leg.max_following_error_mm = leg.max_abs_following_error / units_per_mm
-
     return TrialResult(
         approach=approach,
         descent=descent,
@@ -121,7 +107,6 @@ async def run_descent_trial(
         configured_peak_current=int(params.Ip),
         holding_current_percent=await _read_optional(motor, "Closed loop holding current %"),
         standby_current_percent=await _read_optional(motor, "Standby current %"),
-        following_error_units_per_mm=units_per_mm,
     )
 
 
@@ -171,37 +156,36 @@ async def _run_leg(
     except MotorError as exc:
         logger.warning("Y descent trial settle read failed", exc_info=exc)
 
-    if leg.samples:
-        peak = max(leg.samples, key=lambda sample: abs(sample.following_error))
-        leg.max_abs_following_error = abs(peak.following_error)
-        leg.max_following_error_at_mm = peak.position_mm
+    params = motor._params
+    leg.max_following_error_mm, leg.max_following_error_at_mm = peak_following_error(
+        leg.samples,
+        profile_per_mm=int(getattr(params, "ppr", 10000)) / float(params.mpr),
+        feedback_per_mm=int(getattr(params, "encoder_resolution_cpr", 4000)) / float(params.mpr),
+    )
     return leg
 
 
-def _following_error_units_per_mm(
-    legs: list[list[FollowingErrorSample]], *, ppr: int, mpr: float
-) -> float | None:
-    """Trace units per mm, from how far the feedback position moved against the 0x602C position.
+def peak_following_error(
+    samples: list[FollowingErrorSample], *, profile_per_mm: float, feedback_per_mm: float
+) -> tuple[float | None, float | None]:
+    """Peak |commanded - actual| in mm over a leg, and the position it happened at.
 
-    The 0x602C position is in command pulses (ppr per rev). Travel, not absolute values, because
-    the two registers need not share a zero. A ratio of 1 means the trace counts pulses, 0.4
-    (4000/10000) encoder counts. Legs that disagree leave it unresolved.
+    0x1010 on the CL57RS is not the following error in any usable unit (on lb4a-3 it ran at
+    ~155k per mm of real error), so the error is the profile position (0x1012, command pulses)
+    minus the feedback position (0x1014, encoder counts). Both restart at 0 every move and share
+    its direction, verified on lb4a-3 and lb4a-9 at 250 and 100 per mm for 10000 ppr, 4000 cpr,
+    40 mm/rev.
     """
-    ratios = []
-    for samples in legs:
-        located = [sample for sample in samples if sample.raw_position is not None]
-        if len(located) < 2:
-            continue
-        raw_travel = located[-1].raw_position - located[0].raw_position
-        if abs(raw_travel) < UNIT_PROBE_MIN_RAW_TRAVEL:
-            continue
-        ratios.append(abs((located[-1].feedback_position - located[0].feedback_position) / raw_travel))
-    if not ratios:
-        return None
-    ratio = statistics.median(ratios)
-    if ratio <= 0 or max(abs(value - ratio) for value in ratios) > 0.02 * ratio:
-        return None
-    return ratio * ppr / mpr
+    if not samples:
+        return None, None
+    peak = max(
+        samples,
+        key=lambda s: abs(s.profile_position / profile_per_mm - s.feedback_position / feedback_per_mm),
+    )
+    return (
+        abs(peak.profile_position / profile_per_mm - peak.feedback_position / feedback_per_mm),
+        peak.position_mm,
+    )
 
 
 async def _read_optional(motor: Any, register: str) -> int | None:
