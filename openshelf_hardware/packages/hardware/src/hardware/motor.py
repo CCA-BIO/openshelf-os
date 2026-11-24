@@ -2912,8 +2912,13 @@ class Motor():
             except Exception as e:
                 raise MotorConfigError(f"Failed to configure homing parameters: {str(e)}") from e
 
-            # The seek runs down to the home stop, so a parked axis seeks at its descent current.
-            seek_peak_current = homing_peak_current if homing_peak_current is not None else self._descent_peak_current
+            # A caller's current wins, then the configured home_Ip; otherwise the seek runs down
+            # to the home stop, so a parked axis seeks at its descent current.
+            seek_peak_current = homing_peak_current
+            if seek_peak_current is None:
+                seek_peak_current = getattr(self._params, "home_Ip", None)
+            if seek_peak_current is None:
+                seek_peak_current = self._descent_peak_current
             if seek_peak_current is not None:
                 restore_peak_current = int(self._params.Ip)
                 self._logger.info(
