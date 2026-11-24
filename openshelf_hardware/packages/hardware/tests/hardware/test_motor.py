@@ -1162,3 +1162,254 @@ async def test_absolute_move_keeps_y_at_least_2mm_off_home(
 
     assert await motor._start_absolute_move(requested) is True
     assert motor._target_pos == expected
+
+
+@pytest.mark.asyncio
+async def test_trial_settings_park_then_restore_ip_and_trip_after_a_faulted_move(mock_controller):
+    motor = y_home_motor(mock_controller, Ip=60, max_following_error=4000)
+    registers = echo_registers(mock_controller, {0x0159: 0x24, 0x0191: 60, 0x000B: 4000, 0x000F: 1, 0x1003: 1 << 1})
+
+    with pytest.raises(MotorError):
+        async with motor.trial_drive_settings(peak_current=15, following_error_mm=10.0):
+            # Applied with the load on the brake: Pr0.07 off before the current drops.
+            assert registers[0x000F] == 0
+            assert registers[0x0191] == 15
+            assert registers[0x000B] == 500
+            registers[0x000F] = 1  # the faulted move left the axis energised
+            registers[0x1003] |= 1 << 1
+            raise MotorError("Movement failed for motor 1 (status=FAULT)")
+
+    writes = [c.args[1:] for c in mock_controller.write_single_register.await_args_list]
+    assert registers[0x0191] == 60
+    assert registers[0x000B] == 4000
+    assert registers[0x000F] == 0
+    # Parked before the configured current returns, so the restore never lands on a load
+    # hanging off a drive below holding current.
+    assert writes.index((0x0191, 60)) > max(i for i, w in enumerate(writes) if w == (0x000F, 0))
+
+    with pytest.raises(MotorConfigError):
+        async with motor.trial_drive_settings(peak_current=61, following_error_mm=10.0):
+            pass
+
+
+def y_descent_motor(mock_controller, registers: dict[int, int] | None = None, **overrides) -> tuple[Motor, dict[int, int]]:
+    """A parked y_axis with a descent current whose moves complete against echoed registers."""
+    params = {
+        "motor_name": "y_axis",
+        "brake_output_function": 0x24,
+        "brake_release_delay_ms": 0,
+        "brake_engagement_delay_ms": 0,
+        "Ip": 60,
+        "descent_Ip": 30,
+        "lim": 1000.0,
+        "logical_to_physical": lambda value: value,
+        "logical_to_physical_delta": lambda value: value,
+        "physical_to_logical": lambda value: value,
+        **overrides,
+    }
+    motor = Motor(mock_controller, make_motor_params(**params))
+    regs = echo_registers(mock_controller, {0x0159: 0x24, 0x0191: 60, **(registers or {})})
+
+    async def finish(**_):
+        motor._status = MotorStatus.STOPPED
+        await motor._park()
+        return MotorStatus.STOPPED
+
+    motor.wait_for_move = AsyncMock(side_effect=finish)
+    motor.move_config = AsyncMock()
+    return motor, regs
+
+
+def peak_current_writes(mock_controller) -> list[int]:
+    return [c.args[2] for c in mock_controller.write_single_register.await_args_list if c.args[1] == 0x0191]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("start_mm", "target_mm", "expected"),
+    [
+        pytest.param(700.0, 300.0, 30, id="down-at-descent-current"),
+        pytest.param(300.0, 700.0, 60, id="up-at-ip"),
+        pytest.param(None, 300.0, 60, id="unknown-start-at-ip"),
+    ],
+)
+async def test_y_move_writes_its_direction_current_before_the_enable(mock_controller, start_mm, target_mm, expected):
+    motor, regs = y_descent_motor(mock_controller)
+    motor._cur_pos = start_mm
+
+    await motor.move_to_position(target_mm)
+
+    assert peak_current_writes(mock_controller) == [expected]
+    assert regs[0x0191] == expected
+    calls = mock_controller.write_single_register.await_args_list
+    assert calls.index(call(1, 0x0191, expected)) < calls.index(call(1, 0x000F, 1)) < calls.index(call(1, 0x6002, 0x10))
+
+
+@pytest.mark.asyncio
+async def test_y_move_without_descent_current_leaves_pr500_alone(mock_controller):
+    motor, _ = y_descent_motor(mock_controller, descent_Ip=None)
+    motor._cur_pos = 700.0
+
+    await motor.move_to_position(300.0)
+
+    assert peak_current_writes(mock_controller) == []
+
+
+@pytest.mark.asyncio
+async def test_y_move_is_refused_before_the_enable_when_the_current_does_not_read_back(mock_controller):
+    motor, regs = y_descent_motor(mock_controller)
+    motor._cur_pos = 700.0
+    write = mock_controller.write_single_register.side_effect
+
+    async def drop_peak_current(unit, address, value, **kwargs):
+        if address != 0x0191:
+            await write(unit, address, value, **kwargs)
+
+    mock_controller.write_single_register.side_effect = drop_peak_current
+
+    with pytest.raises(MotorError, match="peak current readback mismatch"):
+        await motor.move_to_position(300.0)
+
+    assert enable_writes(mock_controller) == []
+    assert call(1, 0x6002, 0x10) not in mock_controller.write_single_register.await_args_list
+    assert regs[0x0191] == 60
+
+
+@pytest.mark.asyncio
+async def test_y_jog_up_after_a_descent_lifts_at_ip(mock_controller):
+    motor, regs = y_descent_motor(mock_controller)
+    motor._cur_pos = 700.0
+    await motor.move_to_position(300.0)
+
+    await motor.jog(10.0)
+
+    assert peak_current_writes(mock_controller) == [30, 60]
+    assert regs[0x0191] == 60
+
+
+@pytest.mark.asyncio
+async def test_y_trial_current_is_not_replaced_by_the_direction_current(mock_controller):
+    motor, regs = y_descent_motor(mock_controller, registers={0x000B: 4000})
+    motor._cur_pos = 700.0
+
+    async with motor.trial_drive_settings(peak_current=15, following_error_mm=5.0):
+        await motor.move_to_position(300.0)
+        assert regs[0x0191] == 15
+
+    assert peak_current_writes(mock_controller) == [15, 60]
+
+
+@pytest.mark.asyncio
+async def test_y_hold_runs_at_ip_written_while_parked(mock_controller):
+    motor, regs = y_descent_motor(mock_controller, registers={0x0191: 30})
+    motor._cur_pos = 700.0
+
+    async with motor.hold_enabled():
+        await motor.move_to_position(300.0)
+        await motor.move_to_position(600.0)
+
+    assert peak_current_writes(mock_controller) == [60]
+    calls = mock_controller.write_single_register.await_args_list
+    assert calls.index(call(1, 0x0191, 60)) < calls.index(call(1, 0x000F, 1))
+
+
+@pytest.mark.asyncio
+async def test_y_home_seeks_at_the_descent_current_and_lifts_at_ip(mock_controller):
+    motor = y_home_motor(mock_controller, Ip=60, descent_Ip=30, max_following_error=4000)
+    regs = echo_registers(mock_controller, {0x0159: 0x24, 0x0191: 60})
+    lift_currents: list[int] = []
+    motor._move_to_position = AsyncMock(side_effect=lambda value, **_: lift_currents.append(regs[0x0191]))
+    seek_currents: list[int] = []
+    start_path_zero = motor._start_path_zero
+
+    async def record_seek():
+        seek_currents.append(regs[0x0191])
+        await start_path_zero()
+
+    motor._start_path_zero = record_seek
+
+    await motor.home()
+
+    assert seek_currents == [30]
+    assert lift_currents == [60]
+    assert regs[0x0191] == 60
+
+
+@pytest.mark.asyncio
+async def test_y_electrical_check_after_a_descent_expects_the_descent_current(mock_controller):
+    motor, regs = y_descent_motor(mock_controller, registers={0x0003: 2, 0x0001: 10000, 0x0233: 4000})
+    motor._cur_pos = 700.0
+    await motor.move_to_position(300.0)
+
+    settings = await motor._read_and_verify_motor_electrical_parameters()
+
+    assert settings["Peak current"] == 30
+
+
+def fail_peak_current_writes(mock_controller) -> dict[str, bool]:
+    """Make Pr5.00 writes raise while the returned flag is set."""
+    state = {"fail": False}
+    write = mock_controller.write_single_register.side_effect
+
+    async def maybe_fail(unit, address, value, **kwargs):
+        if state["fail"] and address == 0x0191:
+            raise MotorError("Modbus write failed")
+        await write(unit, address, value, **kwargs)
+
+    mock_controller.write_single_register.side_effect = maybe_fail
+    return state
+
+
+async def trial_with_failed_restore(motor, regs, fail: dict[str, bool]) -> None:
+    with pytest.raises(MotorError, match="Modbus write failed"):
+        async with motor.trial_drive_settings(peak_current=13, following_error_mm=5.0):
+            fail["fail"] = True
+    assert regs[0x0191] == 13
+    assert regs[0x000B] == 250
+    assert motor._trial_restore_failed is True
+
+
+@pytest.mark.asyncio
+async def test_move_after_a_failed_trial_restore_rewrites_ip_and_the_trip_before_the_trigger(mock_controller):
+    motor, regs = y_descent_motor(mock_controller, descent_Ip=None, registers={0x000B: 4000})
+    motor._cur_pos = 700.0
+    fail = fail_peak_current_writes(mock_controller)
+    await trial_with_failed_restore(motor, regs, fail)
+    fail["fail"] = False
+    mock_controller.write_single_register.reset_mock()
+
+    await motor.move_to_position(300.0)
+
+    assert regs[0x0191] == 60
+    assert regs[0x000B] == 4000
+    assert motor._trial_restore_failed is False
+    calls = mock_controller.write_single_register.await_args_list
+    assert calls.index(call(1, 0x0191, 60)) < calls.index(call(1, 0x6002, 0x10))
+    assert calls.index(call(1, 0x000B, 4000)) < calls.index(call(1, 0x6002, 0x10))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry", ["move", "home"])
+async def test_motion_is_refused_before_any_trigger_when_the_trial_restore_fails_again(mock_controller, entry):
+    if entry == "home":
+        motor = y_home_motor(mock_controller, Ip=60, max_following_error=4000)
+        regs = echo_registers(mock_controller, {0x0159: 0x24, 0x0191: 60, 0x000B: 4000})
+        start = motor.home
+    else:
+        motor, regs = y_descent_motor(mock_controller, descent_Ip=None, registers={0x000B: 4000})
+        motor._cur_pos = 700.0
+
+        async def start():
+            await motor.move_to_position(300.0)
+
+    fail = fail_peak_current_writes(mock_controller)
+    await trial_with_failed_restore(motor, regs, fail)
+    mock_controller.write_single_register.reset_mock()
+
+    with pytest.raises(MotorConfigError, match="trial settings could not be restored"):
+        await start()
+
+    assert regs[0x0191] == 13
+    assert enable_writes(mock_controller) == [0]
+    calls = mock_controller.write_single_register.await_args_list
+    assert not [c for c in calls if c.args[1] == 0x6002]

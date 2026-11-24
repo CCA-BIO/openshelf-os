@@ -6,6 +6,7 @@ from openshelf_os_server.core.validation import ItemValidator, ValidationError
 
 import asyncio
 from copy import deepcopy
+from dataclasses import asdict
 import json
 import math
 import re
@@ -31,6 +32,9 @@ from openshelf_os.robot.commands import (
 )
 import logging
 from openshelf_os.robot.core import POWER_CYCLE_HOLD_S, V24_POWER_RAILS
+from openshelf_os.robot.y_descent_trial import run_descent_trial
+from hardware.exceptions import MotorConfigError
+from hardware.motor import Y_MIN_TARGET_MM
 from openshelf_os.robot.worker import (
     SCALE_OCCUPIED_THRESHOLD_GRAMS,
     TRAY_ON_TOOL_ALLOWED_COMMANDS,
@@ -350,6 +354,68 @@ class MotorLimitSwitchesResponse(BaseModel):
 
 class MotorMoveRequest(BaseModel):
     position_mm: FiniteFloat = Field(..., description="Target position in millimeters")
+
+
+class YDescentTrialRequest(BaseModel):
+    start_mm: FiniteFloat = Field(..., description="Height the carriage climbs to first, in millimeters")
+    end_mm: FiniteFloat = Field(..., description="Height the trial descent ends at, below `start_mm`")
+    descent_peak_current: int = Field(
+        ..., ge=1, description="Peak current (Pr5.00) for the descent, in 0.1 A, at most the configured `Ip`"
+    )
+    approach_peak_current: int | None = Field(
+        default=None,
+        ge=1,
+        description="Peak current for the climb to `start_mm`; omit to climb at the configured current and trip",
+    )
+    following_error_trip_mm: float = Field(
+        default=40.0, gt=0, le=200, description="Drive following-error trip armed for every trial-current leg"
+    )
+    rpm: int | None = Field(default=None, ge=1, description="Speed for both legs; omit for the configured speed")
+    pause_at_mm: FiniteFloat | None = Field(
+        default=None,
+        description="Stop the descent through the safety-guard pause once it reaches this height, between `end_mm` and `start_mm`",
+    )
+    pause_s: float = Field(default=5.0, gt=0, le=60, description="How long the paused descent holds before it resumes")
+
+
+class FollowingErrorSampleModel(BaseModel):
+    elapsed_s: float
+    position_mm: float | None
+    raw_position: int | None = Field(description="0x602C/D position in command pulses")
+    following_error: int = Field(description="Raw drive value (0x1010/1011); not the following error on the CL57RS")
+    profile_position: int = Field(description="Raw drive value (0x1012/1013)")
+    feedback_position: int = Field(description="Raw drive value (0x1014/1015)")
+
+
+class YDescentTrialLeg(BaseModel):
+    peak_current: int | None = Field(description="Pr5.00 for this leg in 0.1 A; null ran at the configured current")
+    start_mm: float | None
+    target_mm: float
+    outcome: Literal["completed", "drive_alarm", "stalled", "timeout", "error"]
+    alarm_code: int | None
+    duration_s: float | None
+    end_mm: float | None = Field(description="Position the move finished on")
+    settled_mm: float | None = Field(description="Position once the axis parked and its brake set")
+    max_following_error_mm: float | None = Field(
+        description="Peak |profile - feedback| position over the leg; null without trace samples"
+    )
+    max_following_error_at_mm: float | None
+    trace_failed: bool = Field(description="The drive stopped answering the trace registers; the server log has why")
+    paused_at_mm: float | None = Field(description="Where the requested pause stopped the leg; null when it did not pause")
+    hold_start_mm: float | None = Field(description="Position once the paused drive had stopped")
+    hold_end_mm: float | None = Field(description="Position at the end of the hold, just before the resume")
+    samples: List[FollowingErrorSampleModel]
+
+
+class YDescentTrialResponse(BaseModel):
+    outcome: Literal["completed", "drive_alarm", "stalled", "timeout", "error"]
+    approach: YDescentTrialLeg
+    descent: YDescentTrialLeg | None = Field(description="Null when the climb to `start_mm` failed")
+    following_error_trip_mm: float
+    following_error_trip_counts: int = Field(description="Pr0.05 as written for the trial legs")
+    configured_peak_current: int
+    holding_current_percent: int | None
+    standby_current_percent: int | None
 
 
 class SafetyGuardOverrideRequest(BaseModel):
@@ -2167,6 +2233,108 @@ async def move_motor(
             "motor_move_failed",
             "",
         ) from exc
+
+
+@router.post(
+    "/debug/motors/y_axis/descent-trial",
+    dependencies=[Depends(require_permissions("robot:control")), Depends(check_robot_enabled)],
+    summary="Run one Y descent-current trial",
+    responses=response_docs(errors=(400, 401, 403, 404, 409, 503)),
+)
+async def run_y_descent_trial(
+    request: YDescentTrialRequest,
+    worker: RobotWorker = Depends(get_robot_worker_or_error),
+) -> YDescentTrialResponse:
+    """Run one Y descent-current trial (development mode only).
+
+    Climbs to `start_mm`, then descends to `end_mm` at `descent_peak_current` behind a
+    `following_error_trip_mm` drive trip, recording the drive's live following error on both
+    legs. The axis parks and its configured current and trip return after every leg, whatever
+    happened; nothing is saved to the drive. A failed leg is a result, not an error: it comes
+    back with its outcome and alarm code, and Y then needs homing. Closing the request does
+    not stop the motion; the emergency stop does. Returns `409` when Y is not homed and `503`
+    when the test settings cannot be applied or restored.
+    """
+    if get_operating_mode() != OperatingMode.development:
+        raise api_error(status.HTTP_403_FORBIDDEN, "development_mode_only", "")
+
+    motor = worker._robot._get_motor_by_name("y_axis")
+    if motor is None:
+        raise api_error(status.HTTP_404_NOT_FOUND, "motor_not_configured", "")
+
+    params = motor._params
+    configured_peak_current = int(params.Ip)
+    lower_mm = max(float(getattr(params, "lower_lim", 0.0)), Y_MIN_TARGET_MM)
+    if not lower_mm <= request.end_mm < request.start_mm <= float(params.lim):
+        raise api_error(
+            status.HTTP_400_BAD_REQUEST,
+            "request_invalid",
+            "The trial must descend between the Y travel limits.",
+        )
+    if request.pause_at_mm is not None and not request.end_mm < request.pause_at_mm < request.start_mm:
+        raise api_error(
+            status.HTTP_400_BAD_REQUEST,
+            "request_invalid",
+            "The pause must fall between the end and the start of the descent.",
+        )
+    if request.rpm is not None and request.rpm > int(params.rpm):
+        raise api_error(
+            status.HTTP_400_BAD_REQUEST,
+            "request_invalid",
+            "A trial speed cannot exceed the configured Y speed.",
+        )
+    if any(
+        current is not None and current > configured_peak_current
+        for current in (request.descent_peak_current, request.approach_peak_current)
+    ):
+        raise api_error(
+            status.HTTP_400_BAD_REQUEST,
+            "request_invalid",
+            "A trial current cannot exceed the configured Y current.",
+        )
+    if motor.is_homed() is False:
+        raise api_error(status.HTTP_409_CONFLICT, "home_required", "")
+
+    try:
+        async with manual_motion_guard("y_descent_trial", worker=worker, allow_tray_on_tool=True):
+            try:
+                result = await run_descent_trial(
+                    motor,
+                    start_mm=request.start_mm,
+                    end_mm=request.end_mm,
+                    descent_peak_current=request.descent_peak_current,
+                    approach_peak_current=request.approach_peak_current,
+                    following_error_trip_mm=request.following_error_trip_mm,
+                    rpm=request.rpm,
+                    pause_at_mm=request.pause_at_mm,
+                    pause_s=request.pause_s,
+                )
+            except MotorConfigError:
+                # A refusal touches nothing; a failed restore may leave a trial current behind.
+                if getattr(motor, "_trial_restore_failed", False) is True:
+                    worker.set_needs_home("Y descent trial settings not restored on y_axis", axes=["y_axis"])
+                raise
+            except Exception:
+                worker.set_needs_home("Y descent trial failed on y_axis", axes=["y_axis"])
+                raise
+            if result.completed is False:
+                worker.set_needs_home(f"Y descent trial ended {result.outcome} on y_axis", axes=["y_axis"])
+            await worker.get_status_snapshot(force_refresh=True)
+    except HTTPException:
+        raise
+    except MotorConfigError as exc:
+        logger.error("Y descent trial settings failed", exc_info=exc)
+        raise api_error(status.HTTP_503_SERVICE_UNAVAILABLE, "motor_trial_settings_failed", "") from exc
+    except Exception as exc:
+        logger.error("Y descent trial failed", exc_info=exc)
+        raise hardware_api_error(exc, status.HTTP_503_SERVICE_UNAVAILABLE, "motor_move_failed", "") from exc
+
+    return YDescentTrialResponse.model_validate(
+        {
+            **asdict(result),
+            "outcome": result.outcome,
+        }
+    )
 
 
 @router.post(
