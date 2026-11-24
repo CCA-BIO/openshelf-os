@@ -10,7 +10,6 @@ from openshelf_os.config.laser_scan import (
 )
 from openshelf_os.laser_calibration.defaults import Z_OFFSET_MODEL_PARAM_TOLERANCE_MM
 
-from openshelf_os.storage import CellStatus
 from openshelf_os_server.core.storage import StorageService
 from openshelf_os_server.database.session import AsyncSessionLocal
 
@@ -104,18 +103,15 @@ def _build_reference_offset_entry(
 		movers=list(result.movers),
 	)
 
-def _occupied_cells(worker: RobotWorker, side: StorageModuleSide) -> frozenset[tuple[int, int]]:
-    """Cells holding an item in the live grid; the grid file's statuses can lag behind it."""
-    grid = getattr(getattr(worker, "_robot", None), "_grid", None)
-
-    if grid is None:
-        return frozenset()
+async def _occupied_cells(side: StorageModuleSide) -> frozenset[tuple[int, int]]:
+    """Cells the database says hold an item or an at-home bin; grid statuses can be stale."""
+    async with AsyncSessionLocal() as session:
+        occupied = await StorageService(session).get_all_occupied_cells()
 
     return frozenset(
-        (int(shelf.shelf_idx), int(cell.cell_idx))
-        for shelf in grid.get_side(side)
-        for cell in shelf.cells
-        if cell.status == CellStatus.OCCUPIED or cell.item is not None
+        (int(shelf_idx), int(cell_idx))
+        for cell_side, shelf_idx, cell_idx, _ in occupied
+        if cell_side == side.value
     )
 
 
@@ -705,7 +701,7 @@ class ApplyRunnerMixin:
                 side=completed_result.side,
                 analysis=completed_result.analysis,
                 source_grid=source_grid,
-                occupied_cells=_occupied_cells(worker, completed_result.side),
+                occupied_cells=await _occupied_cells(completed_result.side),
             )
 
             if reference_result is not None:
@@ -820,7 +816,7 @@ class ApplyRunnerMixin:
             side=side,
             analysis=analysis,
             source_grid=grid,
-            occupied_cells=_occupied_cells(worker, side),
+            occupied_cells=await _occupied_cells(side),
         )
         # The probe's model is judged against the datum, so a rescan whose scope does not hold the
         # datum cannot fit one: it keeps whatever model the machine already has.
@@ -900,7 +896,7 @@ class ApplyRunnerMixin:
             side=side,
             analysis=analysis,
             source_grid=grid,
-            occupied_cells=_occupied_cells(worker, side),
+            occupied_cells=await _occupied_cells(side),
         )
         # A run scoped to some other opening cannot see the datum, so neither the frame nor a
         # probed model can be re-derived from it.

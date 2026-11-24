@@ -86,13 +86,14 @@ def build_scan_config(xy_offset: tuple[float, float] | None = None) -> LaserScan
 	return config
 
 
-def derive(grid: StorageGrid, analysis: SimpleNamespace, scan_config: LaserScanConfig):
+def derive(grid: StorageGrid, analysis: SimpleNamespace, scan_config: LaserScanConfig, occupied_cells=frozenset()):
 	return derive_reference_offsets(
 		grid=grid,
 		analysis=analysis,
 		side=StorageModuleSide.FRONT,
 		scan_config=scan_config,
 		candidates=[],
+		occupied_cells=occupied_cells,
 	)
 
 
@@ -220,14 +221,25 @@ def test_consensus_outvotes_a_datum_whose_hole_reads_off() -> None:
 def test_covered_datum_frames_no_xy() -> None:
 	# lb4a-4 2026-11-23: a plate over the datum's hole was measured as the hole.
 	grid, analysis = build_side(datum_shift_x_mm=-1.8)
-	grid.front_module[0].cells[0].status = CellStatus.OCCUPIED
+	covered = frozenset({(0, 0)})
 
-	result = derive(grid, analysis, build_scan_config((1.784, -3.325)))
+	result = derive(grid, analysis, build_scan_config((1.784, -3.325)), occupied_cells=covered)
 	assert result.offset_x_mm == pytest.approx(TRUE_OFFSET[0])
 
 	datum_only = build_grid([grid.front_module[0].cells[0]])
 	with pytest.raises(ValueError, match="covered by an item"):
-		derive(datum_only, analysis, build_scan_config((1.784, -3.325)))
+		derive(datum_only, analysis, build_scan_config((1.784, -3.325)), occupied_cells=covered)
+
+
+def test_grid_status_alone_does_not_mark_a_cell_covered() -> None:
+	# lb4a-9 2026-11-24: every cell read occupied in the grid with no item in the database.
+	grid, analysis = build_side()
+	for shelf in grid.front_module:
+		for cell in shelf.cells:
+			cell.status = CellStatus.OCCUPIED
+
+	result = derive(grid, analysis, build_scan_config((1.784, -3.325)))
+	assert result.method == "consensus"
 
 
 def test_stored_grid_that_no_longer_matches_falls_back_to_the_hand_set_cells() -> None:

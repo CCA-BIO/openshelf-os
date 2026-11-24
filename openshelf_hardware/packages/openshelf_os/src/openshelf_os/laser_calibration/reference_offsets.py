@@ -154,11 +154,9 @@ def _describe_mover(label: str, off_x_mm: float, off_y_mm: float, is_manual: boo
 
 
 def _is_covered(shelf_idx: int, cell: Cell, occupied_cells: frozenset[tuple[int, int]]) -> bool:
-	return (
-		cell.status == CellStatus.OCCUPIED
-		or cell.item is not None
-		or (int(shelf_idx), int(cell.cell_idx)) in occupied_cells
-	)
+	# Grid statuses are not inventory: a grid file or a live grid that missed a delete keeps
+	# cells marked occupied, so only the caller's database view counts.
+	return (int(shelf_idx), int(cell.cell_idx)) in occupied_cells
 
 
 def derive_consensus_offset(
