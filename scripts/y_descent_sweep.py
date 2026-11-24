@@ -142,8 +142,6 @@ class Run:
         self.output = output
         self.api = Api(args.base_url, args.token)
         self.rows: list[dict] = []
-        self.profile_per_mm: float | None = None
-        self.feedback_per_mm: float | None = None
         self.stop_reason: str | None = None
 
     def trial(self, current: int, repeat: int, trip_mm: float) -> dict:
@@ -164,7 +162,8 @@ class Run:
         (self.output / f"trial-{current:03d}-{repeat + 1:02d}.json").write_text(json.dumps(result, indent=1))
 
         leg = result["descent"] if args.leg == "descent" else result["approach"]
-        fe_mm, fe_at_mm = self.derived_following_error(leg)
+        fe_mm = None if leg is None else leg.get("max_following_error_mm")
+        fe_at_mm = None if leg is None else leg.get("max_following_error_at_mm")
         shares = [] if fe_mm is None else [fe_mm / trip_mm]
         sag_mm = None
         if leg and leg.get("end_mm") is not None and leg.get("settled_mm") is not None:
@@ -194,7 +193,7 @@ class Run:
             )
         elif fe_mm is None:
             self.stop_reason = (
-                f"The following-error trace is missing or too short to scale (trace_failed="
+                f"The following-error trace is missing (trace_failed="
                 f"{row['trace_failed']}). Fix that before sweeping."
             )
         elif row["share_of_trip"] > args.margin:
@@ -206,38 +205,10 @@ class Run:
             )
         return result
 
-    def derived_following_error(self, leg: dict | None) -> tuple[float | None, float | None]:
-        """Peak |profile - feedback| in mm and where it happened.
-
-        0x1010 on the CL57RS is not the following error in any unit the trip uses (on lb4a-3 it
-        tracked the real error at ~155k per mm), so the error is profile minus feedback. Both
-        restart at 0 each move; their units come from a leg's travel (250/mm command pulses and
-        100/mm encoder counts at 40 mm/rev), kept from the first leg long enough to measure.
-        """
-        samples = [] if leg is None else [
-            s for s in leg.get("samples") or []
-            if s.get("profile_position") is not None and s.get("feedback_position") is not None
-        ]
-        if len(samples) < 2:
-            return None, None
-        travel_mm = samples[-1]["position_mm"] - samples[0]["position_mm"]
-        if abs(travel_mm) >= 50 and self.profile_per_mm is None:
-            self.profile_per_mm = (samples[-1]["profile_position"] - samples[0]["profile_position"]) / travel_mm
-            self.feedback_per_mm = (samples[-1]["feedback_position"] - samples[0]["feedback_position"]) / travel_mm
-        if not self.profile_per_mm or not self.feedback_per_mm:
-            return None, None
-        peak = max(
-            samples,
-            key=lambda s: abs(s["profile_position"] / self.profile_per_mm - s["feedback_position"] / self.feedback_per_mm),
-        )
-        fe = abs(peak["profile_position"] / self.profile_per_mm - peak["feedback_position"] / self.feedback_per_mm)
-        return fe, peak["position_mm"]
-
     def report_check(self, result: dict) -> None:
         trip_units_per_mm = result["following_error_trip_counts"] / result["following_error_trip_mm"]
         print(
-            f"Profile {self.profile_per_mm} and feedback {self.feedback_per_mm} per mm; trip written at "
-            f"{trip_units_per_mm:.0f} counts per mm; holding {result['holding_current_percent']}%, "
+            f"Trip written at {trip_units_per_mm:.0f} counts per mm; holding {result['holding_current_percent']}%, "
             f"standby {result['standby_current_percent']}%."
         )
 

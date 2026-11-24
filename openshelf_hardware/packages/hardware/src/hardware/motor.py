@@ -1244,6 +1244,7 @@ class Motor():
             yield
             return
 
+        await self._retry_failed_trial_restore()
         if self._descent_peak_current is not None and self._peak_current_override is None:
             # Held moves start energised and keep whatever current they find, so the hold
             # runs at Ip throughout, written while still parked.
@@ -2502,6 +2503,7 @@ class Motor():
         write raises before the axis is enabled, so the move never runs at the wrong current.
         Trial overrides and held (energised) sequences keep the current they set.
         """
+        await self._retry_failed_trial_restore()
         descent = self._descent_peak_current
         if descent is None or self._peak_current_override is not None or self._hold_enabled is True:
             return
@@ -2626,11 +2628,35 @@ class Motor():
             await self._arm_following_error_trip(float(following_error_mm))
             yield
         finally:
-            self._peak_current_override = None
-            await self._park_after_trial()
-            await self._set_and_verify_peak_current(int(self._params.Ip))
-            await self._restore_following_error_limit()
-            self._trial_restore_failed = False
+            await self._restore_after_trial()
+
+    async def _restore_after_trial(self) -> None:
+        self._peak_current_override = None
+        await self._park_after_trial()
+        await self._set_and_verify_peak_current(int(self._params.Ip))
+        await self._restore_following_error_limit()
+        self._trial_restore_failed = False
+
+    async def _retry_failed_trial_restore(self) -> None:
+        """Put Ip and the following-error limit back before motion if a trial could not.
+
+        A failed restore leaves the trial's Pr5.00 and trip on the drive, and nothing else
+        rewrites them when descent_Ip is unset. Not while a trial runs (override set). A second
+        failure raises, so the axis never moves on trial settings.
+        """
+        if self._trial_restore_failed is False or self._peak_current_override is not None:
+            return
+
+        self._logger.warning(
+            "Retrying the restore of trial drive settings before motion",
+            extra={"motor_id": self._motor_id},
+        )
+        try:
+            await self._restore_after_trial()
+        except Exception as exc:
+            raise MotorConfigError(
+                f"Motor {self._motor_id} trial settings could not be restored; refusing to move"
+            ) from exc
 
     async def _park_after_trial(self) -> None:
         try:
@@ -2910,6 +2936,7 @@ class Motor():
 
         try:
             self._emit_init("homing")
+            await self._retry_failed_trial_restore()
             await self.clear_alarm()
 
             is_y_axis = getattr(self._params, "motor_name", None) == "y_axis"
