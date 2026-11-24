@@ -98,7 +98,22 @@ def _build_reference_offset_entry(
 			for sample in result.samples
 		],
 		skipped=list(result.skipped),
+		method=result.method,
+		consensus_sample_count=int(result.consensus_sample_count),
+		movers=list(result.movers),
 	)
+
+async def _occupied_cells(side: StorageModuleSide) -> frozenset[tuple[int, int]]:
+    """Cells the database says hold an item or an at-home bin; grid statuses can be stale."""
+    async with AsyncSessionLocal() as session:
+        occupied = await StorageService(session).get_all_occupied_cells()
+
+    return frozenset(
+        (int(shelf_idx), int(cell_idx))
+        for cell_side, shelf_idx, cell_idx, _ in occupied
+        if cell_side == side.value
+    )
+
 
 def _shelf_center_y(shelf: Any) -> float | None:
     ys = [float(cell.calibration_point.y) for cell in shelf.cells if cell.calibration_point is not None]
@@ -429,6 +444,7 @@ class ApplyRunnerMixin:
         side: StorageModuleSide,
         analysis: Any,
         source_grid: Any,
+        occupied_cells: frozenset[tuple[int, int]] = frozenset(),
     ) -> laser_module.ReferenceOffsetResult | None:
         """Derive this side's xy offset from the hand-calibrated datum its scan can see.
 
@@ -463,16 +479,21 @@ class ApplyRunnerMixin:
             shelf_idx=shelf_idx,
             cell_idx=cell_idx,
             stage_extension_mm=None if stage_extension_value is None else float(stage_extension_value),
+            occupied_cells=occupied_cells,
         )
         laser_module.print_status(
-            f"reference_offset_derivation side={side_name} "
+            f"reference_offset_derivation side={side_name} method={result.method} "
+            f"consensus_cells={result.consensus_sample_count} "
             f"samples={result.sample_count} offset_x_mm={result.offset_x_mm:.3f} "
             f"offset_y_mm={result.offset_y_mm:.3f} spread_x_mm={result.spread_x_mm:.3f} "
             f"spread_y_mm={result.spread_y_mm:.3f} "
             f"intercept_mm={'none' if result.intercept_mm is None else f'{result.intercept_mm:.3f}'}"
         )
 
-        if result.sample_count == 1:
+        for mover in result.movers:
+            laser_module.print_status(f"reference_offset_mover {mover}")
+
+        if result.method == "manual" and result.sample_count == 1:
             laser_module.print_status(
                 "reference_offset_warning single_reference_cell "
                 "(only as precise as that cell's manual placement)"
@@ -680,6 +701,7 @@ class ApplyRunnerMixin:
                 side=completed_result.side,
                 analysis=completed_result.analysis,
                 source_grid=source_grid,
+                occupied_cells=await _occupied_cells(completed_result.side),
             )
 
             if reference_result is not None:
@@ -794,6 +816,7 @@ class ApplyRunnerMixin:
             side=side,
             analysis=analysis,
             source_grid=grid,
+            occupied_cells=await _occupied_cells(side),
         )
         # The probe's model is judged against the datum, so a rescan whose scope does not hold the
         # datum cannot fit one: it keeps whatever model the machine already has.
@@ -873,6 +896,7 @@ class ApplyRunnerMixin:
             side=side,
             analysis=analysis,
             source_grid=grid,
+            occupied_cells=await _occupied_cells(side),
         )
         # A run scoped to some other opening cannot see the datum, so neither the frame nor a
         # probed model can be re-derived from it.

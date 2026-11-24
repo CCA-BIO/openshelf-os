@@ -86,13 +86,14 @@ def build_scan_config(xy_offset: tuple[float, float] | None = None) -> LaserScan
 	return config
 
 
-def derive(grid: StorageGrid, analysis: SimpleNamespace, scan_config: LaserScanConfig):
+def derive(grid: StorageGrid, analysis: SimpleNamespace, scan_config: LaserScanConfig, occupied_cells=frozenset()):
 	return derive_reference_offsets(
 		grid=grid,
 		analysis=analysis,
 		side=StorageModuleSide.FRONT,
 		scan_config=scan_config,
 		candidates=[],
+		occupied_cells=occupied_cells,
 	)
 
 
@@ -182,3 +183,71 @@ def test_datum_intercept_beyond_the_plausible_z_delta_is_refused() -> None:
 
 	with pytest.raises(ValueError, match="implausible z intercept 30.4mm"):
 		stamped_datum_intercept_mm(result)
+
+
+TRUE_OFFSET = (-0.4, -3.2)
+
+
+def build_side(*, datum_shift_x_mm: float = 0.0, cell_noise_x_mm: list[float] | None = None) -> tuple[StorageGrid, SimpleNamespace]:
+	"""A stored row whose points the gripper works at, and a scan of it with the true offset."""
+	noise = cell_noise_x_mm or [0.0] * 8
+	cells = [build_cell(cell_idx=0, x=327.5, y=39.0)] + [
+		build_cell(cell_idx=index, x=327.5 + 105.0 * index, y=39.0, is_manual=False) for index in range(1, 8)
+	]
+	detected = [
+		build_detected_cell(
+			cell_idx=index,
+			tool_x=cell.calibration_point.x - TRUE_OFFSET[0] + noise[index] + (datum_shift_x_mm if index == 0 else 0.0),
+			tool_y=cell.calibration_point.y - TRUE_OFFSET[1],
+		)
+		for index, cell in enumerate(cells)
+	]
+	return build_grid(cells), build_analysis(detected)
+
+
+def test_consensus_outvotes_a_datum_whose_hole_reads_off() -> None:
+	# lb4a-4 2026-11-22: the datum's hole read 2.3mm off the rest, and framing on it alone moved
+	# every front cell by that much. The stored grid outvotes it and the datum is reported.
+	grid, analysis = build_side(datum_shift_x_mm=-2.3)
+
+	result = derive(grid, analysis, build_scan_config((0.705, -4.587)))
+
+	assert result.method == "consensus"
+	assert result.offset_x_mm == pytest.approx(TRUE_OFFSET[0])
+	assert result.offset_y_mm == pytest.approx(TRUE_OFFSET[1])
+	assert any(mover.startswith("reference F0:0") for mover in result.movers)
+
+
+def test_covered_datum_frames_no_xy() -> None:
+	# lb4a-4 2026-11-23: a plate over the datum's hole was measured as the hole.
+	grid, analysis = build_side(datum_shift_x_mm=-1.8)
+	covered = frozenset({(0, 0)})
+
+	result = derive(grid, analysis, build_scan_config((1.784, -3.325)), occupied_cells=covered)
+	assert result.offset_x_mm == pytest.approx(TRUE_OFFSET[0])
+
+	datum_only = build_grid([grid.front_module[0].cells[0]])
+	with pytest.raises(ValueError, match="covered by an item"):
+		derive(datum_only, analysis, build_scan_config((1.784, -3.325)), occupied_cells=covered)
+
+
+def test_grid_status_alone_does_not_mark_a_cell_covered() -> None:
+	# lb4a-9 2026-11-24: every cell read occupied in the grid with no item in the database.
+	grid, analysis = build_side()
+	for shelf in grid.front_module:
+		for cell in shelf.cells:
+			cell.status = CellStatus.OCCUPIED
+
+	result = derive(grid, analysis, build_scan_config((1.784, -3.325)))
+	assert result.method == "consensus"
+
+
+def test_stored_grid_that_no_longer_matches_falls_back_to_the_hand_set_cells() -> None:
+	# A side rebuilt since the last calibration is no reference; the hand-set datum frames it.
+	grid, analysis = build_side(cell_noise_x_mm=[0.0, 3.0, -3.0, 2.5, -2.5, 3.5, -3.5, 2.0])
+
+	result = derive(grid, analysis, build_scan_config((0.0, -3.0)))
+
+	assert result.method == "manual"
+	assert result.offset_x_mm == pytest.approx(TRUE_OFFSET[0])
+	assert any("consensus" in skipped for skipped in result.skipped)
