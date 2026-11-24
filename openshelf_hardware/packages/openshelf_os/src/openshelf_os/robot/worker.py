@@ -33,7 +33,6 @@ from openshelf_os.robot.commands import (
 from openshelf_os.robot.status import (
     CabinetDoorState, RobotCommandSuccessful, RobotResponse, SafetyStatus, ScaleStatus,
 )
-from openshelf_os.robot.weight_guard import WEIGHT_CHANGE_SOURCE
 from openshelf_os.robot.models import (
     CrashReportArtifacts,
     CrashReportAttachment,
@@ -507,7 +506,6 @@ class RobotWorker:
         self._component_bypasses: dict[str, bool] = {
             "light_curtain": False,
             "cabinet_doors": False,
-            WEIGHT_CHANGE_SOURCE: False,
         }
         self._demo_cycling: bool = False
         self._guard_lock = asyncio.Lock()
@@ -1159,7 +1157,6 @@ class RobotWorker:
 
         self._robot.register_light_curtain_listener(self._on_light_curtain_change)
         self._robot.register_cabinet_door_listener(self._on_cabinet_door_change)
-        self._robot.register_weight_change_listener(self._on_weight_change)
         if hasattr(self._robot, "set_operation_context_listener"):
             self._robot.set_operation_context_listener(self._on_operation_context_change)
 
@@ -2262,7 +2259,6 @@ class RobotWorker:
         logger.info("Creating process_commands task")
         self._worker_task = asyncio.create_task(self.process_commands())
         self._scale_poll_task = asyncio.create_task(self._poll_scale_status())
-        await self._robot.start_weight_guard()
         await self._start_estop_monitor()
         logger.info("Task created: %s", self._worker_task)
         await self.refresh_tray_on_tool()
@@ -2301,8 +2297,6 @@ class RobotWorker:
             self._scale_poll_task = None
 
         await self._stop_estop_monitor()
-
-        await self._robot.stop_weight_guard()
 
         if self._barcode_task:
             logger.info("Stopping barcode bridge")
@@ -2453,55 +2447,8 @@ class RobotWorker:
         # the robot, so the curtain guards it like any other motion.
         return self._is_stopped() is True and self._current_command is None
 
-    def _weight_change_source(self, *, bypassed: bool) -> Optional[dict[str, Any]]:
-        """Safety source for the weight-change guard, absent when there is no guard."""
-        getter = getattr(self._robot, "get_weight_change_state", None)
-
-        if callable(getter) is False:
-            return None
-
-        state = getter()
-
-        if isinstance(state, dict) is False:
-            return None
-
-        return {
-            **state,
-            "active": (
-                state.get("active") is True
-                and bypassed is False
-                and self._is_stopped() is False
-            ),
-            "bypassed": bypassed,
-        }
-
     def _can_acknowledge_safety(self) -> bool:
-        """Report whether an acknowledgement would clear every active source.
-
-        A weight change stays changed after the gantry stops pressing, so waiting
-        for the reading to return to the baseline would latch the guard with no
-        way out. Sources that only an acknowledgement can clear are listed here.
-        """
-        if self._awaiting_safety_ack is not True:
-            return False
-
-        if not self._safety_active_sources:
-            return True
-
-        return self._sources_clear_on_ack(self._safety_sources, self._safety_active_sources)
-
-    @staticmethod
-    def _sources_clear_on_ack(
-        sources: dict[str, dict[str, Any]],
-        active_sources: list[str],
-    ) -> bool:
-        if not active_sources:
-            return False
-
-        return all(
-            sources.get(name, {}).get("clears_on_ack") is True
-            for name in active_sources
-        )
+        return self._awaiting_safety_ack is True and not self._safety_active_sources
 
     def _build_safety_sources(self) -> tuple[list[str], dict[str, dict[str, Any]]]:
         io_door_opening = self._is_io_door_opening()
@@ -2537,12 +2484,6 @@ class RobotWorker:
                 "bypassed": cabinet_doors_bypassed,
             },
         }
-
-        weight_source = self._weight_change_source(
-            bypassed=is_bypassed or self._component_bypasses[WEIGHT_CHANGE_SOURCE]
-        )
-        if weight_source is not None:
-            sources[WEIGHT_CHANGE_SOURCE] = weight_source
 
         active_sources = [
             name
@@ -2633,24 +2574,6 @@ class RobotWorker:
 
         return sources_changed is True or active_sources_changed is True or motion_blocked_changed is True
 
-    def _on_weight_change(self, info: dict[str, Any]) -> None:
-        """Stop the axes from the sampling task, then latch the interruption state.
-
-        The interlock is engaged before the first await so the motor wait loop sees
-        it on its next pass; the safety bookkeeping and the event follow.
-        """
-        if self._safety_guard_bypassed is True or self._component_bypasses[WEIGHT_CHANGE_SOURCE] is True:
-            logger.warning("Weight change interruption bypassed", extra=info)
-
-            return
-
-        self._robot.block_motion_for_safety()
-        self._track_background_task(self._handle_weight_change(), name="weight-change")
-
-    async def _handle_weight_change(self) -> None:
-        await self._evaluate_safety_guard(refresh=False)
-        await self._publish_status()
-
     def _on_light_curtain_change(self, state: Optional[bool]) -> None:
         async def _handle() -> None:
             # Recorded even while ignored, so a recovery home starts from the real state.
@@ -2740,28 +2663,6 @@ class RobotWorker:
         async with self._guard_lock:
             await self._refresh_safety_inputs()
             active_sources, sources = self._build_safety_sources()
-
-            acknowledge_weight = getattr(self._robot, "acknowledge_weight_change", None)
-            weight_source_suppressed = (
-                WEIGHT_CHANGE_SOURCE in sources
-                and WEIGHT_CHANGE_SOURCE not in active_sources
-            )
-
-            if self._sources_clear_on_ack(sources, active_sources) is True:
-                # The weight does not come back on its own, so acknowledging is what
-                # clears the source and re-bases the guard on the new reading.
-                self._robot.acknowledge_weight_change()
-                active_sources, sources = self._build_safety_sources()
-            elif (
-                weight_source_suppressed is True
-                and acknowledge_weight is not None
-            ):
-                # A latched trip whose source is currently suppressed (crash,
-                # emergency stop or a bypass) must still be acknowledged, or it
-                # re-activates the moment the suppress clears and the guard keeps
-                # skipping sampling until a second acknowledgement.
-                acknowledge_weight()
-                active_sources, sources = self._build_safety_sources()
 
             if active_sources:
                 self._awaiting_safety_ack = True

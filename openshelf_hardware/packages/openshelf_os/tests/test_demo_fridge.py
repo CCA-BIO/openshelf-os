@@ -910,7 +910,6 @@ def startup_robot(events: list[str], *, hazards: list[str | None]) -> Robot:
     robot._bus_settings = {"motor": {}}
     robot._logger = logging.getLogger("test_demo_fridge")
     robot._gpio = None
-    robot._weight_guard = None
     robot._failed_init_components = set()
     robot._config = SimpleNamespace(
         robot=SimpleNamespace(bus=None),

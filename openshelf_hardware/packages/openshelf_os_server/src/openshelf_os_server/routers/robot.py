@@ -423,7 +423,7 @@ class SafetyGuardOverrideRequest(BaseModel):
 
 
 class SafetyComponentOverrideRequest(BaseModel):
-    component: Literal["light_curtain", "cabinet_doors", "weight_change"]
+    component: Literal["light_curtain", "cabinet_doors"]
     bypass: bool
 
 
@@ -1373,11 +1373,9 @@ async def acknowledge_safety_guard(
 ) -> SuccessResponse:
     """Acknowledge a cleared safety interruption.
 
-    Acknowledges the worker safety guard once every interruption source is either
-    clear or one an acknowledgement is enough to clear, such as a weight change
-    that leaves the scale reading permanently shifted. Returns `409` with
-    `active_sources` while a source that has to clear physically remains active.
-    This does not bypass sensors or home the robot.
+    Acknowledges the worker safety guard only after all interruption sources are clear.
+    Returns `409` with `active_sources` while an interruption remains active. This does not
+    bypass sensors or home the robot.
     """
     result = await worker.acknowledge_safety_guard()
 
@@ -1435,8 +1433,8 @@ async def override_safety_component(
 ) -> dict[str, Any]:
     """Set a component safety bypass.
 
-    Engineering control requiring `robot:control`. Changes bypass for `light_curtain`,
-    `cabinet_doors` or `weight_change` and returns the resulting safety state. Restore the
+    Engineering control requiring `robot:control`. Changes bypass for `light_curtain`
+    or `cabinet_doors` and returns the resulting safety state. Restore the
     component after the controlled diagnostic procedure.
     """
     return await worker.set_safety_component_bypassed(request.component, request.bypass)

@@ -5,9 +5,7 @@
 
 	// The global /robot/status stream is the single source of truth. The
 	// server decides can_acknowledge: an interruption that is over on every
-	// source the operator can physically clear, including sources that only
-	// an acknowledgement can clear (e.g. the scale weight-change guard), so
-	// the same component works with or without the motion guard.
+	// source the operator can physically clear.
 	const safety = $derived(
 		$robotStatus?.robot_status?.safety ?? null
 	);

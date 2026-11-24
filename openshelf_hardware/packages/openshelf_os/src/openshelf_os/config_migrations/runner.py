@@ -16,6 +16,7 @@ from openshelf_os.config_migrations import (
     v008_remove_scan_style_keys,
     v009_fold_legacy_enabled_keys,
     v010_remove_angle_calibration_keys,
+    v011_remove_weight_guard_keys,
 )
 
 Migration = Callable[[dict[str, Any]], tuple[dict[str, Any], list[str]]]
@@ -30,6 +31,7 @@ MIGRATIONS: dict[int, Migration] = {
     8: v008_remove_scan_style_keys.migrate,
     9: v009_fold_legacy_enabled_keys.migrate,
     10: v010_remove_angle_calibration_keys.migrate,
+    11: v011_remove_weight_guard_keys.migrate,
 }
 
 

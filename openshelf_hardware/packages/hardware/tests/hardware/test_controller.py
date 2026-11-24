@@ -28,7 +28,7 @@ def silent_serial_port(serial_drive):
 
 
 async def test_bounded_read_fails_inside_its_own_timeout(silent_serial_port):
-    # The motion guard's fast weigh and the bounded position reads hold the shared port lock.
+    # Bounded position reads hold the shared port lock.
     # Their timeout was written to an object pymodbus does not read, so a device that did not
     # answer held the bus for the full 2 s default instead of the 0.1 s asked for.
     controller = SharedModbusController(silent_serial_port, 9600, timeout=2.0)

@@ -269,9 +269,9 @@ class SharedModbusController:
         for another full device timeout.
 
         `modbus_retries` and `modbus_timeout_s` override the client's own retry
-        count and per-attempt timeout for the duration of this read. The guard's
-        fast weigh uses `modbus_retries=0` and a short timeout so one read can
-        never hold the port lock for the client default (3 retries at `timeout`).
+        count and per-attempt timeout for the duration of this read, so a
+        latency-bound read never holds the port lock for the client default
+        (3 retries at `timeout`).
         """
         self._require_connected()
 
