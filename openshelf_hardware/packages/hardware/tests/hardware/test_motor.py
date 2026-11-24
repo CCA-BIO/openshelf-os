@@ -418,16 +418,6 @@ def echo_registers(mock_controller, registers: dict[int, int]) -> dict[int, int]
     return registers
 
 
-def home_motor(mock_controller, **overrides) -> Motor:
-    """A motor whose home() runs against echoed registers; the drive wait is mocked."""
-    params = {"motor_name": "z_axis", "physical_to_logical": lambda value: value, **overrides}
-    motor = Motor(mock_controller, make_motor_params(**params))
-    motor.clear_alarm = AsyncMock()
-    motor.move_config = AsyncMock()
-    motor.wait_for_move = AsyncMock(return_value=MotorStatus.STOPPED)
-    return motor
-
-
 def enable_writes(mock_controller) -> list[int]:
     """Every value written to Pr0.07, in order."""
     return [
@@ -573,6 +563,17 @@ async def test_jog_reports_the_axis_in_motion_while_it_runs(mock_controller):
     assert status is MotorStatus.STOPPED
     assert seen == [True]
     assert motor._status is not MotorStatus.MOVING
+
+
+@pytest.mark.parametrize("busy", [True, False])
+def test_motor_reports_bus_busy_from_its_controller_unit(mock_controller, busy):
+    # The IO box door refresh skips its read while the drive is held back; a real Motor has
+    # to answer this or every door operation raises AttributeError.
+    mock_controller.is_unit_busy = Mock(return_value=busy)
+    motor = Motor(mock_controller, make_motor_params(motor_id=7))
+
+    assert motor.is_bus_busy() is busy
+    mock_controller.is_unit_busy.assert_called_once_with(7)
 
 
 @pytest.mark.asyncio

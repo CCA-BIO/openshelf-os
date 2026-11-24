@@ -517,6 +517,11 @@ class Motor():
     def is_hard_stopped(self) -> bool:
         return self._hard_stopped
 
+    def is_bus_busy(self) -> bool:
+        """Report whether frames to this drive are held back (e.g. after the alarm-history
+        reset), without touching the bus. A read now would sleep out the window."""
+        return self._controller.is_unit_busy(self._motor_id)
+
     def position_mm(self) -> Optional[float]:
         """Last position tracked in-process, without touching the bus."""
         return self._cur_pos
