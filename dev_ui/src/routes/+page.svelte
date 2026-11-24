@@ -117,10 +117,7 @@
 		return (safety as Record<string, unknown>).awaiting_ack === true;
 	}
 
-	// The server decides whether an acknowledgement would clear every active
-	// source, including sources only an acknowledgement can clear (the scale
-	// weight-change guard), so the button stays correct with or without the
-	// motion guard.
+	// The server decides whether an acknowledgement would clear every active source.
 	function getSafetyCanAcknowledge(): boolean {
 		const safety = $robotStatus?.robot_status?.safety;
 		if (!safety || typeof safety !== 'object') {

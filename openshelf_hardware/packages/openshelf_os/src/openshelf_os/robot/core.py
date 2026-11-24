@@ -42,7 +42,6 @@ from openshelf_os.robot.status import (
     RobotResponse, RobotCommandSuccessful, RobotCommandError,
     RobotStatus, GantryStatus, ToolAxisStatus, RobotState, AxisTelemetry, CabinetDoorState,
 )
-from openshelf_os.robot.weight_guard import WeightChangeGuard
 from openshelf_os.storage import (
     StorageGrid, Dimensions, StorageModuleSide, CellItem, StorageModuleCellLocation, CellStatus,
     StorageValidationError,
@@ -204,8 +203,6 @@ class Robot:
         self._last_fault_context: dict[str, Any] | None = None
         self._motor_time_accumulator: float = 0.0
 
-        self._weight_guard = self._build_weight_guard()
-
         self._demo_cell_map: dict[str, StorageModuleCellLocation] | None = None
         self._demo_nudge_map: dict[tuple[str, int, int], float] = {}
         if should_enable_demo_features() is True:
@@ -352,15 +349,6 @@ class Robot:
             gpio.apply_initial_outputs()
             gpio.observe_all_inputs()
 
-        # The pre-home clearance jog of the startup home runs before the worker
-        # exists, so the guard has to start sampling here or the boot-time crush
-        # scenario goes unguarded. The worker replaces the listener when it
-        # connects; start() is idempotent so its later start is a no-op.
-        weight_guard = getattr(self, "_weight_guard", None)
-        if weight_guard is not None:
-            weight_guard.set_listener(self._stop_motion_on_weight_change)
-            await weight_guard.start()
-
         # Homing waits until every sensor is live, so the startup home is watched by
         # the same inputs that guard motion once the worker runs.
         await self._tool.configure(isolate=isolate, home_on_init=False)
@@ -486,8 +474,7 @@ class Robot:
     def _startup_motion_hazard(self) -> Optional[str]:
         """Why motion must not start or continue before the worker runs, or None."""
         if self._motion_safety.blocked is True:
-            # Only the weight guard blocks the interlock before the worker exists.
-            return "the weight guard tripped"
+            return "the motion interlock is engaged"
 
         try:
             if self._is_emergency_stop_pressed() is True:
@@ -1272,76 +1259,6 @@ class Robot:
     def release_motion_safety(self) -> None:
         self._motion_safety.unblock()
         self._logger.info("Safety guard cleared")
-
-    def _build_weight_guard(self) -> Optional[WeightChangeGuard]:
-        """Watch the scale during downward y travel so a crash into the cell stops motion.
-
-        Returns None when the scale or the y axis is absent, or when the guard is
-        switched off in config, in which case the safety sources simply omit it.
-        """
-        scale_cfg = self._config.get("robot.io.scale", None)
-
-        if scale_cfg is None or getattr(scale_cfg, "enabled", True) is not True:
-            return None
-
-        if getattr(scale_cfg, "motion_guard_enabled", True) is not True:
-            self._logger.info("weight_guard_disabled")
-
-            return None
-
-        scale = getattr(self._io, "_scale", None)
-        y_motor = getattr(self._tool, "_my", None)
-
-        if scale is None or y_motor is None:
-            self._logger.info("weight_guard_unavailable: scale or y axis not configured")
-
-            return None
-
-        return WeightChangeGuard(
-            scale=scale,
-            axis=y_motor,
-            delta_grams=float(getattr(scale_cfg, "motion_guard_delta_grams", 10.0)),
-            min_samples=int(getattr(scale_cfg, "motion_guard_min_samples", 2)),
-            arm_delay_s=float(getattr(scale_cfg, "motion_guard_arm_delay_s", 0.05)),
-            ack_grace_s=float(getattr(scale_cfg, "motion_guard_ack_grace_s", 1.0)),
-            sample_timeout_s=float(getattr(scale_cfg, "motion_guard_sample_timeout_s", 0.25)),
-            idle_interval_s=float(getattr(scale_cfg, "motion_guard_idle_interval_s", 0.2)),
-            context_provider=lambda: dict(self.get_operation_context() or {}),
-        )
-
-    def register_weight_change_listener(self, listener) -> None:
-        if self._weight_guard is not None:
-            self._weight_guard.set_listener(listener)
-
-    def _stop_motion_on_weight_change(self, info: dict[str, Any]) -> None:
-        """Trip listener for the window before the worker takes over.
-
-        Only the drive has to stop here; the worker latches the safety state and
-        publishes the event once it connects and replaces this listener.
-        """
-        self.block_motion_for_safety()
-        self._logger.warning(
-            "Weight change guard tripped during configuration",
-            extra=info,
-        )
-
-    async def start_weight_guard(self) -> None:
-        if self._weight_guard is not None:
-            await self._weight_guard.start()
-
-    async def stop_weight_guard(self) -> None:
-        if self._weight_guard is not None:
-            await self._weight_guard.stop()
-
-    def acknowledge_weight_change(self) -> None:
-        if self._weight_guard is not None:
-            self._weight_guard.acknowledge()
-
-    def get_weight_change_state(self) -> Optional[dict[str, Any]]:
-        if self._weight_guard is None:
-            return None
-
-        return self._weight_guard.source_state()
 
     def get_curtain_state(self) -> Optional[bool]:
         if self._io:

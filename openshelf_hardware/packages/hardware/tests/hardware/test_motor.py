@@ -558,9 +558,7 @@ async def test_jog_reports_the_axis_in_motion_while_it_runs(mock_controller):
     seen = []
 
     async def fake_wait_for_move(*args, **kwargs):
-        # The weight-change guard reads this, so the pre-home clearance jog has to
-        # look like motion while the drive is running the relative move.
-        seen.append(motor.is_moving())
+        seen.append(motor._status is MotorStatus.MOVING)
         await motor.stop()
 
         return MotorStatus.STOPPED
@@ -574,7 +572,7 @@ async def test_jog_reports_the_axis_in_motion_while_it_runs(mock_controller):
 
     assert status is MotorStatus.STOPPED
     assert seen == [True]
-    assert motor.is_moving() is False
+    assert motor._status is not MotorStatus.MOVING
 
 
 @pytest.mark.asyncio
@@ -722,90 +720,6 @@ async def test_home_stopped_on_its_seek_by_the_guard_is_a_safety_stop_and_skips_
     motor._move_to_position.reset_mock()
     await motor._move_near_home(rpm=100)
     motor._move_to_position.assert_not_awaited()
-
-
-def direction_recording_motor(mock_controller, **overrides) -> tuple[Motor, list[int]]:
-    """A z-like motor whose drive wait records the commanded direction mid-move."""
-    params = {
-        "motor_name": "z_axis",
-        "logical_to_physical": lambda value: value,
-        "logical_to_physical_delta": lambda value: value,
-        **overrides,
-    }
-    motor = Motor(mock_controller, make_motor_params(**params))
-    seen: list[int] = []
-
-    async def fake_wait_for_move(*args, **kwargs):
-        # The weight-change guard reads this while the drive runs the move.
-        seen.append(motor.commanded_direction())
-        motor._status = MotorStatus.STOPPED
-
-        return MotorStatus.STOPPED
-
-    motor.wait_for_move = fake_wait_for_move
-    motor.move_config = AsyncMock()
-    return motor, seen
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("start_mm", "target_mm", "expected"),
-    [
-        pytest.param(60.0, 20.0, -1, id="toward-zero"),
-        pytest.param(20.0, 60.0, 1, id="away-from-zero"),
-        pytest.param(None, 60.0, 0, id="unknown-start"),
-    ],
-)
-async def test_absolute_move_reports_its_commanded_direction(
-    mock_controller, monkeypatch, start_mm, target_mm, expected
-):
-    monkeypatch.setattr("hardware.motor.asyncio.sleep", AsyncMock())
-    motor, seen = direction_recording_motor(mock_controller)
-    motor._cur_pos = start_mm
-
-    await motor.move_to_position(target_mm)
-
-    assert seen == [expected]
-    # Idle again once the move ends.
-    assert motor.commanded_direction() == 0
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(("dist_mm", "expected"), [(-5.0, -1), (5.0, 1)])
-async def test_jog_reports_its_commanded_direction(mock_controller, dist_mm, expected):
-    motor, seen = direction_recording_motor(mock_controller)
-
-    await motor.jog(dist_mm)
-
-    assert seen == [expected]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("phys_at_zero", "phys_at_max", "expected"),
-    [
-        pytest.param(0.0, 100.0, -1, id="non-inverted"),
-        pytest.param(100.0, 0.0, 1, id="inverted"),
-    ],
-)
-async def test_homing_reports_the_direction_of_the_drive_zero(
-    mock_controller, phys_at_zero, phys_at_max, expected
-):
-    motor = home_motor(mock_controller, phys_at_zero=phys_at_zero, phys_at_max=phys_at_max)
-    echo_registers(mock_controller, {})
-    seen: list[int] = []
-
-    async def fake_wait_for_move(*args, **kwargs):
-        seen.append(motor.commanded_direction())
-
-        return MotorStatus.STOPPED
-
-    motor.wait_for_move = fake_wait_for_move
-    motor._move_near_home = AsyncMock()
-
-    await motor.home()
-
-    assert seen == [expected]
 
 
 def y_home_motor(mock_controller, **overrides) -> Motor:

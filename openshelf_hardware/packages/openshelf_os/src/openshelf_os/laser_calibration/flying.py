@@ -99,8 +99,8 @@ FLYING_SCAN_SAFETY_POLL_S = 0.1
 # or takes longer than this in total (lock wait included) stops the axis, and the line resumes from
 # what the pass placed. That bounds how long the gantry can fly unobserved to about two of these per
 # sample plus the stop write, instead of the client's full retry budget. A normal read takes a few
-# tens of milliseconds, and the margin above that leaves room for the weight guard's 0.1s fast weigh
-# to hold the lock first.
+# tens of milliseconds, and the margin above that leaves room for another short read to hold the
+# lock first.
 FLYING_SCAN_READ_TIMEOUT_S = 0.15
 # A pass stopped by a read overrun is resumed; a bus that keeps overrunning fails the line.
 FLYING_SCAN_MAX_READ_OVERRUN_RESTARTS = 2

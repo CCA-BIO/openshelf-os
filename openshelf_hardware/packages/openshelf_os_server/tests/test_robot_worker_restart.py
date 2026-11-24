@@ -41,12 +41,6 @@ class GpioRobot:
 	def clear_operation_context(self) -> None:
 		pass
 
-	async def start_weight_guard(self) -> None:
-		pass
-
-	async def stop_weight_guard(self) -> None:
-		pass
-
 
 @pytest.fixture
 async def worker():
@@ -88,11 +82,11 @@ async def test_cancelled_stop_still_releases_hardware_once(client: AsyncClient, 
 	entered = asyncio.Event()
 	release = asyncio.Event()
 
-	async def blocked_stop_weight_guard() -> None:
+	async def blocked_stop_estop_monitor() -> None:
 		entered.set()
 		await release.wait()
 
-	with patch.object(worker._robot, "stop_weight_guard", blocked_stop_weight_guard):
+	with patch.object(worker, "_stop_estop_monitor", blocked_stop_estop_monitor):
 		stop_request = asyncio.create_task(worker.shutdown())
 		await entered.wait()
 

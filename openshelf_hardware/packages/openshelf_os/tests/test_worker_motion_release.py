@@ -78,12 +78,6 @@ class InterlockRobot:
     def clear_operation_context(self) -> None:
         pass
 
-    async def start_weight_guard(self) -> None:
-        pass
-
-    async def stop_weight_guard(self) -> None:
-        pass
-
     async def shutdown(self) -> None:
         pass
 

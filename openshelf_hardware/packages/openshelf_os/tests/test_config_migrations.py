@@ -17,6 +17,7 @@ from openshelf_os.config_migrations import (
     v005_module_side_names as v005,
     v006_multi_item_io_pose as v006,
     v009_fold_legacy_enabled_keys as v009,
+    v011_remove_weight_guard_keys as v011,
 )
 from openshelf_os.config_migrations.v002_laser_parameter_names import (
     SCAN_KEY_RENAMES,
@@ -75,7 +76,10 @@ def legacy_config():
                 "motors": [],
                 "poe_camera": {"url": ""},
             },
-            "io": {"motors": []},
+            "io": {
+                "motors": [],
+                "scale": {"enabled": True, "motion_guard_enabled": True, "motion_guard_delta_grams": 10.0},
+            },
             "grid": {
                 "path": "storage.development.json",
                 "scan": {
@@ -126,7 +130,7 @@ def test_migration_preserves_pose_geometry_and_unrelated_values(legacy_config):
     original = copy.deepcopy(legacy_config)
     migrated, changes = runner.migrate_config(legacy_config)
     assert legacy_config == original
-    assert migrated["schema_version"] == 10
+    assert migrated["schema_version"] == 11
     assert migrated["version"] == original["version"]
     assert migrated["auth"] == original["auth"]
     assert migrated["unknown_root_setting"] == original["unknown_root_setting"]
@@ -137,7 +141,8 @@ def test_migration_preserves_pose_geometry_and_unrelated_values(legacy_config):
     assert not set(Z_STALL_PROBE_SCAN_KEYS) & migrated["robot"]["grid"]["scan"].keys()
     assert not set(SCAN_STYLE_KEYS) & migrated["robot"]["grid"]["scan"].keys()
     assert not set(ANGLE_CALIBRATION_SCAN_KEYS) & migrated["robot"]["grid"]["scan"].keys()
-    assert changes[-1] == "schema_version: 9 -> 10"
+    assert migrated["robot"]["io"]["scale"] == {"enabled": True}
+    assert changes[-1] == "schema_version: 10 -> 11"
     config = RootConfig.model_validate(migrated)
     scan = config.robot.grid.scan
 
@@ -285,7 +290,7 @@ def v4_side_config():
 
 def test_v5_renames_module_side_scan_keys_and_bin_sides(v4_side_config):
     migrated, changes = runner.migrate_config(v4_side_config)
-    assert migrated["schema_version"] == 10
+    assert migrated["schema_version"] == 11
     scan = migrated["robot"]["grid"]["scan"]
     assert scan["front_shelf_scout_x_mm"] == 120.0
     assert scan["back_shelf_scout_x_mm"] == 45.0
@@ -353,7 +358,7 @@ def test_startup_rejects_unmigrated_config_without_writing(tmp_path, legacy_conf
     path = tmp_path / "config.json"
     raw = json.dumps(legacy_config).encode()
     path.write_bytes(raw)
-    with pytest.raises(ConfigValidationError, match="requires migration to 10"):
+    with pytest.raises(ConfigValidationError, match="requires migration to 11"):
         load_config_file(path)
     assert path.read_bytes() == raw
     assert list(tmp_path.iterdir()) == [path]
@@ -496,3 +501,19 @@ def test_v9_leaves_a_migrated_document_unchanged(pre_v9_config):
     pre_v9_config["robot"]["io"]["curtain"] = {"enabled": False}
     after, changes = v009.migrate(pre_v9_config)
     assert after == pre_v9_config and changes == []
+
+
+def test_v11_drops_every_weight_guard_key_and_keeps_the_rest():
+    scale = {"enabled": False, "unknown_scale_setting": 1, **{key: 1 for key in v011.REMOVED_SCALE_KEYS}}
+    before = {"robot": {"io": {"scale": scale}}}
+    snapshot = copy.deepcopy(before)
+    after, changes = v011.migrate(before)
+    assert before == snapshot
+    assert after["robot"]["io"]["scale"] == {"enabled": False, "unknown_scale_setting": 1}
+    assert changes == [f"robot.io.scale.{key} removed (unused)" for key in v011.REMOVED_SCALE_KEYS]
+
+
+def test_v11_leaves_a_config_without_a_scale_unchanged():
+    config = {"robot": {"io": {"motors": []}}}
+    after, changes = v011.migrate(config)
+    assert after == config and changes == []

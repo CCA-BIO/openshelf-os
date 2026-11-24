@@ -141,7 +141,6 @@ async def test_startup_with_a_held_tray_skips_homing_and_blocks_commands(running
     robot._motorbus = robot._scalebus = object()
     robot._config = SimpleNamespace(get=lambda *_args: SimpleNamespace(enabled=False))
     robot._gpio = None
-    robot._weight_guard = None
     robot._cabinet = None
     robot._tool = tool
     robot._io = SimpleNamespace(configure=AsyncMock())

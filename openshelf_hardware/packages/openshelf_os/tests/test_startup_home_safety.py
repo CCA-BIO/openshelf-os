@@ -44,7 +44,6 @@ def make_robot() -> Robot:
     # Scale and laser off; the e-stop stays monitored.
     robot._config = SimpleNamespace(get=lambda key, *_args: SimpleNamespace(enabled=key == "robot.emergency_stop"))
     robot._gpio = gpio
-    robot._weight_guard = None
     robot._motion_safety = MotionSafetyInterlock()
     robot._tool = SimpleNamespace(
         configure=AsyncMock(),
