@@ -36,8 +36,8 @@ NOOP_POSITION_TOLERANCE_MM = 0.01
 SETTLED_ON_TARGET_TOLERANCE_MM = 0.1
 HOME_APPROACH_TOLERANCE_MM = 1.0
 DEFAULT_HOME_APPROACH_BACKOFF_MM = 5.0
-# Y following-error trip for homing only; restored to max_following_error after,
-# since lifts at speed lag well past 10 mm.
+# Y following-error trip for homing only, where alarm 32 marks the hard stop; restored to
+# max_following_error after (template 500 = 5 mm; lb4a-9 lifts peak 1.2 mm, 2026-11-24).
 HOME_FOLLOWING_ERROR_MM = 10.0
 Y_HOME_SETTLE_LIFT_MM = 5.0
 # lb4a-5 stalls Y on the next move after returning to 0 from the settle lift; 2 mm holds.
