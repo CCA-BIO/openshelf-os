@@ -2277,6 +2277,12 @@ async def run_y_descent_trial(
             "request_invalid",
             "The pause must fall between the end and the start of the descent.",
         )
+    if request.rpm is not None and request.rpm > int(params.rpm):
+        raise api_error(
+            status.HTTP_400_BAD_REQUEST,
+            "request_invalid",
+            "A trial speed cannot exceed the configured Y speed.",
+        )
     if any(
         current is not None and current > configured_peak_current
         for current in (request.descent_peak_current, request.approach_peak_current)

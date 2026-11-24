@@ -192,9 +192,9 @@ class Run:
                 "Trial failed: Y is stopped and needs homing. Inspect, remove blocks and gauge from under "
                 "the carriage, clear the alarm, then home Y yourself."
             )
-        elif fe_mm is None:
+        elif fe_mm is None or row["trace_failed"]:
             self.stop_reason = (
-                f"The following-error trace is missing (trace_failed="
+                f"The following-error trace is missing or incomplete (trace_failed="
                 f"{row['trace_failed']}). Fix that before sweeping."
             )
         elif row["share_of_trip"] > args.margin:
@@ -248,8 +248,12 @@ class Run:
             worst_share = max((r["share_of_trip"] or 0.0 for r in level), default=0.0)
             worst_sag = max((abs(r["sag_mm"] or 0.0) for r in level), default=0.0)
             sag_known = all(r["sag_mm"] is not None for r in level)
+            measured = all(
+                r["max_following_error_mm"] is not None and r["share_of_trip"] is not None and not r["trace_failed"]
+                for r in level
+            )
             if (
-                len(level) == repeats and completed == len(level) and worst_share <= args.margin
+                len(level) == repeats and completed == len(level) and measured and worst_share <= args.margin
                 and sag_known and worst_sag <= args.max_sag_mm
             ):
                 passing.append(current)

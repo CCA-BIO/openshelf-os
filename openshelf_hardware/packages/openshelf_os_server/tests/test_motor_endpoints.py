@@ -446,3 +446,29 @@ async def test_y_descent_trial_refuses_a_pause_outside_the_descent_before_motion
 	assert response.status_code == 400
 	y_axis.move_to_position.assert_not_awaited()
 	y_axis.trial_drive_settings.assert_not_called()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(("rpm", "expected_status"), [(151, 400), (1500, 400)])
+async def test_y_descent_trial_refuses_a_speed_above_the_configured_rpm_before_motion(
+	client: AsyncClient, rpm: int, expected_status: int
+) -> None:
+	from types import SimpleNamespace
+	from openshelf_os.operating_mode import OperatingMode
+
+	y_axis = _mock_motor(200.0)
+	y_axis._params = SimpleNamespace(Ip=60, rpm=150, lim=1165.0, lower_lim=0.0, mpr=40.0, ppr=10000)
+	y_axis.is_homed = MagicMock(return_value=True)
+	mock_worker = _mock_worker({"y_axis": y_axis})
+
+	with patch("openshelf_os_server.routers.robot.get_settings", return_value=_mock_settings()), \
+		patch("openshelf_os_server.routers.robot.get_robot_worker", return_value=mock_worker), \
+		patch("openshelf_os_server.routers.robot.get_operating_mode", return_value=OperatingMode("development")):
+		response = await client.post(
+			"/api/robot/debug/motors/y_axis/descent-trial",
+			json={"start_mm": 600.0, "end_mm": 300.0, "descent_peak_current": 30, "rpm": rpm},
+		)
+
+	assert response.status_code == expected_status
+	y_axis.move_to_position.assert_not_awaited()
+	y_axis.trial_drive_settings.assert_not_called()
