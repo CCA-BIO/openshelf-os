@@ -15,8 +15,9 @@ Before running, on site:
      least 150 mm of clear travel under --end-mm and put blocks under the carriage there.
   3. Keep a hand on the emergency stop. Closing this script does not stop a trial in progress.
   4. Run --check-only first: one trial at the configured current. It confirms the drive answers
-     the trace registers (trace_failed false), that the profile and feedback positions scale as
-     expected (about 250 and 100 per mm at 10000 ppr, 4000 cpr, 40 mm/rev), and the baseline
+     the trace registers (trace_failed false), and prints the profile and feedback counts
+     per mm over the run leg (about 250 and 100 at 10000 ppr, 4000 cpr, 40 mm/rev; compare them
+     with the drive's settings), and the baseline
      error.
 
 The sweep:
@@ -207,9 +208,24 @@ class Run:
 
     def report_check(self, result: dict) -> None:
         trip_units_per_mm = result["following_error_trip_counts"] / result["following_error_trip_mm"]
+        leg = result["descent"] if self.args.leg == "descent" else result["approach"]
+        pts = [
+            s
+            for s in ((leg or {}).get("samples") or [])
+            if s.get("profile_position") is not None
+            and s.get("feedback_position") is not None
+            and s.get("position_mm") is not None
+        ]
+        if len(pts) < 2 or abs(pts[-1]["position_mm"] - pts[0]["position_mm"]) < 50:
+            scale = "profile/feedback scale unknown (under 2 samples or under 50 mm of travel)"
+        else:
+            travel = pts[-1]["position_mm"] - pts[0]["position_mm"]
+            profile = (pts[-1]["profile_position"] - pts[0]["profile_position"]) / travel
+            feedback = (pts[-1]["feedback_position"] - pts[0]["feedback_position"]) / travel
+            scale = f"profile {profile:.1f} and feedback {feedback:.1f} counts per mm"
         print(
-            f"Trip written at {trip_units_per_mm:.0f} counts per mm; holding {result['holding_current_percent']}%, "
-            f"standby {result['standby_current_percent']}%."
+            f"Trip written at {trip_units_per_mm:.0f} counts per mm; {scale}; "
+            f"holding {result['holding_current_percent']}%, standby {result['standby_current_percent']}%."
         )
 
     def finish(self) -> int:

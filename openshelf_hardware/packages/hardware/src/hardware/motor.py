@@ -44,9 +44,10 @@ Y_HOME_SETTLE_LIFT_MM = 5.0
 # Only homing takes Y below this.
 Y_MIN_TARGET_MM = 2.0
 ALARM_DETECT_FOLLOWING_ERROR_BIT = 2
-# Live following error, then profile and feedback position: three signed 32-bit values, high
-# word first (CL57RS manual p.25). Unconfirmed on every fielded Y drive, so they are read only
-# while a trace is open, with one bounded attempt, and never again after a read fails.
+# A raw drive value that is not the following error, then profile (command pulses) and feedback
+# (encoder counts) position: three signed 32-bit values, high word first (CL57RS manual p.25).
+# The trial uses profile and feedback. Read only while a trace is open, with one bounded
+# attempt, and never again after a read fails.
 FOLLOWING_ERROR_TRACE_REGISTER = 0x1010
 FOLLOWING_ERROR_TRACE_READ_TIMEOUT_S = 0.1
 # Control word 0x1122 resets the alarm history, an EEPROM write that leaves the drive
@@ -208,7 +209,6 @@ class MotionRecordEntry:
     correlation_id: str | None
     # Pr4.29 on axes with a drive-controlled brake: whether SO2 held the brake released.
     digital_output_state: int | None = None
-    following_error: int | None = None
 
 
 @dataclass(frozen=True)
@@ -571,7 +571,6 @@ class Motor():
         state: MotionWaitState,
         position_delta: float | None,
         digital_output_state: int | None = None,
-        following_error: int | None = None,
     ) -> None:
         now = time.monotonic()
 
@@ -599,7 +598,6 @@ class Motor():
                 run_id=self._diagnostic_run_id,
                 correlation_id=self._diagnostic_correlation_id,
                 digital_output_state=digital_output_state,
-                following_error=following_error,
             )
         )
 
@@ -1244,11 +1242,8 @@ class Motor():
             yield
             return
 
-        await self._retry_failed_trial_restore()
-        if self._descent_peak_current is not None and self._peak_current_override is None:
-            # Held moves start energised and keep whatever current they find, so the hold
-            # runs at Ip throughout, written while still parked.
-            await self._set_and_verify_peak_current(int(self._params.Ip))
+        # Held moves keep the current they find, so the hold runs at Ip, written while parked.
+        await self._apply_move_peak_current(None)
         self._hold_enabled = True
         try:
             await self.enable()
@@ -1685,14 +1680,9 @@ class Motor():
                     return await self._finish_completed_move(homing, state)
 
                 alarm_state = await self._read_alarm_state(homing, state)
-                self._record_flight_snapshot(
-                    snapshot,
-                    alarm_state,
-                    state,
-                    position_delta,
-                    await self._read_brake_output_for_recorder(),
-                    await self._read_following_error_for_trace(state),
-                )
+                brake_output = await self._read_brake_output_for_recorder()
+                await self._read_following_error_for_trace(state)
+                self._record_flight_snapshot(snapshot, alarm_state, state, position_delta, brake_output)
 
                 if self._is_homing_limit_stop(homing, alarm_state, state):
                     return await self._finish_homing_limit_stop(snapshot, alarm_state, state)
@@ -2556,10 +2546,10 @@ class Motor():
         finally:
             self._following_error_trace = None
 
-    async def _read_following_error_for_trace(self, state: MotionWaitState) -> int | None:
+    async def _read_following_error_for_trace(self, state: MotionWaitState) -> None:
         trace = self._following_error_trace
         if trace is None or trace.read_failed is True:
-            return None
+            return
 
         try:
             registers = await self._controller.read_holding_register_block(
@@ -2581,7 +2571,7 @@ class Motor():
                 extra={"motor_id": self._motor_id},
                 exc_info=exc,
             )
-            return None
+            return
 
         trace.samples.append(
             FollowingErrorSample(
@@ -2593,7 +2583,6 @@ class Motor():
                 feedback_position=feedback_position,
             )
         )
-        return following_error
 
     @asynccontextmanager
     async def trial_drive_settings(self, *, peak_current: int, following_error_mm: float):
