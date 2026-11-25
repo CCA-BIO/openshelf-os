@@ -1319,6 +1319,68 @@ async def test_failed_home_still_restores_ip_after_the_home_current(mock_control
     assert events == [("current", 15), ("seek", 0), ("current", 36)]
 
 
+def _two_speed_home_motor(mock_controller, *, approach_moved: bool, switch_engaged: bool):
+    # Rotate as on lb4a-9: final seek 12 rpm at 1.5 A, fast seek 24 rpm, approach target 5 deg.
+    motor, events = _stubbed_home_motor(
+        mock_controller, Ip=36, home_Ip=15, home_rpm=12, ret_rpm=36, home_fast_rpm=24, lim=270, mpr=36.0
+    )
+    motor._move_near_home = AsyncMock(return_value=approach_moved)
+    motor._home_limit_input = Mock(read=Mock(return_value=switch_engaged))
+    motor._prepare_home_motion = AsyncMock(side_effect=lambda rpm, direction: events.append(("prepare", rpm)))
+    motor._zero_at_home = AsyncMock(side_effect=lambda *args: events.append(("zero", 0)))
+    motor._move_to_position = AsyncMock(side_effect=lambda target, **kwargs: events.append(("move", target)))
+    return motor, events
+
+
+@pytest.mark.asyncio
+async def test_home_from_a_lost_position_finds_the_switch_fast_then_takes_the_final_stop_slow(mock_controller):
+    # After a drive power cycle the counter reads 0 anywhere, so there is no approach; a 270 deg
+    # seek at 12 rpm took ~37 s, and only the last stop on the flag needs the slow speed.
+    motor, events = _two_speed_home_motor(mock_controller, approach_moved=False, switch_engaged=False)
+
+    await motor.home()
+
+    assert events == [
+        ("current", 15),
+        ("prepare", 24), ("seek", 0), ("zero", 0),
+        ("move", 5.0),
+        ("prepare", 12), ("seek", 0), ("zero", 0),
+        ("current", 36),
+    ]
+    assert motor.is_homed() is True
+
+
+@pytest.mark.parametrize(
+    ("approach_moved", "switch_engaged"),
+    [
+        pytest.param(True, False, id="approach-ran"),
+        pytest.param(False, True, id="resting-on-the-switch"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_routine_home_only_takes_the_slow_stop(mock_controller, approach_moved, switch_engaged):
+    # Every API restart homes rotate from rest on its switch; a fast seek there would put the
+    # flag through a 24 rpm stop on each restart.
+    motor, events = _two_speed_home_motor(mock_controller, approach_moved=approach_moved, switch_engaged=switch_engaged)
+
+    await motor.home()
+
+    assert [e for e in events if e[0] in ("prepare", "move")] == [("prepare", 12)]
+
+
+@pytest.mark.asyncio
+async def test_failed_fast_seek_stops_the_home_without_backing_off(mock_controller):
+    motor, events = _two_speed_home_motor(mock_controller, approach_moved=False, switch_engaged=False)
+    motor.wait_for_move = AsyncMock(return_value=MotorStatus.FAULT)
+    motor._raise_home_fault = Mock(side_effect=MotorError("alarm"))
+
+    with pytest.raises(MotorError):
+        await motor.home()
+
+    assert events == [("current", 15), ("prepare", 24), ("seek", 0), ("current", 36)]
+    assert motor.is_homed() is False
+
+
 @pytest.mark.asyncio
 async def test_y_electrical_check_after_a_descent_expects_the_descent_current(mock_controller):
     motor, regs = y_descent_motor(mock_controller, registers={0x0003: 2, 0x0001: 10000, 0x0233: 4000})
