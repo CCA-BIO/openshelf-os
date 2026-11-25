@@ -56,3 +56,12 @@ def test_home_current_is_optional_and_allowed_on_any_axis_up_to_ip():
 def test_invalid_home_current_is_rejected(home_ip, message):
     with pytest.raises(ValidationError, match=message):
         Motor(**{**Y_AXIS, "home_Ip": home_ip})
+
+
+def test_fast_home_speed_must_exceed_the_final_speed_and_is_refused_on_y():
+    rotate = {**Y_AXIS, "motor_name": "rotate", "Ip": 36, "ret_rpm": 36, "home_rpm": 12}
+    assert Motor(**rotate, home_fast_rpm=24).home_fast_rpm == 24
+    with pytest.raises(ValidationError, match="must exceed the final homing speed"):
+        Motor(**rotate, home_fast_rpm=12)
+    with pytest.raises(ValidationError, match="not supported on y_axis"):
+        Motor(**Y_AXIS, home_fast_rpm=100)

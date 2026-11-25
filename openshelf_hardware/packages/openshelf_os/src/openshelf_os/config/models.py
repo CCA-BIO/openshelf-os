@@ -56,6 +56,10 @@ class Motor(BaseModel):
     # into the hard stop at this current: lb4a-9's rotate flag broke repeatedly at full Ip.
     # None seeks at Ip (Y: at descent_Ip).
     home_Ip: Optional[int] = Field(default=None, gt=0)
+    # Speed to find the switch when homing starts off it without an approach (position lost,
+    # e.g. a drive power cycle); the axis then backs off and takes the final stop at home_rpm.
+    # The flag still takes one stop at this speed. None seeks the whole way at home_rpm.
+    home_fast_rpm: Optional[int] = Field(default=None, gt=0)
     # How far from zero a homed axis may read and still count as home. Compliant axes such
     # as the IO door spring back off their stop (lb4a-3 read 0.496 mm); the door's closed
     # check accepts that instead of re-homing.
@@ -110,6 +114,16 @@ class Motor(BaseModel):
             raise ValueError(
                 f"Motor '{self.motor_name}': home_Ip ({self.home_Ip}) cannot exceed Ip ({self.Ip})"
             )
+        if self.home_fast_rpm is not None:
+            # Y homes with a following-error trip and a settle lift that the two-stage seek skips.
+            if self.motor_name == "y_axis":
+                raise ValueError("Motor 'y_axis': home_fast_rpm is not supported on y_axis")
+            final_rpm = self.home_rpm or self.ret_rpm
+            if self.home_fast_rpm <= final_rpm:
+                raise ValueError(
+                    f"Motor '{self.motor_name}': home_fast_rpm ({self.home_fast_rpm}) must exceed "
+                    f"the final homing speed ({final_rpm})"
+                )
         return self
 
     @model_validator(mode="after")
