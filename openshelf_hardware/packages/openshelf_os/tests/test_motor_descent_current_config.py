@@ -39,3 +39,20 @@ def test_y_axis_accepts_a_descent_current_up_to_ip():
 def test_invalid_descent_current_is_rejected(overrides, message):
     with pytest.raises(ValidationError, match=message):
         Motor(**{**Y_AXIS, **overrides})
+
+
+def test_home_current_is_optional_and_allowed_on_any_axis_up_to_ip():
+    assert Motor(**Y_AXIS).home_Ip is None
+    assert Motor(**{**Y_AXIS, "motor_name": "rotate", "Ip": 36, "home_Ip": 36}).home_Ip == 36
+
+
+@pytest.mark.parametrize(
+    ("home_ip", "message"),
+    [
+        pytest.param(61, "home_Ip \\(61\\) cannot exceed Ip", id="above-ip"),
+        pytest.param(0, "greater than 0", id="zero"),
+    ],
+)
+def test_invalid_home_current_is_rejected(home_ip, message):
+    with pytest.raises(ValidationError, match=message):
+        Motor(**{**Y_AXIS, "home_Ip": home_ip})

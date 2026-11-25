@@ -52,6 +52,10 @@ class Motor(BaseModel):
     accel: int = Field(..., gt=0)
     ret_rpm: int = Field(..., gt=0)
     home_rpm: Optional[int] = Field(default=None, gt=0)
+    # Peak current (0.1 A) for the homing seek, at most Ip. A seek that misses its switch runs
+    # into the hard stop at this current: lb4a-9's rotate flag broke repeatedly at full Ip.
+    # None seeks at Ip (Y: at descent_Ip).
+    home_Ip: Optional[int] = Field(default=None, gt=0)
     # How far from zero a homed axis may read and still count as home. Compliant axes such
     # as the IO door spring back off their stop (lb4a-3 read 0.496 mm); the door's closed
     # check accepts that instead of re-homing.
@@ -97,6 +101,14 @@ class Motor(BaseModel):
         if self.descent_Ip > self.Ip:
             raise ValueError(
                 f"Motor '{self.motor_name}': descent_Ip ({self.descent_Ip}) cannot exceed Ip ({self.Ip})"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_home_current(self) -> "Motor":
+        if self.home_Ip is not None and self.home_Ip > self.Ip:
+            raise ValueError(
+                f"Motor '{self.motor_name}': home_Ip ({self.home_Ip}) cannot exceed Ip ({self.Ip})"
             )
         return self
 

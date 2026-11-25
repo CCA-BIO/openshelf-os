@@ -1251,6 +1251,75 @@ async def test_y_home_seeks_at_the_descent_current_and_lifts_at_ip(mock_controll
 
 
 @pytest.mark.asyncio
+async def test_y_home_seeks_at_home_ip_over_the_descent_current(mock_controller):
+    motor = y_home_motor(mock_controller, Ip=60, descent_Ip=30, home_Ip=20, max_following_error=4000)
+    regs = echo_registers(mock_controller, {0x0159: 0x24, 0x0191: 60})
+    motor._move_to_position = AsyncMock()
+    seek_currents: list[int] = []
+    start_path_zero = motor._start_path_zero
+
+    async def record_seek():
+        seek_currents.append(regs[0x0191])
+        await start_path_zero()
+
+    motor._start_path_zero = record_seek
+
+    await motor.home()
+
+    assert seek_currents == [20]
+    assert regs[0x0191] == 60
+
+
+def _stubbed_home_motor(mock_controller, **overrides) -> tuple[Motor, list[tuple[str, int]]]:
+    motor = Motor(mock_controller, make_motor_params(**overrides))
+    events: list[tuple[str, int]] = []
+    motor.clear_alarm = AsyncMock()
+    motor._move_near_home = AsyncMock()
+    motor._prepare_home_motion = AsyncMock()
+    motor._start_path_zero = AsyncMock(side_effect=lambda: events.append(("seek", 0)))
+    motor.wait_for_move = AsyncMock(return_value=MotorStatus.STOPPED)
+    motor._set_zero_position = AsyncMock()
+    motor.set_param = AsyncMock()
+    motor._verify_zero_position = AsyncMock()
+    motor.move_config = AsyncMock()
+    motor._park = AsyncMock()
+    motor._set_and_verify_peak_current = AsyncMock(side_effect=lambda value: events.append(("current", value)))
+    return motor, events
+
+
+@pytest.mark.asyncio
+async def test_home_seeks_at_the_configured_home_current_then_restores_ip(mock_controller):
+    # lb4a-9: the rotate seek broke its limit flag running into the stop at full Ip.
+    motor, events = _stubbed_home_motor(mock_controller, Ip=36, home_Ip=15)
+
+    await motor.home()
+
+    assert events == [("current", 15), ("seek", 0), ("current", 36)]
+    assert motor.is_homed() is True
+
+
+@pytest.mark.asyncio
+async def test_home_without_a_home_current_leaves_the_peak_current_alone(mock_controller):
+    motor, events = _stubbed_home_motor(mock_controller, Ip=36)
+
+    await motor.home()
+
+    assert events == [("seek", 0)]
+
+
+@pytest.mark.asyncio
+async def test_failed_home_still_restores_ip_after_the_home_current(mock_controller):
+    motor, events = _stubbed_home_motor(mock_controller, Ip=36, home_Ip=15)
+    motor.wait_for_move = AsyncMock(return_value=MotorStatus.FAULT)
+    motor._raise_home_fault = Mock(side_effect=MotorError("alarm 32"))
+
+    with pytest.raises(MotorError):
+        await motor.home()
+
+    assert events == [("current", 15), ("seek", 0), ("current", 36)]
+
+
+@pytest.mark.asyncio
 async def test_y_electrical_check_after_a_descent_expects_the_descent_current(mock_controller):
     motor, regs = y_descent_motor(mock_controller, registers={0x0003: 2, 0x0001: 10000, 0x0233: 4000})
     motor._cur_pos = 700.0
