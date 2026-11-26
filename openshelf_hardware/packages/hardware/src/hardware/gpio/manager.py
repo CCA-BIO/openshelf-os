@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from collections.abc import Mapping
@@ -10,6 +11,7 @@ from hardware.exceptions import GpioConfigError
 from hardware.gpio.fake import FakeGpioBackend
 from hardware.gpio.pca9535 import Pca9535Backend
 from hardware.gpio.pcf8575 import Pcf8575Backend
+from hardware.gpio.remote import RemoteGpioBackend
 from hardware.gpio.rpi import RpiGpioBackend
 from hardware.gpio.types import (
     DigitalInput,
@@ -28,6 +30,9 @@ logger = logging.getLogger(__name__)
 # log; after a logged change, a pin's further changes within this window are only counted and
 # reported by one trailing line at the end of the window.
 INPUT_LOG_WINDOW_S = 5.0
+# host:port of a remote GPIO server (hardware/gpio/remote.py). When set, every pin is served by it,
+# for hardware-in-the-loop rigs and simulators; nothing touches the Pi or the I2C expanders.
+REMOTE_GPIO_ENV = "OPENSHELF_GPIO_REMOTE"
 
 
 class GpioManager:
@@ -42,6 +47,7 @@ class GpioManager:
         self._pins = dict(pins)
         self._expanders = dict(expanders or {})
         self._fake = fake
+        self._remote = None if fake is True else (os.environ.get(REMOTE_GPIO_ENV) or None)
         self._injected_backends = dict(backends or {})
         self._created_backends: dict[str, GpioBackend] = {}
         self._inputs: dict[str, DigitalInput] = {}
@@ -176,6 +182,10 @@ class GpioManager:
             raise GpioConfigError(f"GPIO pin '{name}' is not configured") from exc
 
     def _backend_for(self, spec: GpioPinSpec) -> GpioBackend:
+        if self._remote is not None:
+            remote = self._remote
+            return self._get_or_create_backend("remote", lambda: RemoteGpioBackend(remote))
+
         if spec.board in ("pca9535", "pcf8575"):
             if self._fake is True:
                 self._validate_fake_expander(spec)
